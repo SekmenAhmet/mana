@@ -3,6 +3,7 @@ mod config;
 mod log;
 mod project;
 mod task;
+mod lock;
 
 use clap::Parser;
 use cli::{Cli, Command};
