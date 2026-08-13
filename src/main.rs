@@ -8,6 +8,7 @@ mod lock;
 mod dependencies;
 mod review;
 mod prompts;
+mod pty;
 
 use clap::Parser;
 use cli::{Cli, Command};
