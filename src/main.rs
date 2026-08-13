@@ -1,5 +1,6 @@
 mod cli;
 mod config;
+mod log;
 mod project;
 mod task;
 
