@@ -69,4 +69,28 @@ mod tests {
         let unmet = unmet_dependencies(&lock, tmp.path(), &["task-a".to_string()]).unwrap();
         assert!(unmet.is_empty());
     }
+
+    #[test]
+    fn multiple_entries_same_task_one_done_is_satisfied() {
+        let mut lock = Lock::new();
+        lock.insert("agent-1".to_string(), LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-a".into() });
+        lock.insert("agent-2".to_string(), LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-a".into() });
+        let tmp = tempfile::tempdir().unwrap();
+        append_log(&tmp.path().join("agent-1.jsonl"), &LogEntry { status: crate::log::Status::Running, action: "started".into(), timestamp: now_iso8601() }).unwrap();
+        append_log(&tmp.path().join("agent-2.jsonl"), &LogEntry { status: crate::log::Status::Done, action: "exited".into(), timestamp: now_iso8601() }).unwrap();
+        let unmet = unmet_dependencies(&lock, tmp.path(), &["task-a".to_string()]).unwrap();
+        assert!(unmet.is_empty());
+    }
+
+    #[test]
+    fn multiple_entries_same_task_all_not_done_is_unmet() {
+        let mut lock = Lock::new();
+        lock.insert("agent-1".to_string(), LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-a".into() });
+        lock.insert("agent-2".to_string(), LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-a".into() });
+        let tmp = tempfile::tempdir().unwrap();
+        append_log(&tmp.path().join("agent-1.jsonl"), &LogEntry { status: crate::log::Status::Running, action: "started".into(), timestamp: now_iso8601() }).unwrap();
+        append_log(&tmp.path().join("agent-2.jsonl"), &LogEntry { status: crate::log::Status::Running, action: "relaunched".into(), timestamp: now_iso8601() }).unwrap();
+        let unmet = unmet_dependencies(&lock, tmp.path(), &["task-a".to_string()]).unwrap();
+        assert_eq!(unmet, vec!["task-a".to_string()]);
+    }
 }
