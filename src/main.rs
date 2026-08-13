@@ -4,6 +4,7 @@ mod log;
 mod project;
 mod task;
 mod lock;
+mod dependencies;
 mod review;
 
 use clap::Parser;
