@@ -1,4 +1,4 @@
-use crate::config::{Config, load_config};
+use crate::config::{ensure_agent_registered, load_config};
 use crate::lock::load_lock;
 use crate::monitor::file_watcher::{FsEvent, watch};
 use crate::project::{
@@ -37,16 +37,6 @@ pub fn build_notification(event_path: &Path, reviews_dir: &Path) -> Option<Strin
         "[mana] Review disponible pour {task_uuid} : {}",
         event_path.display()
     ))
-}
-
-fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Result<()> {
-    if config.models.contains_key(agent_cli) {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer."
-        )
-    }
 }
 
 /// Reads the PM's PTY output on a background thread so the render loop never
@@ -247,26 +237,6 @@ mod tests {
         let reviews_dir = Path::new("/home/x/.mana/projects/demo/reviews");
         let logs_path = Path::new("/home/x/.mana/projects/demo/logs/agent-1.jsonl");
         assert!(build_notification(logs_path, reviews_dir).is_none());
-    }
-
-    #[test]
-    fn ensure_agent_registered_rejects_unknown_agent() {
-        let config = crate::config::Config::default();
-        assert!(ensure_agent_registered(&config, "claude").is_err());
-    }
-
-    #[test]
-    fn ensure_agent_registered_accepts_known_agent() {
-        let mut config = crate::config::Config::default();
-        config.models.insert(
-            "claude".to_string(),
-            crate::config::AgentConfig {
-                name: "claude".into(),
-                version: "1.0".into(),
-                path: "/usr/local/bin/claude".into(),
-            },
-        );
-        assert!(ensure_agent_registered(&config, "claude").is_ok());
     }
 
     #[test]

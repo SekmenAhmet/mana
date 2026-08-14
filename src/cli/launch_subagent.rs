@@ -1,5 +1,5 @@
 use crate::agents::autonomous_flag;
-use crate::config::{Config, load_config};
+use crate::config::{ensure_agent_registered, load_config};
 use crate::dependencies::unmet_dependencies;
 use crate::lock::{LockEntry, append_entry, load_lock};
 use crate::log::{LogEntry, Status, append_log, now_iso8601};
@@ -32,16 +32,6 @@ fn build_agent_args(flag: &str, extra_params: &[String]) -> Vec<String> {
     let mut args = vec![flag.to_string()];
     args.extend_from_slice(extra_params);
     args
-}
-
-fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Result<()> {
-    if config.models.contains_key(agent_cli) {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer."
-        )
-    }
 }
 
 pub fn run(
@@ -149,12 +139,6 @@ mod tests {
     }
 
     #[test]
-    fn ensure_agent_registered_rejects_unknown_agent() {
-        let config = crate::config::Config::default();
-        assert!(ensure_agent_registered(&config, "claude").is_err());
-    }
-
-    #[test]
     fn build_agent_args_puts_flag_first_then_extra_params() {
         let extra = vec!["--foo".to_string(), "bar".to_string()];
         assert_eq!(
@@ -166,19 +150,5 @@ mod tests {
     #[test]
     fn build_agent_args_with_no_extra_params() {
         assert_eq!(build_agent_args("--flag", &[]), vec!["--flag"]);
-    }
-
-    #[test]
-    fn ensure_agent_registered_accepts_known_agent() {
-        let mut config = crate::config::Config::default();
-        config.models.insert(
-            "claude".to_string(),
-            crate::config::AgentConfig {
-                name: "claude".into(),
-                version: "1.0".into(),
-                path: "/usr/local/bin/claude".into(),
-            },
-        );
-        assert!(ensure_agent_registered(&config, "claude").is_ok());
     }
 }
