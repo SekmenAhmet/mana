@@ -9,6 +9,7 @@ mod dependencies;
 mod review;
 mod prompts;
 mod pty;
+mod monitor;
 
 use clap::Parser;
 use cli::{Cli, Command};
