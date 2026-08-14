@@ -16,7 +16,7 @@ pub fn build_nodes(lock: &Lock, logs_dir: &Path) -> anyhow::Result<Vec<GraphNode
     let mut nodes = Vec::new();
     for (agent_uuid, entry) in lock.iter() {
         let log_path = logs_dir.join(format!("{agent_uuid}.jsonl"));
-        let status = read_last_status(&log_path)?;
+        let status = read_last_status(&log_path).unwrap_or(None);
         nodes.push(GraphNode {
             agent_uuid: agent_uuid.clone(),
             role: entry.role.clone(),
@@ -70,6 +70,18 @@ mod tests {
         lock.insert("agent-1".to_string(), LockEntry { model: "claude".into(), role: Role::Reviewer, task_uuid: "task-a".into() });
 
         let nodes = build_nodes(&lock, tmp.path()).unwrap();
+        assert_eq!(nodes[0].status, None);
+    }
+
+    #[test]
+    fn build_nodes_degrades_to_none_status_on_malformed_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut lock = Lock::new();
+        lock.insert("agent-1".to_string(), LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-a".into() });
+        std::fs::write(tmp.path().join("agent-1.jsonl"), "not valid json\n").unwrap();
+
+        let nodes = build_nodes(&lock, tmp.path()).unwrap();
+        assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].status, None);
     }
 

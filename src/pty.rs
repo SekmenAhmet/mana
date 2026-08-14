@@ -28,7 +28,6 @@ pub fn spawn(cmd: &str, args: &[String]) -> anyhow::Result<PtySession> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read as _;
 
     #[cfg(unix)]
     #[test]

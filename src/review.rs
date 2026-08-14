@@ -125,15 +125,8 @@ mod tests {
     #[test]
     fn multiline_problem_text_roundtrips() {
         // Test that a problem with an embedded newline (multi-line text) is recovered
-        // as a single-line string with continuation joined by space
-        let problem_text = "First line of problem description\nSecond line continues here";
-        let verdict = Verdict::Rejected {
-            problems: vec![problem_text.to_string()],
-        };
-        let rendered = render_review("task-1", &verdict);
-
-        // The rendered output will have the problem on one line
-        // But if we manually construct a scenario with line breaks, parse should handle it
+        // as a single-line string with continuation joined by space.
+        // If we manually construct a scenario with line breaks, parse should handle it
         let manual_content = "# Review — task-1\n\n## Verdict : \u{274c} Rejet\u{e9}\n\n### Probl\u{e8}mes identifi\u{e9}s\n\n1. First line of problem description\nSecond line continues here\n";
         let parsed = parse_verdict(manual_content).unwrap();
 

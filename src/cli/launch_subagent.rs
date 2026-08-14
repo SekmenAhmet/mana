@@ -1,4 +1,5 @@
 use crate::agents::autonomous_flag;
+use crate::config::{load_config, Config};
 use crate::dependencies::unmet_dependencies;
 use crate::lock::{append_entry, load_lock, LockEntry};
 use crate::log::{append_log, now_iso8601, LogEntry, Status};
@@ -22,6 +23,14 @@ impl FromStr for Role {
     }
 }
 
+fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Result<()> {
+    if config.models.contains_key(agent_cli) {
+        Ok(())
+    } else {
+        anyhow::bail!("agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer.")
+    }
+}
+
 pub fn run(agent_cli: &str, role_str: &str, task_uuid: &str, extra_params: &[String]) -> anyhow::Result<()> {
     let role: Role = role_str.parse()?;
     let home = mana_home()?;
@@ -41,6 +50,9 @@ pub fn run(agent_cli: &str, role_str: &str, task_uuid: &str, extra_params: &[Str
     if !unmet.is_empty() {
         anyhow::bail!("dependances non satisfaites pour {task_uuid}: {}", unmet.join(", "));
     }
+
+    let config = load_config(&home.join("config.yaml"))?;
+    ensure_agent_registered(&config, agent_cli)?;
 
     let flag = autonomous_flag(agent_cli)?;
 
@@ -99,5 +111,18 @@ mod tests {
     #[test]
     fn autonomous_flag_rejects_unsupported_cli_before_any_lock_write() {
         assert!(autonomous_flag("gemini").is_err());
+    }
+
+    #[test]
+    fn ensure_agent_registered_rejects_unknown_agent() {
+        let config = crate::config::Config::default();
+        assert!(ensure_agent_registered(&config, "claude").is_err());
+    }
+
+    #[test]
+    fn ensure_agent_registered_accepts_known_agent() {
+        let mut config = crate::config::Config::default();
+        config.models.insert("claude".to_string(), crate::config::AgentConfig { name: "claude".into(), version: "1.0".into(), path: "/usr/local/bin/claude".into() });
+        assert!(ensure_agent_registered(&config, "claude").is_ok());
     }
 }

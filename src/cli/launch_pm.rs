@@ -1,3 +1,4 @@
+use crate::config::{load_config, Config};
 use crate::lock::load_lock;
 use crate::monitor::file_watcher::{watch, FsEvent};
 use crate::project::{ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths, ProjectPaths};
@@ -34,6 +35,14 @@ pub fn build_notification(event_path: &Path, reviews_dir: &Path) -> Option<Strin
     ))
 }
 
+fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Result<()> {
+    if config.models.contains_key(agent_cli) {
+        Ok(())
+    } else {
+        anyhow::bail!("agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer.")
+    }
+}
+
 /// Reads the PM's PTY output on a background thread so the render loop never
 /// blocks on it — a blocking `reader.read()` in the main loop would freeze
 /// keyboard input and screen redraws for as long as the PM stays silent.
@@ -62,6 +71,9 @@ pub fn run(agent_cli: &str) -> anyhow::Result<()> {
     let project_name = project_name_from_dir(&cwd);
     let paths = resolve_project_paths(&home, &project_name);
     ensure_project_structure(&paths)?;
+
+    let config = load_config(&home.join("config.yaml"))?;
+    ensure_agent_registered(&config, agent_cli)?;
 
     let mut session = pty::spawn(agent_cli, &[])?;
     session.writer.write_all(pm_prompt(&project_name).as_bytes())?;
@@ -188,5 +200,18 @@ mod tests {
         let reviews_dir = Path::new("/home/x/.mana/projects/demo/reviews");
         let logs_path = Path::new("/home/x/.mana/projects/demo/logs/agent-1.jsonl");
         assert!(build_notification(logs_path, reviews_dir).is_none());
+    }
+
+    #[test]
+    fn ensure_agent_registered_rejects_unknown_agent() {
+        let config = crate::config::Config::default();
+        assert!(ensure_agent_registered(&config, "claude").is_err());
+    }
+
+    #[test]
+    fn ensure_agent_registered_accepts_known_agent() {
+        let mut config = crate::config::Config::default();
+        config.models.insert("claude".to_string(), crate::config::AgentConfig { name: "claude".into(), version: "1.0".into(), path: "/usr/local/bin/claude".into() });
+        assert!(ensure_agent_registered(&config, "claude").is_ok());
     }
 }
