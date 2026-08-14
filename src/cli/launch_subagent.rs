@@ -1,14 +1,16 @@
 use crate::agents::autonomous_flag;
-use crate::config::{load_config, Config};
+use crate::config::{Config, load_config};
 use crate::dependencies::unmet_dependencies;
-use crate::lock::{append_entry, load_lock, LockEntry};
-use crate::log::{append_log, now_iso8601, LogEntry, Status};
+use crate::lock::{LockEntry, append_entry, load_lock};
+use crate::log::{LogEntry, Status, append_log, now_iso8601};
 use crate::monitor::process_watcher::watch_and_log;
 use crate::monitor::pty_listener::spawn_listener;
-use crate::project::{ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths};
+use crate::project::{
+    ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
+};
 use crate::prompts::{executor_prompt, reviewer_prompt};
 use crate::pty;
-use crate::task::{read_task, Role};
+use crate::task::{Role, read_task};
 use std::io::Write;
 use std::str::FromStr;
 
@@ -27,11 +29,18 @@ fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Result<(
     if config.models.contains_key(agent_cli) {
         Ok(())
     } else {
-        anyhow::bail!("agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer.")
+        anyhow::bail!(
+            "agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer."
+        )
     }
 }
 
-pub fn run(agent_cli: &str, role_str: &str, task_uuid: &str, extra_params: &[String]) -> anyhow::Result<()> {
+pub fn run(
+    agent_cli: &str,
+    role_str: &str,
+    task_uuid: &str,
+    extra_params: &[String],
+) -> anyhow::Result<()> {
     let role: Role = role_str.parse()?;
     let home = mana_home()?;
     let cwd = std::env::current_dir()?;
@@ -48,7 +57,10 @@ pub fn run(agent_cli: &str, role_str: &str, task_uuid: &str, extra_params: &[Str
     let lock = load_lock(&paths.lock_file)?;
     let unmet = unmet_dependencies(&lock, &paths.logs, &task.frontmatter.depends_on)?;
     if !unmet.is_empty() {
-        anyhow::bail!("dependances non satisfaites pour {task_uuid}: {}", unmet.join(", "));
+        anyhow::bail!(
+            "dependances non satisfaites pour {task_uuid}: {}",
+            unmet.join(", ")
+        );
     }
 
     let config = load_config(&home.join("config.yaml"))?;
@@ -57,10 +69,25 @@ pub fn run(agent_cli: &str, role_str: &str, task_uuid: &str, extra_params: &[Str
     let flag = autonomous_flag(agent_cli)?;
 
     let agent_uuid = uuid::Uuid::new_v4().to_string();
-    append_entry(&paths.lock_file, &agent_uuid, LockEntry { model: agent_cli.to_string(), role: role.clone(), task_uuid: task_uuid.to_string() })?;
+    append_entry(
+        &paths.lock_file,
+        &agent_uuid,
+        LockEntry {
+            model: agent_cli.to_string(),
+            role: role.clone(),
+            task_uuid: task_uuid.to_string(),
+        },
+    )?;
 
     let log_path = paths.logs.join(format!("{agent_uuid}.jsonl"));
-    append_log(&log_path, &LogEntry { status: Status::Running, action: "started".to_string(), timestamp: now_iso8601() })?;
+    append_log(
+        &log_path,
+        &LogEntry {
+            status: Status::Running,
+            action: "started".to_string(),
+            timestamp: now_iso8601(),
+        },
+    )?;
 
     let review_path = paths.reviews.join(format!("{task_uuid}.md"));
     let prompt = match role {
@@ -122,7 +149,14 @@ mod tests {
     #[test]
     fn ensure_agent_registered_accepts_known_agent() {
         let mut config = crate::config::Config::default();
-        config.models.insert("claude".to_string(), crate::config::AgentConfig { name: "claude".into(), version: "1.0".into(), path: "/usr/local/bin/claude".into() });
+        config.models.insert(
+            "claude".to_string(),
+            crate::config::AgentConfig {
+                name: "claude".into(),
+                version: "1.0".into(),
+                path: "/usr/local/bin/claude".into(),
+            },
+        );
         assert!(ensure_agent_registered(&config, "claude").is_ok());
     }
 }

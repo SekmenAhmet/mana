@@ -1,10 +1,10 @@
 use clap::{Args, Parser, Subcommand};
 
-pub mod install;
-pub mod uninstall;
 pub mod doctor;
-pub mod launch_subagent;
+pub mod install;
 pub mod launch_pm;
+pub mod launch_subagent;
+pub mod uninstall;
 pub mod upgrade;
 
 #[derive(Parser)]

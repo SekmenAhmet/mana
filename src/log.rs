@@ -63,10 +63,34 @@ mod tests {
     fn append_then_read_last_status() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("logs/agent.jsonl");
-        append_log(&path, &LogEntry { status: Status::Running, action: "started".into(), timestamp: now_iso8601() }).unwrap();
-        append_log(&path, &LogEntry { status: Status::Running, action: "cmd:cargo test".into(), timestamp: now_iso8601() }).unwrap();
+        append_log(
+            &path,
+            &LogEntry {
+                status: Status::Running,
+                action: "started".into(),
+                timestamp: now_iso8601(),
+            },
+        )
+        .unwrap();
+        append_log(
+            &path,
+            &LogEntry {
+                status: Status::Running,
+                action: "cmd:cargo test".into(),
+                timestamp: now_iso8601(),
+            },
+        )
+        .unwrap();
         assert_eq!(read_last_status(&path).unwrap(), Some(Status::Running));
-        append_log(&path, &LogEntry { status: Status::Done, action: "exited".into(), timestamp: now_iso8601() }).unwrap();
+        append_log(
+            &path,
+            &LogEntry {
+                status: Status::Done,
+                action: "exited".into(),
+                timestamp: now_iso8601(),
+            },
+        )
+        .unwrap();
         assert_eq!(read_last_status(&path).unwrap(), Some(Status::Done));
     }
 
@@ -74,7 +98,15 @@ mod tests {
     fn each_line_is_independent_json() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("agent.jsonl");
-        append_log(&path, &LogEntry { status: Status::Running, action: "started".into(), timestamp: "2026-08-13T19:00:00Z".into() }).unwrap();
+        append_log(
+            &path,
+            &LogEntry {
+                status: Status::Running,
+                action: "started".into(),
+                timestamp: "2026-08-13T19:00:00Z".into(),
+            },
+        )
+        .unwrap();
         let contents = std::fs::read_to_string(&path).unwrap();
         let lines: Vec<&str> = contents.lines().collect();
         assert_eq!(lines.len(), 1);

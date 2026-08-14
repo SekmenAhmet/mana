@@ -1,6 +1,6 @@
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc::{channel, Receiver};
+use std::sync::mpsc::{Receiver, channel};
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum FsEvent {

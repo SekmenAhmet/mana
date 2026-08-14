@@ -1,15 +1,25 @@
-use crate::log::{append_log, now_iso8601, LogEntry, Status};
+use crate::log::{LogEntry, Status, append_log, now_iso8601};
 use portable_pty::Child;
 use std::path::Path;
 
-pub fn watch_and_log(mut child: Box<dyn Child + Send + Sync>, log_path: &Path) -> anyhow::Result<()> {
+pub fn watch_and_log(
+    mut child: Box<dyn Child + Send + Sync>,
+    log_path: &Path,
+) -> anyhow::Result<()> {
     let exit_status = child.wait()?;
     let action = if exit_status.success() {
         "exited".to_string()
     } else {
         format!("exited(code={})", exit_status.exit_code())
     };
-    append_log(log_path, &LogEntry { status: Status::Done, action, timestamp: now_iso8601() })?;
+    append_log(
+        log_path,
+        &LogEntry {
+            status: Status::Done,
+            action,
+            timestamp: now_iso8601(),
+        },
+    )?;
     Ok(())
 }
 

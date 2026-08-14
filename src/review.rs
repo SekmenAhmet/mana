@@ -10,7 +10,9 @@ pub fn render_review(task_uuid: &str, verdict: &Verdict) -> String {
     match verdict {
         Verdict::Validated => format!("## Verdict : \u{2705} Valid\u{e9}\n"),
         Verdict::Rejected { problems } => {
-            let mut out = format!("# Review — {task_uuid}\n\n## Verdict : \u{274c} Rejet\u{e9}\n\n### Probl\u{e8}mes identifi\u{e9}s\n\n");
+            let mut out = format!(
+                "# Review — {task_uuid}\n\n## Verdict : \u{274c} Rejet\u{e9}\n\n### Probl\u{e8}mes identifi\u{e9}s\n\n"
+            );
             for (i, problem) in problems.iter().enumerate() {
                 out.push_str(&format!("{}. {}\n", i + 1, problem));
             }
@@ -93,7 +95,10 @@ mod tests {
     #[test]
     fn rejected_review_lists_problems() {
         let verdict = Verdict::Rejected {
-            problems: vec!["Gestion d'erreur manquante".to_string(), "Test incomplet".to_string()],
+            problems: vec![
+                "Gestion d'erreur manquante".to_string(),
+                "Test incomplet".to_string(),
+            ],
         };
         let rendered = render_review("task-1", &verdict);
         assert!(rendered.contains("1. Gestion d'erreur manquante"));
@@ -108,7 +113,9 @@ mod tests {
 
     #[test]
     fn parse_verdict_roundtrips_rejected() {
-        let verdict = Verdict::Rejected { problems: vec!["Probleme A".to_string(), "Probleme B".to_string()] };
+        let verdict = Verdict::Rejected {
+            problems: vec!["Probleme A".to_string(), "Probleme B".to_string()],
+        };
         let rendered = render_review("task-1", &verdict);
         assert_eq!(parse_verdict(&rendered).unwrap(), verdict);
     }
@@ -133,7 +140,10 @@ mod tests {
         // The continuation line should be appended with a space
         if let Verdict::Rejected { problems } = parsed {
             assert_eq!(problems.len(), 1);
-            assert_eq!(problems[0], "First line of problem description Second line continues here");
+            assert_eq!(
+                problems[0],
+                "First line of problem description Second line continues here"
+            );
         } else {
             panic!("expected Rejected verdict");
         }

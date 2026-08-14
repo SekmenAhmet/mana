@@ -51,7 +51,11 @@ mod tests {
         let mut cfg = Config::default();
         cfg.models.insert(
             "claude".to_string(),
-            AgentConfig { name: "claude".to_string(), version: "1.0.16".to_string(), path: "/usr/local/bin/claude".to_string() },
+            AgentConfig {
+                name: "claude".to_string(),
+                version: "1.0.16".to_string(),
+                path: "/usr/local/bin/claude".to_string(),
+            },
         );
         save_config(&path, &cfg).unwrap();
         let loaded = load_config(&path).unwrap();
