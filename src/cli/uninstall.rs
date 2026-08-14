@@ -1,4 +1,4 @@
-use crate::config::{load_config, save_config, Config};
+use crate::config::{Config, load_config, save_config};
 use crate::project::mana_home;
 
 pub fn remove_agent(config: &mut Config, name: &str) -> bool {
@@ -26,7 +26,14 @@ mod tests {
     #[test]
     fn remove_agent_removes_existing_entry() {
         let mut config = Config::default();
-        config.models.insert("claude".to_string(), AgentConfig { name: "claude".into(), version: "1.0".into(), path: "/bin/claude".into() });
+        config.models.insert(
+            "claude".to_string(),
+            AgentConfig {
+                name: "claude".into(),
+                version: "1.0".into(),
+                path: "/bin/claude".into(),
+            },
+        );
         assert!(remove_agent(&mut config, "claude"));
         assert!(config.models.is_empty());
     }

@@ -1,4 +1,4 @@
-use crate::log::{append_log, now_iso8601, LogEntry, Status};
+use crate::log::{LogEntry, Status, append_log, now_iso8601};
 use std::io::Read;
 use std::path::PathBuf;
 
@@ -29,7 +29,10 @@ pub fn extract_commands(text: &str) -> Vec<String> {
     commands
 }
 
-pub fn spawn_listener(mut reader: Box<dyn Read + Send>, log_path: PathBuf) -> std::thread::JoinHandle<()> {
+pub fn spawn_listener(
+    mut reader: Box<dyn Read + Send>,
+    log_path: PathBuf,
+) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut buf = [0u8; 4096];
         loop {
@@ -40,7 +43,11 @@ pub fn spawn_listener(mut reader: Box<dyn Read + Send>, log_path: PathBuf) -> st
                     for cmd in extract_commands(&text) {
                         let _ = append_log(
                             &log_path,
-                            &LogEntry { status: Status::Running, action: format!("cmd:{cmd}"), timestamp: now_iso8601() },
+                            &LogEntry {
+                                status: Status::Running,
+                                action: format!("cmd:{cmd}"),
+                                timestamp: now_iso8601(),
+                            },
                         );
                     }
                 }
@@ -70,7 +77,10 @@ mod tests {
     #[test]
     fn extract_commands_finds_multiple_bash_calls() {
         let text = "Bash(cargo build)\nsome output\nBash(cargo test)\n";
-        assert_eq!(extract_commands(text), vec!["cargo build".to_string(), "cargo test".to_string()]);
+        assert_eq!(
+            extract_commands(text),
+            vec!["cargo build".to_string(), "cargo test".to_string()]
+        );
     }
 
     #[test]

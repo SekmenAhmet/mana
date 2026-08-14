@@ -39,6 +39,7 @@ pub fn parse_task_file(contents: &str) -> anyhow::Result<Task> {
     Ok(Task { frontmatter, body })
 }
 
+#[allow(dead_code)]
 pub fn render_task_file(task: &Task) -> String {
     let yaml = serde_yaml::to_string(&task.frontmatter).unwrap_or_default();
     format!("---\n{yaml}---\n\n{}", task.body)
@@ -49,6 +50,7 @@ pub fn read_task(path: &Path) -> anyhow::Result<Task> {
     parse_task_file(&contents)
 }
 
+#[allow(dead_code)]
 pub fn write_task(path: &Path, task: &Task) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -79,7 +81,10 @@ Contenu du prompt.
         let task = parse_task_file(EXAMPLE).unwrap();
         assert_eq!(task.frontmatter.id, "f9e8d7c6-b5a4-3210-fedc-ba9876543210");
         assert_eq!(task.frontmatter.role, Role::Executor);
-        assert_eq!(task.frontmatter.depends_on, vec!["a1b2c3d4-e5f6-7890-abcd-ef1234567890"]);
+        assert_eq!(
+            task.frontmatter.depends_on,
+            vec!["a1b2c3d4-e5f6-7890-abcd-ef1234567890"]
+        );
         assert!(task.body.starts_with("# Implementer"));
     }
 

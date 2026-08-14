@@ -1,4 +1,11 @@
-pub const KNOWN_CLIS: &[&str] = &["claude", "codex", "gemini", "antigravity", "copilot", "opencode"];
+pub const KNOWN_CLIS: &[&str] = &[
+    "claude",
+    "codex",
+    "gemini",
+    "antigravity",
+    "copilot",
+    "opencode",
+];
 
 /// The flag that makes a given agent CLI skip interactive permission
 /// prompts, required for sub-agents (executor/reviewer) which run
@@ -19,7 +26,10 @@ mod tests {
 
     #[test]
     fn claude_has_known_autonomous_flag() {
-        assert_eq!(autonomous_flag("claude").unwrap(), "--dangerously-skip-permissions");
+        assert_eq!(
+            autonomous_flag("claude").unwrap(),
+            "--dangerously-skip-permissions"
+        );
     }
 
     #[test]

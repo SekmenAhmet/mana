@@ -1,15 +1,15 @@
 mod agents;
 mod cli;
 mod config;
-mod log;
-mod project;
-mod task;
-mod lock;
 mod dependencies;
-mod review;
+mod lock;
+mod log;
+mod monitor;
+mod project;
 mod prompts;
 mod pty;
-mod monitor;
+mod review;
+mod task;
 mod tui;
 
 use clap::Parser;
@@ -22,13 +22,21 @@ fn main() -> anyhow::Result<()> {
         Command::Uninstall { cli } => cli::uninstall::run(&cli)?,
         Command::Launch(args) => {
             if let Some(subagent_cli) = &args.subagent {
-                let role = args.role.as_deref().ok_or_else(|| anyhow::anyhow!("--role est requis avec --subagent"))?;
-                let assign = args.assign.as_deref().ok_or_else(|| anyhow::anyhow!("--assign est requis avec --subagent"))?;
+                let role = args
+                    .role
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--role est requis avec --subagent"))?;
+                let assign = args
+                    .assign
+                    .as_deref()
+                    .ok_or_else(|| anyhow::anyhow!("--assign est requis avec --subagent"))?;
                 cli::launch_subagent::run(subagent_cli, role, assign, &args.params)?;
             } else if let Some(agent) = &args.agent {
                 cli::launch_pm::run(agent)?;
             } else {
-                anyhow::bail!("usage: mana launch <agent> | mana launch --subagent <cli> --role <role> --assign <task-uuid>");
+                anyhow::bail!(
+                    "usage: mana launch <agent> | mana launch --subagent <cli> --role <role> --assign <task-uuid>"
+                );
             }
         }
         Command::Doctor => cli::doctor::run()?,

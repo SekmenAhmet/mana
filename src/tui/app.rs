@@ -14,7 +14,11 @@ pub struct App {
 
 impl App {
     pub fn new() -> Self {
-        App { chat_lines: Vec::new(), input: String::new(), mode: AppMode::Chat }
+        App {
+            chat_lines: Vec::new(),
+            input: String::new(),
+            mode: AppMode::Chat,
+        }
     }
 
     /// Appends raw PTY output (ANSI stripped) as chat lines. Splits on
@@ -67,7 +71,10 @@ mod tests {
     fn push_output_splits_into_lines() {
         let mut app = App::new();
         app.push_output(b"line one\nline two\n");
-        assert_eq!(app.chat_lines, vec!["line one".to_string(), "line two".to_string()]);
+        assert_eq!(
+            app.chat_lines,
+            vec!["line one".to_string(), "line two".to_string()]
+        );
     }
 
     #[test]

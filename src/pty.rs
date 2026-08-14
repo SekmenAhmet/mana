@@ -1,4 +1,4 @@
-use portable_pty::{native_pty_system, Child, CommandBuilder, PtySize};
+use portable_pty::{Child, CommandBuilder, PtySize, native_pty_system};
 use std::io::{Read, Write};
 
 pub struct PtySession {
@@ -9,7 +9,12 @@ pub struct PtySession {
 
 pub fn spawn(cmd: &str, args: &[String]) -> anyhow::Result<PtySession> {
     let pty_system = native_pty_system();
-    let pair = pty_system.openpty(PtySize { rows: 40, cols: 120, pixel_width: 0, pixel_height: 0 })?;
+    let pair = pty_system.openpty(PtySize {
+        rows: 40,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
 
     let mut command = CommandBuilder::new(cmd);
     for arg in args {
@@ -22,7 +27,11 @@ pub fn spawn(cmd: &str, args: &[String]) -> anyhow::Result<PtySession> {
     let writer = pair.master.take_writer()?;
     let reader = pair.master.try_clone_reader()?;
 
-    Ok(PtySession { writer, reader, child })
+    Ok(PtySession {
+        writer,
+        reader,
+        child,
+    })
 }
 
 #[cfg(test)]
@@ -32,7 +41,8 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn spawn_echo_and_read_output() {
-        let mut session = spawn("sh", &["-c".to_string(), "echo hello-from-pty".to_string()]).unwrap();
+        let mut session =
+            spawn("sh", &["-c".to_string(), "echo hello-from-pty".to_string()]).unwrap();
         let mut buf = Vec::new();
         let mut chunk = [0u8; 1024];
         loop {
@@ -41,7 +51,10 @@ mod tests {
                 Ok(n) => buf.extend_from_slice(&chunk[..n]),
                 Err(_) => break,
             }
-            if buf.windows(b"hello-from-pty".len()).any(|w| w == b"hello-from-pty") {
+            if buf
+                .windows(b"hello-from-pty".len())
+                .any(|w| w == b"hello-from-pty")
+            {
                 break;
             }
         }

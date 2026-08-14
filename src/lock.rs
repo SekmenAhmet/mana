@@ -56,8 +56,26 @@ mod tests {
     fn append_entry_then_load_roundtrips() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("subagent-lock.yaml");
-        append_entry(&path, "agent-1", LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-1".into() }).unwrap();
-        append_entry(&path, "agent-2", LockEntry { model: "claude".into(), role: Role::Reviewer, task_uuid: "task-1".into() }).unwrap();
+        append_entry(
+            &path,
+            "agent-1",
+            LockEntry {
+                model: "claude".into(),
+                role: Role::Executor,
+                task_uuid: "task-1".into(),
+            },
+        )
+        .unwrap();
+        append_entry(
+            &path,
+            "agent-2",
+            LockEntry {
+                model: "claude".into(),
+                role: Role::Reviewer,
+                task_uuid: "task-1".into(),
+            },
+        )
+        .unwrap();
         let lock = load_lock(&path).unwrap();
         assert_eq!(lock.len(), 2);
         assert_eq!(lock.get("agent-1").unwrap().role, Role::Executor);

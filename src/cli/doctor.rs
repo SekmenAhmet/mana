@@ -1,4 +1,4 @@
-use crate::config::{load_config, AgentConfig, Config};
+use crate::config::{AgentConfig, Config, load_config};
 use crate::project::mana_home;
 use std::io::Read;
 use std::process::Stdio;
@@ -22,13 +22,16 @@ pub fn diagnose(config: &Config) -> Vec<DoctorIssue> {
             });
             continue;
         }
-        if let Ok(current) = current_version(agent) {
-            if current != agent.version {
-                issues.push(DoctorIssue {
-                    agent: name.clone(),
-                    problem: format!("version enregistree {} != version actuelle {current}", agent.version),
-                });
-            }
+        if let Ok(current) = current_version(agent)
+            && current != agent.version
+        {
+            issues.push(DoctorIssue {
+                agent: name.clone(),
+                problem: format!(
+                    "version enregistree {} != version actuelle {current}",
+                    agent.version
+                ),
+            });
         }
     }
     issues
@@ -81,7 +84,10 @@ pub fn run() -> anyhow::Result<()> {
     let config = load_config(&home.join("config.yaml"))?;
     let issues = diagnose(&config);
     if issues.is_empty() {
-        println!("mana doctor: tout est en ordre ({} agent(s) enregistre(s))", config.models.len());
+        println!(
+            "mana doctor: tout est en ordre ({} agent(s) enregistre(s))",
+            config.models.len()
+        );
     } else {
         for issue in issues {
             println!("[{}] {}", issue.agent, issue.problem);

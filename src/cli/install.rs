@@ -1,5 +1,5 @@
 use crate::agents::KNOWN_CLIS;
-use crate::config::{load_config, save_config, AgentConfig};
+use crate::config::{AgentConfig, load_config, save_config};
 use crate::project::mana_home;
 use dialoguer::MultiSelect;
 use std::io::Read;
@@ -12,9 +12,14 @@ const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 /// the interactive selector below so it's testable against a real,
 /// always-present binary.
 pub fn resolve_agent(name: &str) -> anyhow::Result<AgentConfig> {
-    let path = which::which(name).map_err(|_| anyhow::anyhow!("binaire '{name}' introuvable dans le PATH"))?;
+    let path = which::which(name)
+        .map_err(|_| anyhow::anyhow!("binaire '{name}' introuvable dans le PATH"))?;
     let version = run_version_check(&path, VERSION_CHECK_TIMEOUT)?;
-    Ok(AgentConfig { name: name.to_string(), version, path: path.to_string_lossy().to_string() })
+    Ok(AgentConfig {
+        name: name.to_string(),
+        version,
+        path: path.to_string_lossy().to_string(),
+    })
 }
 
 fn run_version_check(path: &std::path::Path, timeout: Duration) -> anyhow::Result<String> {
@@ -112,6 +117,10 @@ mod tests {
         let start = std::time::Instant::now();
         let result = run_version_check(&script, std::time::Duration::from_millis(200));
         assert!(result.is_err(), "expected a timeout error, got {result:?}");
-        assert!(start.elapsed() < std::time::Duration::from_secs(2), "should time out near the 200ms bound, took {:?}", start.elapsed());
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(2),
+            "should time out near the 200ms bound, took {:?}",
+            start.elapsed()
+        );
     }
 }

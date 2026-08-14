@@ -58,7 +58,10 @@ mod tests {
         assert_eq!(paths.tasks, home.join("projects/mon-api/tasks"));
         assert_eq!(paths.logs, home.join("projects/mon-api/logs"));
         assert_eq!(paths.reviews, home.join("projects/mon-api/reviews"));
-        assert_eq!(paths.lock_file, home.join("projects/mon-api/subagent-lock.yaml"));
+        assert_eq!(
+            paths.lock_file,
+            home.join("projects/mon-api/subagent-lock.yaml")
+        );
     }
 
     #[test]

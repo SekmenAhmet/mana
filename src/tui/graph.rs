@@ -1,5 +1,5 @@
 use crate::lock::Lock;
-use crate::log::{read_last_status, Status};
+use crate::log::{Status, read_last_status};
 use crate::task::Role;
 use std::path::Path;
 
@@ -48,14 +48,29 @@ pub fn role_label(role: &Role) -> &'static str {
 mod tests {
     use super::*;
     use crate::lock::LockEntry;
-    use crate::log::{append_log, now_iso8601, LogEntry};
+    use crate::log::{LogEntry, append_log, now_iso8601};
 
     #[test]
     fn build_nodes_reads_status_from_logs() {
         let tmp = tempfile::tempdir().unwrap();
         let mut lock = Lock::new();
-        lock.insert("agent-1".to_string(), LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-a".into() });
-        append_log(&tmp.path().join("agent-1.jsonl"), &LogEntry { status: Status::Running, action: "started".into(), timestamp: now_iso8601() }).unwrap();
+        lock.insert(
+            "agent-1".to_string(),
+            LockEntry {
+                model: "claude".into(),
+                role: Role::Executor,
+                task_uuid: "task-a".into(),
+            },
+        );
+        append_log(
+            &tmp.path().join("agent-1.jsonl"),
+            &LogEntry {
+                status: Status::Running,
+                action: "started".into(),
+                timestamp: now_iso8601(),
+            },
+        )
+        .unwrap();
 
         let nodes = build_nodes(&lock, tmp.path()).unwrap();
         assert_eq!(nodes.len(), 1);
@@ -67,7 +82,14 @@ mod tests {
     fn build_nodes_handles_missing_log_as_none() {
         let tmp = tempfile::tempdir().unwrap();
         let mut lock = Lock::new();
-        lock.insert("agent-1".to_string(), LockEntry { model: "claude".into(), role: Role::Reviewer, task_uuid: "task-a".into() });
+        lock.insert(
+            "agent-1".to_string(),
+            LockEntry {
+                model: "claude".into(),
+                role: Role::Reviewer,
+                task_uuid: "task-a".into(),
+            },
+        );
 
         let nodes = build_nodes(&lock, tmp.path()).unwrap();
         assert_eq!(nodes[0].status, None);
@@ -77,7 +99,14 @@ mod tests {
     fn build_nodes_degrades_to_none_status_on_malformed_log() {
         let tmp = tempfile::tempdir().unwrap();
         let mut lock = Lock::new();
-        lock.insert("agent-1".to_string(), LockEntry { model: "claude".into(), role: Role::Executor, task_uuid: "task-a".into() });
+        lock.insert(
+            "agent-1".to_string(),
+            LockEntry {
+                model: "claude".into(),
+                role: Role::Executor,
+                task_uuid: "task-a".into(),
+            },
+        );
         std::fs::write(tmp.path().join("agent-1.jsonl"), "not valid json\n").unwrap();
 
         let nodes = build_nodes(&lock, tmp.path()).unwrap();
