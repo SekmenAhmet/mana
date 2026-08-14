@@ -1,6 +1,7 @@
 use clap::{Args, Parser, Subcommand};
 
 pub mod install;
+pub mod uninstall;
 
 #[derive(Parser)]
 #[command(name = "mana", about = "Orchestrateur d'agents IA de coding")]
