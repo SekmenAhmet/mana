@@ -81,7 +81,11 @@ fn current_version_with_timeout(agent: &AgentConfig, timeout: Duration) -> anyho
 
 pub fn run() -> anyhow::Result<()> {
     let home = mana_home()?;
-    let config = load_config(&home.join("config.yaml"))?;
+    run_at(&home.join("config.yaml"))
+}
+
+fn run_at(config_path: &std::path::Path) -> anyhow::Result<()> {
+    let config = load_config(config_path)?;
     let issues = diagnose(&config);
     if issues.is_empty() {
         println!(
@@ -121,6 +125,95 @@ mod tests {
     fn diagnose_reports_no_issues_for_empty_config() {
         let config = Config::default();
         assert!(diagnose(&config).is_empty());
+    }
+
+    #[cfg(unix)]
+    fn write_version_script(dir: &std::path::Path, name: &str, printed_version: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+
+        let script = dir.join(name);
+        std::fs::write(&script, format!("#!/bin/sh\necho {printed_version}\n")).unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+        script.to_string_lossy().to_string()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_flags_outdated_version() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_version_script(tmp.path(), "agent.sh", "2.0.0");
+
+        let mut config = Config::default();
+        config.models.insert(
+            "claude".to_string(),
+            AgentConfig {
+                name: "claude".into(),
+                version: "1.0.0".into(),
+                path,
+            },
+        );
+        let issues = diagnose(&config);
+        assert_eq!(issues.len(), 1);
+        assert!(issues[0].problem.contains("1.0.0"));
+        assert!(issues[0].problem.contains("2.0.0"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnose_reports_no_issue_when_version_matches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_version_script(tmp.path(), "agent.sh", "1.0.0");
+
+        let mut config = Config::default();
+        config.models.insert(
+            "claude".to_string(),
+            AgentConfig {
+                name: "claude".into(),
+                version: "1.0.0".into(),
+                path,
+            },
+        );
+        assert!(diagnose(&config).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_version_reads_stdout_on_normal_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_version_script(tmp.path(), "agent.sh", "3.1.4");
+        let agent = AgentConfig {
+            name: "agent".into(),
+            version: "irrelevant".into(),
+            path,
+        };
+        assert_eq!(current_version(&agent).unwrap(), "3.1.4");
+    }
+
+    #[test]
+    fn run_at_reports_ok_for_empty_config() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        crate::config::save_config(&config_path, &Config::default()).unwrap();
+        assert!(run_at(&config_path).is_ok());
+    }
+
+    #[test]
+    fn run_at_reports_issues_for_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+        let mut config = Config::default();
+        config.models.insert(
+            "claude".to_string(),
+            AgentConfig {
+                name: "claude".into(),
+                version: "1.0".into(),
+                path: "/nonexistent/path/claude".into(),
+            },
+        );
+        crate::config::save_config(&config_path, &config).unwrap();
+        assert!(run_at(&config_path).is_ok());
     }
 
     #[cfg(unix)]

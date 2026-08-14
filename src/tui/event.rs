@@ -54,4 +54,41 @@ mod tests {
             Some(AppEvent::Quit)
         );
     }
+
+    #[test]
+    fn ctrl_c_quits() {
+        assert_eq!(
+            map_key_event(KeyCode::Char('c'), KeyModifiers::CONTROL),
+            Some(AppEvent::Quit)
+        );
+    }
+
+    #[test]
+    fn enter_becomes_enter_event() {
+        assert_eq!(
+            map_key_event(KeyCode::Enter, KeyModifiers::NONE),
+            Some(AppEvent::Enter)
+        );
+    }
+
+    #[test]
+    fn backspace_becomes_backspace_event() {
+        assert_eq!(
+            map_key_event(KeyCode::Backspace, KeyModifiers::NONE),
+            Some(AppEvent::Backspace)
+        );
+    }
+
+    #[test]
+    fn shift_char_becomes_key_event() {
+        assert_eq!(
+            map_key_event(KeyCode::Char('X'), KeyModifiers::SHIFT),
+            Some(AppEvent::Key('X'))
+        );
+    }
+
+    #[test]
+    fn unhandled_combo_returns_none() {
+        assert_eq!(map_key_event(KeyCode::Char('g'), KeyModifiers::ALT), None);
+    }
 }

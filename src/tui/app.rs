@@ -21,31 +21,18 @@ impl App {
         }
     }
 
-    /// Appends raw PTY output (ANSI stripped) as chat lines. Splits on
-    /// newlines; a trailing partial line (no newline yet) is kept as the
-    /// last entry and extended by the next call rather than duplicated.
+    /// Appends raw PTY output (ANSI stripped) as chat lines, one entry per
+    /// `\n`-terminated line. A trailing partial line (no newline yet) is
+    /// pushed as its own entry too — v1 doesn't merge it with later output.
     pub fn push_output(&mut self, raw: &[u8]) {
         let text = strip_ansi(raw);
         let mut parts = text.split('\n').peekable();
         while let Some(part) = parts.next() {
             let is_last = parts.peek().is_none();
-            if is_last {
-                if part.is_empty() {
-                    continue;
-                }
-                let is_not_empty = !self.chat_lines.is_empty();
-                match self.chat_lines.last_mut() {
-                    Some(last) if !last.ends_with('\n') && is_not_empty => {
-                        // heuristic: treat as continuation only when called
-                        // again before a newline was seen; for v1 simplicity
-                        // we just push a new line each time instead.
-                        self.chat_lines.push(part.to_string());
-                    }
-                    _ => self.chat_lines.push(part.to_string()),
-                }
-            } else {
-                self.chat_lines.push(part.to_string());
+            if is_last && part.is_empty() {
+                continue;
             }
+            self.chat_lines.push(part.to_string());
         }
     }
 
@@ -92,5 +79,38 @@ mod tests {
         assert_eq!(app.mode, AppMode::Graph);
         app.toggle_graph();
         assert_eq!(app.mode, AppMode::Chat);
+    }
+
+    #[test]
+    fn push_output_keeps_trailing_partial_line_without_newline() {
+        let mut app = App::new();
+        app.push_output(b"partial");
+        assert_eq!(app.chat_lines, vec!["partial".to_string()]);
+    }
+
+    #[test]
+    fn push_output_across_multiple_calls_appends_new_entries() {
+        let mut app = App::new();
+        app.push_output(b"first");
+        app.push_output(b"second");
+        assert_eq!(
+            app.chat_lines,
+            vec!["first".to_string(), "second".to_string()]
+        );
+    }
+
+    #[test]
+    fn push_output_ignores_empty_input() {
+        let mut app = App::new();
+        app.push_output(b"");
+        assert!(app.chat_lines.is_empty());
+    }
+
+    #[test]
+    fn default_matches_new() {
+        let app = App::default();
+        assert_eq!(app.mode, AppMode::Chat);
+        assert!(app.chat_lines.is_empty());
+        assert!(app.input.is_empty());
     }
 }

@@ -8,7 +8,7 @@ pub mod uninstall;
 pub mod upgrade;
 
 #[derive(Parser)]
-#[command(name = "mana", about = "Orchestrateur d'agents IA de coding")]
+#[command(name = "mana", about = "Orchestrateur d'agents IA de coding", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
