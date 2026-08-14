@@ -1,5 +1,7 @@
 # mana
 
+[![CI](https://github.com/SekmenAhmet/mana/actions/workflows/ci.yml/badge.svg)](https://github.com/SekmenAhmet/mana/actions/workflows/ci.yml)
+
 Orchestrateur d'agents IA de coding en CLI/TUI (Rust). Lance un agent CLI (Claude Code en v1) comme Project Manager, qui decoupe le travail en taches et delegue a des sous-agents executor/reviewer.
 
 ## Build
