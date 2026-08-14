@@ -26,7 +26,7 @@ fn main() -> anyhow::Result<()> {
                 let assign = args.assign.as_deref().ok_or_else(|| anyhow::anyhow!("--assign est requis avec --subagent"))?;
                 cli::launch_subagent::run(subagent_cli, role, assign, &args.params)?;
             } else if let Some(agent) = &args.agent {
-                println!("mana launch {agent} (PM): not yet implemented"); // replaced in Task 21
+                cli::launch_pm::run(agent)?;
             } else {
                 anyhow::bail!("usage: mana launch <agent> | mana launch --subagent <cli> --role <role> --assign <task-uuid>");
             }

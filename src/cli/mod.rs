@@ -4,6 +4,7 @@ pub mod install;
 pub mod uninstall;
 pub mod doctor;
 pub mod launch_subagent;
+pub mod launch_pm;
 
 #[derive(Parser)]
 #[command(name = "mana", about = "Orchestrateur d'agents IA de coding")]
