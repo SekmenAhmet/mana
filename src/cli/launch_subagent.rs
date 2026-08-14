@@ -65,8 +65,8 @@ pub fn run(agent_cli: &str, role_str: &str, task_uuid: &str, extra_params: &[Str
     let listener_reader = session.reader;
     let listener_handle = spawn_listener(listener_reader, log_path.clone());
 
-    watch_and_log(session.child, &log_path)?;
     let _ = listener_handle.join();
+    watch_and_log(session.child, &log_path)?;
 
     println!("sous-agent {agent_uuid} ({role_str}) termine pour la tache {task_uuid}");
     Ok(())
@@ -76,8 +76,6 @@ pub fn run(agent_cli: &str, role_str: &str, task_uuid: &str, extra_params: &[Str
 mod tests {
     use super::*;
     use crate::lock::Lock;
-    use crate::log::read_last_status;
-    use crate::task::TaskFrontmatter;
 
     #[test]
     fn role_parsing_accepts_known_values_and_rejects_others() {
