@@ -9,6 +9,7 @@ mod project;
 mod prompts;
 mod pty;
 mod review;
+mod subprocess;
 mod task;
 mod tui;
 

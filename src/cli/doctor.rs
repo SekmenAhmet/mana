@@ -1,10 +1,6 @@
 use crate::config::{AgentConfig, Config, load_config};
 use crate::project::mana_home;
-use std::io::Read;
-use std::process::Stdio;
-use std::time::{Duration, Instant};
-
-const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
+use crate::subprocess::{VERSION_CHECK_TIMEOUT, capture_version_output};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct DoctorIssue {
@@ -38,45 +34,7 @@ pub fn diagnose(config: &Config) -> Vec<DoctorIssue> {
 }
 
 fn current_version(agent: &AgentConfig) -> anyhow::Result<String> {
-    current_version_with_timeout(agent, VERSION_CHECK_TIMEOUT)
-}
-
-fn current_version_with_timeout(agent: &AgentConfig, timeout: Duration) -> anyhow::Result<String> {
-    let path = &agent.path;
-    let mut child = std::process::Command::new(path)
-        .arg("--version")
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()?;
-
-    let start = Instant::now();
-    loop {
-        match child.try_wait()? {
-            Some(_status) => {
-                // Process has exited, read stdout
-                let mut output = String::new();
-                if let Some(mut stdout) = child.stdout.take() {
-                    stdout.read_to_string(&mut output)?;
-                }
-                return Ok(output.trim().to_string());
-            }
-            None => {
-                // Process still running
-                if start.elapsed() > timeout {
-                    // Timeout exceeded
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(anyhow::anyhow!(
-                        "subprocess timeout for '{}': exceeded {:?}",
-                        path,
-                        timeout
-                    ));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-            }
-        }
-    }
+    capture_version_output(std::path::Path::new(&agent.path), VERSION_CHECK_TIMEOUT)
 }
 
 pub fn run() -> anyhow::Result<()> {
@@ -128,22 +86,14 @@ mod tests {
     }
 
     #[cfg(unix)]
-    fn write_version_script(dir: &std::path::Path, name: &str, printed_version: &str) -> String {
-        use std::os::unix::fs::PermissionsExt;
-
-        let script = dir.join(name);
-        std::fs::write(&script, format!("#!/bin/sh\necho {printed_version}\n")).unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-        script.to_string_lossy().to_string()
-    }
-
-    #[cfg(unix)]
     #[test]
     fn diagnose_flags_outdated_version() {
+        use crate::subprocess::write_version_script;
+
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_version_script(tmp.path(), "agent.sh", "2.0.0");
+        let path = write_version_script(tmp.path(), "agent.sh", "2.0.0")
+            .to_string_lossy()
+            .to_string();
 
         let mut config = Config::default();
         config.models.insert(
@@ -163,8 +113,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn diagnose_reports_no_issue_when_version_matches() {
+        use crate::subprocess::write_version_script;
+
         let tmp = tempfile::tempdir().unwrap();
-        let path = write_version_script(tmp.path(), "agent.sh", "1.0.0");
+        let path = write_version_script(tmp.path(), "agent.sh", "1.0.0")
+            .to_string_lossy()
+            .to_string();
 
         let mut config = Config::default();
         config.models.insert(
@@ -176,19 +130,6 @@ mod tests {
             },
         );
         assert!(diagnose(&config).is_empty());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn current_version_reads_stdout_on_normal_exit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let path = write_version_script(tmp.path(), "agent.sh", "3.1.4");
-        let agent = AgentConfig {
-            name: "agent".into(),
-            version: "irrelevant".into(),
-            path,
-        };
-        assert_eq!(current_version(&agent).unwrap(), "3.1.4");
     }
 
     #[test]
@@ -214,33 +155,5 @@ mod tests {
         );
         crate::config::save_config(&config_path, &config).unwrap();
         assert!(run_at(&config_path).is_ok());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn current_version_times_out_on_unresponsive_binary() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = tempfile::tempdir().unwrap();
-        let script = tmp.path().join("slow-agent.sh");
-        std::fs::write(&script, "#!/bin/sh\nsleep 5\n").unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-
-        let agent = AgentConfig {
-            name: "slow".to_string(),
-            version: "1.0".to_string(),
-            path: script.to_string_lossy().to_string(),
-        };
-
-        let start = std::time::Instant::now();
-        let result = current_version_with_timeout(&agent, std::time::Duration::from_millis(200));
-        assert!(result.is_err(), "expected a timeout error, got {result:?}");
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "should time out near the 200ms bound, took {:?}",
-            start.elapsed()
-        );
     }
 }
