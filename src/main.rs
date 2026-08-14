@@ -10,6 +10,7 @@ mod review;
 mod prompts;
 mod pty;
 mod monitor;
+mod tui;
 
 use clap::Parser;
 use cli::{Cli, Command};
