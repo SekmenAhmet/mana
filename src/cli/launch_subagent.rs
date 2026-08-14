@@ -25,6 +25,15 @@ impl FromStr for Role {
     }
 }
 
+/// Builds the argv passed to the sub-agent CLI: the autonomous-mode flag
+/// first, then whatever extra params the caller (the PM's `mana launch
+/// --subagent ...` invocation) forwarded verbatim.
+fn build_agent_args(flag: &str, extra_params: &[String]) -> Vec<String> {
+    let mut args = vec![flag.to_string()];
+    args.extend_from_slice(extra_params);
+    args
+}
+
 fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Result<()> {
     if config.models.contains_key(agent_cli) {
         Ok(())
@@ -95,8 +104,7 @@ pub fn run(
         Role::Reviewer => reviewer_prompt(&task, &task_path, &review_path),
     };
 
-    let mut args = vec![flag.to_string()];
-    args.extend_from_slice(extra_params);
+    let args = build_agent_args(flag, extra_params);
     let mut session = pty::spawn(agent_cli, &args)?;
     session.writer.write_all(prompt.as_bytes())?;
     session.writer.write_all(b"\n")?;
@@ -144,6 +152,20 @@ mod tests {
     fn ensure_agent_registered_rejects_unknown_agent() {
         let config = crate::config::Config::default();
         assert!(ensure_agent_registered(&config, "claude").is_err());
+    }
+
+    #[test]
+    fn build_agent_args_puts_flag_first_then_extra_params() {
+        let extra = vec!["--foo".to_string(), "bar".to_string()];
+        assert_eq!(
+            build_agent_args("--dangerously-skip-permissions", &extra),
+            vec!["--dangerously-skip-permissions", "--foo", "bar"]
+        );
+    }
+
+    #[test]
+    fn build_agent_args_with_no_extra_params() {
+        assert_eq!(build_agent_args("--flag", &[]), vec!["--flag"]);
     }
 
     #[test]

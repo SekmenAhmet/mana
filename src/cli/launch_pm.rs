@@ -140,25 +140,36 @@ fn run_event_loop(
 
         if event::poll(Duration::from_millis(50))?
             && let Event::Key(key) = event::read()?
+            && let Some(app_event) = map_key_event(key.code, key.modifiers)
+            && !apply_app_event(app_event, app, writer)?
         {
-            match map_key_event(key.code, key.modifiers) {
-                Some(AppEvent::Quit) => return Ok(()),
-                Some(AppEvent::ToggleGraph) => app.toggle_graph(),
-                Some(AppEvent::Key(c)) => app.input.push(c),
-                Some(AppEvent::Backspace) => {
-                    app.input.pop();
-                }
-                Some(AppEvent::Enter) => {
-                    let message = std::mem::take(&mut app.input);
-                    if !message.is_empty() {
-                        writer.write_all(message.as_bytes())?;
-                        writer.write_all(b"\n")?;
-                    }
-                }
-                None => {}
+            return Ok(());
+        }
+    }
+}
+
+/// Applies one already-decoded key event to the app state / the PM's PTY
+/// stdin. Returns `Ok(false)` to signal the event loop should quit, `Ok(true)`
+/// to keep going. Kept separate from `run_event_loop` (and its real
+/// `Terminal`/`event::poll`) so the per-key decision logic is testable with
+/// just an in-memory `Write` sink.
+fn apply_app_event(event: AppEvent, app: &mut App, writer: &mut dyn Write) -> anyhow::Result<bool> {
+    match event {
+        AppEvent::Quit => return Ok(false),
+        AppEvent::ToggleGraph => app.toggle_graph(),
+        AppEvent::Key(c) => app.input.push(c),
+        AppEvent::Backspace => {
+            app.input.pop();
+        }
+        AppEvent::Enter => {
+            let message = std::mem::take(&mut app.input);
+            if !message.is_empty() {
+                writer.write_all(message.as_bytes())?;
+                writer.write_all(b"\n")?;
             }
         }
     }
+    Ok(true)
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &App, nodes: &[GraphNode]) {
@@ -256,5 +267,132 @@ mod tests {
             },
         );
         assert!(ensure_agent_registered(&config, "claude").is_ok());
+    }
+
+    #[test]
+    fn apply_app_event_quit_returns_false() {
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+        let keep_going = apply_app_event(AppEvent::Quit, &mut app, &mut writer).unwrap();
+        assert!(!keep_going);
+    }
+
+    #[test]
+    fn apply_app_event_toggle_graph_flips_mode() {
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+        assert_eq!(app.mode, AppMode::Chat);
+        apply_app_event(AppEvent::ToggleGraph, &mut app, &mut writer).unwrap();
+        assert_eq!(app.mode, AppMode::Graph);
+    }
+
+    #[test]
+    fn apply_app_event_key_appends_to_input() {
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+        apply_app_event(AppEvent::Key('h'), &mut app, &mut writer).unwrap();
+        apply_app_event(AppEvent::Key('i'), &mut app, &mut writer).unwrap();
+        assert_eq!(app.input, "hi");
+    }
+
+    #[test]
+    fn apply_app_event_backspace_pops_last_char() {
+        let mut app = App::new();
+        app.input = "hi".to_string();
+        let mut writer: Vec<u8> = Vec::new();
+        apply_app_event(AppEvent::Backspace, &mut app, &mut writer).unwrap();
+        assert_eq!(app.input, "h");
+    }
+
+    #[test]
+    fn apply_app_event_enter_writes_input_and_clears_it() {
+        let mut app = App::new();
+        app.input = "hello pm".to_string();
+        let mut writer: Vec<u8> = Vec::new();
+        apply_app_event(AppEvent::Enter, &mut app, &mut writer).unwrap();
+        assert_eq!(writer, b"hello pm\n");
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn apply_app_event_enter_on_empty_input_writes_nothing() {
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+        apply_app_event(AppEvent::Enter, &mut app, &mut writer).unwrap();
+        assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn spawn_pty_reader_forwards_bytes_from_the_reader() {
+        let cursor = std::io::Cursor::new(b"hello from the pm's pty".to_vec());
+        let rx = spawn_pty_reader(Box::new(cursor));
+        let received = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(received, b"hello from the pm's pty");
+    }
+
+    #[test]
+    fn spawn_pty_reader_closes_channel_when_reader_is_empty() {
+        let cursor = std::io::Cursor::new(Vec::new());
+        let rx = spawn_pty_reader(Box::new(cursor));
+        assert!(rx.recv_timeout(std::time::Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn draw_renders_chat_and_input_blocks() {
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(40, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.push_output(b"salut");
+
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+
+        let content =
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .fold(String::new(), |mut acc, cell| {
+                    acc.push_str(cell.symbol());
+                    acc
+                });
+        assert!(content.contains("Chat"));
+        assert!(content.contains("Input"));
+        assert!(content.contains("salut"));
+    }
+
+    #[test]
+    fn draw_renders_graph_pane_in_graph_mode() {
+        use crate::task::Role;
+        use ratatui::backend::TestBackend;
+
+        let backend = TestBackend::new(80, 10);
+        let mut terminal = Terminal::new(backend).unwrap();
+        let mut app = App::new();
+        app.toggle_graph();
+        let nodes = vec![GraphNode {
+            agent_uuid: "agent-1".to_string(),
+            model: "claude".to_string(),
+            role: Role::Executor,
+            task_uuid: "task-1".to_string(),
+            status: None,
+        }];
+
+        terminal.draw(|frame| draw(frame, &app, &nodes)).unwrap();
+
+        let content =
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .fold(String::new(), |mut acc, cell| {
+                    acc.push_str(cell.symbol());
+                    acc
+                });
+        assert!(content.contains("Graph"));
+        assert!(content.contains("task-1"));
     }
 }
