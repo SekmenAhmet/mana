@@ -1,0 +1,7 @@
+# Raw command output. Not committed: it routinely contains connection strings,
+# tokens and internal hostnames.
+samples/
+
+# How many times each command was asked about without a filter appearing.
+# A local judgement, not something to impose on whoever clones this.
+asked
