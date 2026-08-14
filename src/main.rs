@@ -32,7 +32,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Doctor => cli::doctor::run()?,
-        Command::Upgrade => println!("mana upgrade: pas encore disponible"),
+        Command::Upgrade => cli::upgrade::run(),
     }
     Ok(())
 }
