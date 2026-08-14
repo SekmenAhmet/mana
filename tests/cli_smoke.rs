@@ -9,3 +9,11 @@ fn help_lists_all_subcommands() {
         assert!(stdout.contains(expected), "missing subcommand: {expected}");
     }
 }
+
+#[test]
+fn version_flag_prints_cargo_package_version() {
+    let mut cmd = Command::cargo_bin("mana").unwrap();
+    let output = cmd.arg("--version").output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.trim(), format!("mana {}", env!("CARGO_PKG_VERSION")));
+}
