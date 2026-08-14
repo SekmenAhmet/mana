@@ -20,7 +20,7 @@ fn main() -> anyhow::Result<()> {
         Command::Install => cli::install::run()?,
         Command::Uninstall { cli } => cli::uninstall::run(&cli)?,
         Command::Launch(_args) => println!("mana launch: not yet implemented"),
-        Command::Doctor => println!("mana doctor: not yet implemented"),
+        Command::Doctor => cli::doctor::run()?,
         Command::Upgrade => println!("mana upgrade: pas encore disponible"),
     }
     Ok(())
