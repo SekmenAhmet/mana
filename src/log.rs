@@ -38,7 +38,7 @@ pub fn read_last_status(path: &Path) -> anyhow::Result<Option<Status>> {
         return Ok(None);
     }
     let contents = std::fs::read_to_string(path)?;
-    let last_line = contents.lines().filter(|l| !l.trim().is_empty()).last();
+    let last_line = contents.lines().rfind(|l| !l.trim().is_empty());
     match last_line {
         None => Ok(None),
         Some(line) => {

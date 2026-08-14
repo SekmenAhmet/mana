@@ -22,16 +22,16 @@ pub fn diagnose(config: &Config) -> Vec<DoctorIssue> {
             });
             continue;
         }
-        if let Ok(current) = current_version(agent) {
-            if current != agent.version {
-                issues.push(DoctorIssue {
-                    agent: name.clone(),
-                    problem: format!(
-                        "version enregistree {} != version actuelle {current}",
-                        agent.version
-                    ),
-                });
-            }
+        if let Ok(current) = current_version(agent)
+            && current != agent.version
+        {
+            issues.push(DoctorIssue {
+                agent: name.clone(),
+                problem: format!(
+                    "version enregistree {} != version actuelle {current}",
+                    agent.version
+                ),
+            });
         }
     }
     issues

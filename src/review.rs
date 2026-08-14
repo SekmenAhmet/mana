@@ -1,14 +1,16 @@
 use std::path::Path;
 
 #[derive(Debug, Clone, PartialEq)]
+#[allow(dead_code)]
 pub enum Verdict {
     Validated,
     Rejected { problems: Vec<String> },
 }
 
+#[allow(dead_code)]
 pub fn render_review(task_uuid: &str, verdict: &Verdict) -> String {
     match verdict {
-        Verdict::Validated => format!("## Verdict : \u{2705} Valid\u{e9}\n"),
+        Verdict::Validated => "## Verdict : \u{2705} Valid\u{e9}\n".to_string(),
         Verdict::Rejected { problems } => {
             let mut out = format!(
                 "# Review — {task_uuid}\n\n## Verdict : \u{274c} Rejet\u{e9}\n\n### Probl\u{e8}mes identifi\u{e9}s\n\n"
@@ -21,6 +23,7 @@ pub fn render_review(task_uuid: &str, verdict: &Verdict) -> String {
     }
 }
 
+#[allow(dead_code)]
 pub fn write_review(path: &Path, task_uuid: &str, verdict: &Verdict) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -29,6 +32,7 @@ pub fn write_review(path: &Path, task_uuid: &str, verdict: &Verdict) -> anyhow::
     Ok(())
 }
 
+#[allow(dead_code)]
 pub fn parse_verdict(contents: &str) -> anyhow::Result<Verdict> {
     if contents.contains("\u{2705} Valid\u{e9}") {
         return Ok(Verdict::Validated);
@@ -68,11 +72,11 @@ pub fn parse_verdict(contents: &str) -> anyhow::Result<Verdict> {
             }
 
             // If we have existing problems, treat this line as a continuation
-            if !problems.is_empty() {
-                if let Some(last) = problems.last_mut() {
-                    last.push(' ');
-                    last.push_str(trimmed);
-                }
+            if !problems.is_empty()
+                && let Some(last) = problems.last_mut()
+            {
+                last.push(' ');
+                last.push_str(trimmed);
             }
         }
 

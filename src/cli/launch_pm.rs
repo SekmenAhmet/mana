@@ -138,24 +138,24 @@ fn run_event_loop(
 
         terminal.draw(|frame| draw(frame, app, &nodes))?;
 
-        if event::poll(Duration::from_millis(50))? {
-            if let Event::Key(key) = event::read()? {
-                match map_key_event(key.code, key.modifiers) {
-                    Some(AppEvent::Quit) => return Ok(()),
-                    Some(AppEvent::ToggleGraph) => app.toggle_graph(),
-                    Some(AppEvent::Key(c)) => app.input.push(c),
-                    Some(AppEvent::Backspace) => {
-                        app.input.pop();
-                    }
-                    Some(AppEvent::Enter) => {
-                        let message = std::mem::take(&mut app.input);
-                        if !message.is_empty() {
-                            writer.write_all(message.as_bytes())?;
-                            writer.write_all(b"\n")?;
-                        }
-                    }
-                    None => {}
+        if event::poll(Duration::from_millis(50))?
+            && let Event::Key(key) = event::read()?
+        {
+            match map_key_event(key.code, key.modifiers) {
+                Some(AppEvent::Quit) => return Ok(()),
+                Some(AppEvent::ToggleGraph) => app.toggle_graph(),
+                Some(AppEvent::Key(c)) => app.input.push(c),
+                Some(AppEvent::Backspace) => {
+                    app.input.pop();
                 }
+                Some(AppEvent::Enter) => {
+                    let message = std::mem::take(&mut app.input);
+                    if !message.is_empty() {
+                        writer.write_all(message.as_bytes())?;
+                        writer.write_all(b"\n")?;
+                    }
+                }
+                None => {}
             }
         }
     }

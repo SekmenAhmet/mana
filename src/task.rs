@@ -39,6 +39,7 @@ pub fn parse_task_file(contents: &str) -> anyhow::Result<Task> {
     Ok(Task { frontmatter, body })
 }
 
+#[allow(dead_code)]
 pub fn render_task_file(task: &Task) -> String {
     let yaml = serde_yaml::to_string(&task.frontmatter).unwrap_or_default();
     format!("---\n{yaml}---\n\n{}", task.body)
@@ -49,6 +50,7 @@ pub fn read_task(path: &Path) -> anyhow::Result<Task> {
     parse_task_file(&contents)
 }
 
+#[allow(dead_code)]
 pub fn write_task(path: &Path, task: &Task) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
