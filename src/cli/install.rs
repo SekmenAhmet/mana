@@ -64,13 +64,19 @@ pub fn run() -> anyhow::Result<()> {
         .with_prompt("Select Agent config (space: select, enter: save)")
         .items(KNOWN_CLIS)
         .interact()?;
+    let selected_names: Vec<&str> = selection.into_iter().map(|idx| KNOWN_CLIS[idx]).collect();
 
     let home = mana_home()?;
-    let config_path = home.join("config.yaml");
-    let mut config = load_config(&config_path)?;
+    install_selected(&selected_names, &home.join("config.yaml"))
+}
 
-    for idx in selection {
-        let name = KNOWN_CLIS[idx];
+/// Resolves each selected CLI name to an `AgentConfig` and persists the
+/// resulting config. Kept separate from `run` so the resolve+save loop is
+/// testable without going through the interactive `MultiSelect` prompt.
+fn install_selected(names: &[&str], config_path: &std::path::Path) -> anyhow::Result<()> {
+    let mut config = load_config(config_path)?;
+
+    for &name in names {
         match resolve_agent(name) {
             Ok(agent) => {
                 println!("{name}: {} ({})", agent.version, agent.path);
@@ -80,7 +86,7 @@ pub fn run() -> anyhow::Result<()> {
         }
     }
 
-    save_config(&config_path, &config)?;
+    save_config(config_path, &config)?;
     Ok(())
 }
 
@@ -100,6 +106,30 @@ mod tests {
     fn resolve_agent_errors_on_unknown_binary() {
         let result = resolve_agent("this-binary-does-not-exist-anywhere");
         assert!(result.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_selected_persists_resolved_agent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+
+        install_selected(&["cat"], &config_path).unwrap();
+
+        let config = load_config(&config_path).unwrap();
+        let agent = config.models.get("cat").expect("cat should be resolved");
+        assert!(agent.path.ends_with("cat"));
+    }
+
+    #[test]
+    fn install_selected_skips_unresolvable_names_but_still_saves() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config_path = tmp.path().join("config.yaml");
+
+        install_selected(&["this-binary-does-not-exist-anywhere"], &config_path).unwrap();
+
+        let config = load_config(&config_path).unwrap();
+        assert!(config.models.is_empty());
     }
 
     #[cfg(unix)]
