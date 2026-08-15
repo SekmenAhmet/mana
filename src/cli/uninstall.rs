@@ -35,6 +35,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0".into(),
                 path: "/bin/claude".into(),
+                version_args: vec!["--version".into()],
             },
         );
         assert!(remove_agent(&mut config, "claude"));
@@ -58,6 +59,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0".into(),
                 path: "/bin/claude".into(),
+                version_args: vec!["--version".into()],
             },
         );
         save_config(&config_path, &config).unwrap();

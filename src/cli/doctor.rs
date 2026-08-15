@@ -39,7 +39,11 @@ pub fn diagnose(config: &Config) -> Vec<DoctorIssue> {
 }
 
 fn current_version(agent: &AgentConfig) -> anyhow::Result<String> {
-    capture_version_output(std::path::Path::new(&agent.path), VERSION_CHECK_TIMEOUT)
+    capture_version_output(
+        std::path::Path::new(&agent.path),
+        &agent.version_args,
+        VERSION_CHECK_TIMEOUT,
+    )
 }
 
 /// Applies the safe, automatic half of doctor.md's "Actions proposees":
@@ -127,6 +131,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0".into(),
                 path: "/nonexistent/path/claude".into(),
+                version_args: vec!["--version".into()],
             },
         );
         let issues = diagnose(&config);
@@ -163,6 +168,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0.0".into(),
                 path,
+                version_args: vec!["--version".into()],
             },
         );
         let issues = diagnose(&config);
@@ -194,6 +200,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0.0".into(),
                 path,
+                version_args: vec!["--version".into()],
             },
         );
         assert!(diagnose(&config).is_empty());
@@ -208,6 +215,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0.0".into(),
                 path: "/bin/claude".into(),
+                version_args: vec!["--version".into()],
             },
         );
         let issue = DoctorIssue::OutdatedVersion {
@@ -269,6 +277,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0".into(),
                 path: "/nonexistent/path/claude".into(),
+                version_args: vec!["--version".into()],
             },
         );
         crate::config::save_config(&config_path, &config).unwrap();
@@ -293,6 +302,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0.0".into(),
                 path,
+                version_args: vec!["--version".into()],
             },
         );
         save_config(&config_path, &config).unwrap();
@@ -314,6 +324,7 @@ mod tests {
                 name: "claude".into(),
                 version: "1.0".into(),
                 path: "/nonexistent/path/claude".into(),
+                version_args: vec!["--version".into()],
             },
         );
         save_config(&config_path, &config).unwrap();

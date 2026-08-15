@@ -17,9 +17,19 @@ via `~/.mana/catalog.local.toml`.
 
 ## Usage
 
-    mana install                 # register the CLIs installed on this machine
+    mana install                 # register the catalogued CLIs found on this machine
     mana doctor                  # check the configuration
     mana launch claude           # run Claude Code as the PM, in mana's TUI
+
+`mana install` offers exactly the CLIs the catalogue knows — a CLI with no
+entry has no spawn flags, no failure signatures and no PM driver, so
+registering it would only put a name in the PM's `list_agents` that every
+dispatch then fails on. Add one by dropping an entry in
+`~/.mana/catalog.local.toml` and it shows up in the selector like any other.
+
+Sub-agents are never launched from a shell: the PM dispatches them through
+mana's own tools, which is what lets mana pick the (CLI × model), own the
+worktree and observe the run.
 
 In the TUI: type to talk to the PM, `Enter` to send, `Ctrl+G` for the graph
 pane, `Ctrl+C` to quit. `Esc` does nothing — it is the interrupt key of the
@@ -31,8 +41,9 @@ Everything below is covered by `cargo test` except what only a paid CLI can
 answer: whether the flags mana passes are the flags claude honours, and
 whether the PM actually behaves like one. That is what this checklist is for.
 
-1. `cargo run -- install` — pick `claude`; confirm it lands in
-   `~/.mana/config.toml` with a real version and path.
+1. `cargo run -- install` — the list offered is the catalogue's
+   (`claude`, `agy`, `copilot`, `opencode`). Pick `claude`; confirm it lands in
+   `~/.mana/config.toml` with a real version, path and `version_args`.
 2. `cargo run -- doctor` — no issues reported.
 3. From a scratch **git** project directory, run `cargo run -- launch claude`.
    Before typing anything, confirm:
@@ -66,6 +77,10 @@ whether the PM actually behaves like one. That is what this checklist is for.
     survives** (`ps aux | grep claude`) — neither the PM nor the
     `mana mcp-server` it had spawned.
 
-Known gap: `mana launch agy` is refused with a message naming task 3.2 — the
-`oneshot-continue` driver and the sentinel tool channel are not implemented
-yet.
+The walkthrough above is written for `claude` (the `stream` driver, tools over
+MCP). The same steps apply to the other catalogued CLIs — `agy`
+(`oneshot-continue`, tools over the sentinel channel), `copilot` and
+`opencode` (ACP) — with the differences the catalogue declares: step 5 has
+nothing to check where `[pm].permission_args` is empty, and on the sentinel
+channel step 4's tool call appears as a fenced ```mana block in the transcript
+rather than as an MCP call.

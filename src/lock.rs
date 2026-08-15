@@ -3,8 +3,9 @@
 //! Replaces the v1 YAML lock: a `BTreeMap<agent_uuid, LockEntry>` rewritten
 //! wholesale (read the whole map, insert one key, write the whole map back)
 //! on every single dispatch. That shape is a read-modify-write race waiting
-//! to happen the moment two `mana launch --subagent` calls land close
-//! together. mana is this file's only writer, and a dispatch record never
+//! to happen the moment two dispatches land close together (v1 invited it by
+//! having each sub-agent process write the lock itself; in v2 mana dispatches
+//! them). mana is this file's only writer, and a dispatch record never
 //! changes after it's written, so a strict-append JSONL format removes the
 //! race by construction — there is nothing to "modify", only to append.
 //!

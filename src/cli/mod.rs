@@ -1,11 +1,10 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod dev;
 pub mod doctor;
 pub mod install;
 pub mod launch_pm;
-pub mod launch_subagent;
 pub mod uninstall;
 pub mod upgrade;
 
@@ -22,8 +21,18 @@ pub enum Command {
     Install,
     /// Remove a CLI agent
     Uninstall { cli: String },
-    /// Launch an agent in PM mode, or a sub-agent with --subagent
-    Launch(LaunchArgs),
+    // One argument and no roles: sub-agents are never launched from a shell.
+    // The PM dispatches them through mana's own tool channel
+    // (`launch_subagent`, design §5), which is what lets mana pick the CLI and
+    // model, own the worktree and observe the run. v1's
+    // `mana launch --subagent <cli> --role <role> --assign <uuid>` was the
+    // shell-out protocol that made all three impossible; it is gone, and this
+    // comment is not a doc comment so the rationale stays out of `--help`.
+    /// Launch a CLI agent in PM mode
+    Launch {
+        /// CLI agent to launch in PM mode (e.g. claude)
+        agent: String,
+    },
     /// Diagnose the configuration
     Doctor,
     /// Update mana
@@ -51,24 +60,6 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         project_root: PathBuf,
     },
-}
-
-#[derive(Args)]
-pub struct LaunchArgs {
-    /// CLI agent to launch in PM mode (e.g. claude). Absent if --subagent is used.
-    pub agent: Option<String>,
-
-    #[arg(long)]
-    pub subagent: Option<String>,
-
-    #[arg(long)]
-    pub role: Option<String>,
-
-    #[arg(long)]
-    pub assign: Option<String>,
-
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub params: Vec<String>,
 }
 
 /// clap's generated `help` subcommand only understands `mana help <cmd>`.
