@@ -21,7 +21,6 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 strip-ansi-escapes = "0.2"
 anyhow = "1"
-thiserror = "1"
 dirs = "5"
 which = "6"
 dialoguer = "0.11"
