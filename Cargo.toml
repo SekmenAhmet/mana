@@ -2,6 +2,9 @@
 name = "mana"
 version = "0.1.0"
 edition = "2024"
+# Not on crates.io yet; releases ship as GitHub binaries. Flipping this
+# requires choosing a license first (deny gates on it).
+publish = false
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

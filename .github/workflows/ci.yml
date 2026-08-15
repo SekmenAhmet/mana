@@ -40,3 +40,43 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --verbose
+
+  health:
+    name: deps & coverage
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # The dependency gate: RustSec advisories, license allowlist, duplicate
+      # majors, source restrictions. Renovate proposes updates; this blocks
+      # the bad ones. Config + accepted-debt list live in deny.toml.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+
+      - name: Cache cargo/target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      # Coverage was previously measured by hand per PR (74.79% -> 91.77%
+      # region across three of them); this makes the number free and visible
+      # on every push instead.
+      - name: Coverage
+        run: |
+          cargo llvm-cov --all-features --summary-only | tee coverage.txt
+          cargo llvm-cov report --lcov --output-path lcov.info
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage
+          path: |
+            coverage.txt
+            lcov.info
