@@ -3,25 +3,25 @@ use std::path::Path;
 
 pub fn pm_prompt(project_name: &str) -> String {
     format!(
-        "Tu es le Main Agent (Project Manager) orchestre par mana pour le projet '{project_name}'.\n\
-        Tu ne codes jamais toi-meme. Ton role : discuter avec l'utilisateur pour comprendre le besoin, \
-        decouper le travail en taches, et deleguer chaque tache a un sous-agent via la commande shell \
+        "You are the Main Agent (Project Manager) orchestrated by mana for the project '{project_name}'.\n\
+        You never write code yourself. Your role: talk with the user to understand what they need, \
+        break the work down into tasks, and delegate each task to a sub-agent via the shell command \
         `mana launch --subagent <cli> --role <executor|reviewer> --assign <task-uuid>`.\n\n\
-        Pour creer une tache, ecris un fichier `.mana/projects/{project_name}/tasks/<uuid>.md` avec un \
-        frontmatter YAML (id, title, role, depends-on optionnel) suivi du prompt destine au sous-agent.\n\n\
-        Lance d'abord un executor pour chaque tache de code, puis un reviewer une fois l'executor termine, \
-        en lui assignant la meme tache. Lis le fichier de review ecrit dans `.mana/projects/{project_name}/reviews/<uuid>.md` \
-        pour decider si la tache est terminee ou si elle doit etre relancee avec des corrections.\n\n\
-        Commence par poser des questions a l'utilisateur pour bien comprendre ce qu'il veut construire."
+        To create a task, write a file `.mana/projects/{project_name}/tasks/<uuid>.md` with a YAML \
+        frontmatter (id, title, role, depends-on optional) followed by the prompt intended for the sub-agent.\n\n\
+        Launch an executor first for each code task, then a reviewer once the executor is done, \
+        assigning it the same task. Read the review file written to `.mana/projects/{project_name}/reviews/<uuid>.md` \
+        to decide whether the task is complete or needs to be relaunched with corrections.\n\n\
+        Start by asking the user questions to properly understand what they want to build."
     )
 }
 
 pub fn executor_prompt(task: &Task, task_path: &Path) -> String {
     format!(
-        "Tu es un sous-agent executor orchestre par mana. Ta tache est decrite dans {} (id: {}, titre: {}).\n\n\
-        Realise exactement ce qui est demande : ecris le code, ajoute des tests si pertinent, verifie que ca compile/passe. \
-        Quand c'est termine, arrete-toi simplement — n'attends aucune confirmation, personne ne repondra.\n\n\
-        --- Contenu de la tache ---\n{}",
+        "You are an executor sub-agent orchestrated by mana. Your task is described in {} (id: {}, title: {}).\n\n\
+        Do exactly what's asked: write the code, add tests where relevant, verify it builds/passes. \
+        When you're done, just stop — don't wait for any confirmation, nobody will respond.\n\n\
+        --- Task content ---\n{}",
         task_path.display(),
         task.frontmatter.id,
         task.frontmatter.title,
@@ -31,13 +31,13 @@ pub fn executor_prompt(task: &Task, task_path: &Path) -> String {
 
 pub fn reviewer_prompt(task: &Task, task_path: &Path, review_path: &Path) -> String {
     format!(
-        "Tu es un sous-agent reviewer orchestre par mana. Relis le travail realise pour la tache decrite dans {} \
-        (id: {}, titre: {}), en comparant avec les changements de code produits (regarde le diff git le cas echeant).\n\n\
-        Ecris ton verdict dans {} :\n\
-        - Si tout est conforme, ecris UNIQUEMENT la ligne `## Verdict : \u{2705} Valid\u{e9}` — pas de resume, pas de prose supplementaire.\n\
-        - Si tu trouves des problemes, ecris `## Verdict : \u{274c} Rejet\u{e9}` suivi d'une section `### Problemes identifies` \
-        avec une liste numerotee, un probleme concret par ligne.\n\n\
-        --- Contenu de la tache ---\n{}",
+        "You are a reviewer sub-agent orchestrated by mana. Review the work done for the task described in {} \
+        (id: {}, title: {}), comparing it against the code changes produced (check the git diff if relevant).\n\n\
+        Write your verdict in {}:\n\
+        - If everything is correct, write ONLY the line `## Verdict: \u{2705} Validated` — no summary, no extra prose.\n\
+        - If you find issues, write `## Verdict: \u{274c} Rejected` followed by a `### Issues found` section \
+        with a numbered list, one concrete issue per line.\n\n\
+        --- Task content ---\n{}",
         task_path.display(),
         task.frontmatter.id,
         task.frontmatter.title,
@@ -56,20 +56,20 @@ mod tests {
         Task {
             frontmatter: TaskFrontmatter {
                 id: "uuid-1".to_string(),
-                title: "Titre de test".to_string(),
+                title: "Test title".to_string(),
                 role: Role::Executor,
                 depends_on: vec![],
             },
-            body: "# Description\n\nFais X.\n".to_string(),
+            body: "# Description\n\nDo X.\n".to_string(),
         }
     }
 
     #[test]
     fn pm_prompt_mentions_project_and_launch_command() {
-        let prompt = pm_prompt("mon-api");
-        assert!(prompt.contains("mon-api"));
+        let prompt = pm_prompt("my-api");
+        assert!(prompt.contains("my-api"));
         assert!(prompt.contains("mana launch --subagent"));
-        assert!(prompt.contains("ne codes jamais"));
+        assert!(prompt.contains("never write code"));
     }
 
     #[test]
@@ -77,9 +77,9 @@ mod tests {
         let task = sample_task();
         let path = PathBuf::from("/tmp/tasks/uuid-1.md");
         let prompt = executor_prompt(&task, &path);
-        assert!(prompt.contains("Fais X."));
+        assert!(prompt.contains("Do X."));
         assert!(prompt.contains("uuid-1.md"));
-        assert!(prompt.contains("Titre de test"));
+        assert!(prompt.contains("Test title"));
     }
 
     #[test]
@@ -88,8 +88,8 @@ mod tests {
         let task_path = PathBuf::from("/tmp/tasks/uuid-1.md");
         let review_path = PathBuf::from("/tmp/reviews/uuid-1.md");
         let prompt = reviewer_prompt(&task, &task_path, &review_path);
-        assert!(prompt.contains("UNIQUEMENT la ligne"));
-        assert!(prompt.contains("Probleme"));
+        assert!(prompt.contains("ONLY the line"));
+        assert!(prompt.contains("Issues found"));
         assert!(prompt.contains("uuid-1.md"));
     }
 }

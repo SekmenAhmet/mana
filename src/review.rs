@@ -10,10 +10,10 @@ pub enum Verdict {
 #[allow(dead_code)]
 pub fn render_review(task_uuid: &str, verdict: &Verdict) -> String {
     match verdict {
-        Verdict::Validated => "## Verdict : \u{2705} Valid\u{e9}\n".to_string(),
+        Verdict::Validated => "## Verdict: \u{2705} Validated\n".to_string(),
         Verdict::Rejected { problems } => {
             let mut out = format!(
-                "# Review — {task_uuid}\n\n## Verdict : \u{274c} Rejet\u{e9}\n\n### Probl\u{e8}mes identifi\u{e9}s\n\n"
+                "# Review — {task_uuid}\n\n## Verdict: \u{274c} Rejected\n\n### Issues found\n\n"
             );
             for (i, problem) in problems.iter().enumerate() {
                 out.push_str(&format!("{}. {}\n", i + 1, problem));
@@ -34,21 +34,21 @@ pub fn write_review(path: &Path, task_uuid: &str, verdict: &Verdict) -> anyhow::
 
 #[allow(dead_code)]
 pub fn parse_verdict(contents: &str) -> anyhow::Result<Verdict> {
-    if contents.contains("\u{2705} Valid\u{e9}") {
+    if contents.contains("\u{2705} Validated") {
         return Ok(Verdict::Validated);
     }
-    if contents.contains("\u{274c} Rejet\u{e9}") {
+    if contents.contains("\u{274c} Rejected") {
         let mut problems = Vec::new();
         let mut found_problems_section = false;
 
         for line in contents.lines() {
-            // Check if this line marks the problems section
-            if line.contains("Probl\u{e8}mes identifi\u{e9}s") {
+            // Check if this line marks the issues section
+            if line.contains("Issues found") {
                 found_problems_section = true;
                 continue;
             }
 
-            // Only process lines after the problems section header
+            // Only process lines after the issues section header
             if !found_problems_section {
                 continue;
             }
@@ -60,18 +60,18 @@ pub fn parse_verdict(contents: &str) -> anyhow::Result<Verdict> {
                 continue;
             }
 
-            // Check if this line starts a new problem (matches N. format)
+            // Check if this line starts a new issue (matches N. format)
             if let Some(dot_pos) = trimmed.find(". ") {
                 let prefix = &trimmed[..dot_pos];
                 if prefix.chars().all(|c| c.is_ascii_digit()) && !prefix.is_empty() {
-                    // This is a new problem
+                    // This is a new issue
                     let problem_text = trimmed[dot_pos + 2..].to_string();
                     problems.push(problem_text);
                     continue;
                 }
             }
 
-            // If we have existing problems, treat this line as a continuation
+            // If we have existing issues, treat this line as a continuation
             if !problems.is_empty()
                 && let Some(last) = problems.last_mut()
             {
@@ -93,20 +93,20 @@ mod tests {
     fn validated_review_has_no_extra_prose() {
         let rendered = render_review("task-1", &Verdict::Validated);
         // Per spec: validated reviews must be ONLY the verdict line, no title or extra prose
-        assert_eq!(rendered, "## Verdict : \u{2705} Valid\u{e9}\n");
+        assert_eq!(rendered, "## Verdict: \u{2705} Validated\n");
     }
 
     #[test]
     fn rejected_review_lists_problems() {
         let verdict = Verdict::Rejected {
             problems: vec![
-                "Gestion d'erreur manquante".to_string(),
-                "Test incomplet".to_string(),
+                "Missing error handling".to_string(),
+                "Incomplete test".to_string(),
             ],
         };
         let rendered = render_review("task-1", &verdict);
-        assert!(rendered.contains("1. Gestion d'erreur manquante"));
-        assert!(rendered.contains("2. Test incomplet"));
+        assert!(rendered.contains("1. Missing error handling"));
+        assert!(rendered.contains("2. Incomplete test"));
     }
 
     #[test]
@@ -118,7 +118,7 @@ mod tests {
     #[test]
     fn parse_verdict_roundtrips_rejected() {
         let verdict = Verdict::Rejected {
-            problems: vec!["Probleme A".to_string(), "Probleme B".to_string()],
+            problems: vec!["Issue A".to_string(), "Issue B".to_string()],
         };
         let rendered = render_review("task-1", &verdict);
         assert_eq!(parse_verdict(&rendered).unwrap(), verdict);
@@ -135,10 +135,10 @@ mod tests {
 
     #[test]
     fn multiline_problem_text_roundtrips() {
-        // Test that a problem with an embedded newline (multi-line text) is recovered
+        // Test that an issue with an embedded newline (multi-line text) is recovered
         // as a single-line string with continuation joined by space.
         // If we manually construct a scenario with line breaks, parse should handle it
-        let manual_content = "# Review — task-1\n\n## Verdict : \u{274c} Rejet\u{e9}\n\n### Probl\u{e8}mes identifi\u{e9}s\n\n1. First line of problem description\nSecond line continues here\n";
+        let manual_content = "# Review — task-1\n\n## Verdict: \u{274c} Rejected\n\n### Issues found\n\n1. First line of problem description\nSecond line continues here\n";
         let parsed = parse_verdict(manual_content).unwrap();
 
         // The continuation line should be appended with a space
@@ -155,9 +155,9 @@ mod tests {
 
     #[test]
     fn problems_section_scoping_ignores_numbered_lines_before_section() {
-        // Test that numbered lines appearing BEFORE the "Problèmes identifiés" section
+        // Test that numbered lines appearing BEFORE the "Issues found" section
         // are NOT picked up as problems
-        let content = "# Review — task-1\n\n1. This looks like a problem but isn't\n\n## Verdict : \u{274c} Rejet\u{e9}\n\n### Probl\u{e8}mes identifi\u{e9}s\n\n1. Real problem\n";
+        let content = "# Review — task-1\n\n1. This looks like a problem but isn't\n\n## Verdict: \u{274c} Rejected\n\n### Issues found\n\n1. Real problem\n";
         let parsed = parse_verdict(content).unwrap();
 
         if let Verdict::Rejected { problems } = parsed {
