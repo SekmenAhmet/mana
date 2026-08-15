@@ -1,0 +1,88 @@
+# Antigravity -- Google's successor to the retired Gemini CLI (which stopped
+# serving Pro/Ultra and free accounts on 2026-06-18). The binary is `agy`;
+# "Antigravity" is only the product name.
+schema = 1
+
+# Top-level key, so it has to precede the first [table] header -- see the same
+# note in claude.toml for why the bottom of the file would not work.
+notes = '''
+Measured on 2026-08-15 (this machine): headless `-p`/`--print`; output formats
+text/json/stream-json; auto-approve `--dangerously-skip-permissions` and
+`--sandbox`; `agy models` returns 14 models across three vendors as TSV; quota
+is per-model. No ACP surface and no MCP surface at all -- hence the
+oneshot-continue driver and the sentinel tool channel.
+
+Two parallel dispatches died within 8 seconds, so max_concurrent is 1. A brief
+without an absolute cwd wasted 306k tokens because this CLI ignores its working
+directory unless the brief spells it out, hence cwd_required_in_brief.
+
+`--version` prints more than one line here; callers must keep only the first.
+
+Unverified, and each is a candidate for a golden-transcript check before the PM
+role is trusted on this CLI:
+- [pm.events] paths are copied from the reference entry's stream-json shape and
+  have never been replayed against a real agy stream. A mismatch degrades to
+  raw text lines by design, so this is visible rather than silent.
+- model_args uses the near-universal `--model` convention; the real flag was
+  never confirmed.
+- Whether `--continue` actually preserves context across `--print` calls.
+
+Known gaps in the data rather than in the CLI:
+- The quota pool has no observed period, so it is recorded as "unknown"
+  alongside kind = "unknown".
+- The failure signature below (exit 1 + empty stderr + "402" in stdout) was
+  measured on a different CLI and carried over here by the v2 design; nothing
+  quota-shaped has been observed from agy itself. Re-measure before relying on
+  the cooldown it triggers -- which is also why no cooldown_minutes is set.
+- No agy-specific skills directory was found, so only the vendor-neutral
+  ~/.agents/skills is listed.
+'''
+
+[cli]
+id           = "agy"
+name         = "Antigravity"
+bin          = "agy"
+version_args = ["--version"]
+
+[pm]
+driver        = "oneshot-continue" # acp | stream | oneshot-continue
+first_args    = ["--print", "--output-format", "stream-json", "{prompt}"]
+continue_args = ["--print", "--continue", "--output-format", "stream-json", "{prompt}"]
+prompt        = "argv"             # argv | stdin | stdin-jsonl
+
+[pm.events]                        # non-ACP drivers only; 2 fields MAX (design §4)
+text  = "$.message.content[?@.type=='text'].text"
+usage = "$.usage"
+
+[tools]
+channel = "sentinel"               # no MCP surface found
+
+[subagent]
+args                  = ["--print", "--output-format", "stream-json"]
+auto_approve_args     = ["--dangerously-skip-permissions"]
+model_args            = ["--model", "{model}"]
+prompt                = "argv"
+max_concurrent        = 1          # two parallel dispatches died in 8s
+cwd_required_in_brief = true       # 306k tokens wasted without it
+
+[models]
+discovery_args = ["models"]        # runtime discovery, so no curated list
+line_regex     = '^(\S+)\t'        # capture group = model id (output is TSV)
+
+[[quota.pools]]
+id         = "default"
+kind       = "unknown"             # requests | tokens | credits | unknown
+period     = "unknown"
+pool_scope = "per-model"           # global | per-model
+
+[[failure]]                        # ordered; first match wins
+means        = "quota_exhausted"   # quota_exhausted | rate_limited | auth_expired
+exit_codes   = [1]
+stderr_regex = "^$"
+stdout_regex = "402"
+
+[skills]
+dirs = ["~/.agents/skills"]
+
+[install]
+url = "https://antigravity.google"
