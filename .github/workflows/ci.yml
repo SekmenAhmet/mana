@@ -67,6 +67,17 @@ jobs:
         with:
           components: llvm-tools-preview
 
+      # `.github/workflows/release.yml` is generated from dist-workspace.toml.
+      # Editing one without regenerating the other is a release that builds the
+      # wrong things, discovered at tag time; this catches it at PR time. The
+      # version must match `cargo-dist-version` in dist-workspace.toml -- a
+      # different dist generates a different workflow.
+      - name: Check the release workflow matches dist-workspace.toml
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
+          "$HOME/.cargo/bin/dist" generate --check
+
       - name: Cache cargo/target
         uses: Swatinem/rust-cache@v2
 

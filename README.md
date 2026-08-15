@@ -100,6 +100,24 @@ is plain aligned text with no colour, so `mana doctor | grep BROKEN` works.
 `--prune` removes worktrees under `~/.mana/worktrees/<project>/` that no
 running dispatch is using, and refuses to touch the ones that are.
 
+## Updates
+
+    mana upgrade                 # download and install the newest release
+
+`mana launch` also checks for a newer release in the background and, if there
+is one, prints a single line into the chat pane:
+
+    * [mana] mana 0.2.0 available -- run `mana upgrade`
+
+The check never blocks the launch and never fails it — being offline is
+normal, and looks like silence. The answer is cached in
+`~/.mana/update-check.json` for 24 hours, so it costs at most one request a
+day. Set `MANA_NO_UPDATE_CHECK=1` to switch it off. No other command looks:
+`ps`, `kill`, `doctor` and the MCP server never touch the network.
+
+Releases are cut by merging `develop` into `main` and then merging the Release
+PR a robot opens — see [RELEASING.md](RELEASING.md).
+
 ## Manual QA checklist (v2, requires a real `claude` install)
 
 Everything below is covered by `cargo test` except what only a paid CLI can

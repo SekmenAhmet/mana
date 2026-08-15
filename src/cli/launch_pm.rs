@@ -102,6 +102,12 @@ const TICK: Duration = Duration::from_millis(50);
 
 pub fn run(agent_cli: &str) -> Result<()> {
     let home = mana_home()?;
+    // Started before the session is prepared, so the answer is usually already
+    // waiting by the first frame. It is the only command that looks: `ps`,
+    // `kill`, `doctor` and `mcp-server` must never reach the network, and the
+    // last of those is a protocol server on stdio where a stray request would
+    // be a genuine defect (design §5).
+    let update_notice = crate::cli::upgrade::spawn_check(&home);
     let project_root = std::env::current_dir()?;
     let mut session = prepare_session(&home, &project_root, agent_cli)?;
     let mut app = App::new(&session.cli_name);
@@ -124,6 +130,7 @@ pub fn run(agent_cli: &str) -> Result<()> {
         &mut app,
         &mut GraphCache::new(),
         &mut CrosstermEventSource,
+        update_notice,
     );
     // Restore the terminal before anything is printed or propagated: an error
     // rendered into the alternate screen is an error nobody ever reads.
@@ -526,9 +533,23 @@ fn run_loop<B: Backend>(
     app: &mut App,
     graph: &mut GraphCache,
     events: &mut dyn EventSource,
+    mut update_notice: Option<std::sync::mpsc::Receiver<String>>,
 ) -> Result<SessionEnd> {
+    let started = Instant::now();
     loop {
         let now = Instant::now();
+
+        // At most one line, in mana's own voice, and only if a newer release
+        // exists. Polled here rather than awaited before the TUI because a
+        // launch must not wait on the network -- and because a line printed
+        // before the alternate screen opens would be invisible until the
+        // session ends.
+        if let Some(line) = crate::cli::upgrade::poll_check(
+            &mut update_notice,
+            now.saturating_duration_since(started),
+        ) {
+            app.push(Source::Mana, &line);
+        }
         let mut ended = None;
         let mut tools_ran = false;
         for event in session.drain() {
@@ -1541,6 +1562,7 @@ mod smoke {
             &mut app,
             &mut GraphCache::new(),
             &mut events,
+            None,
         )
         .unwrap();
 
@@ -1577,6 +1599,7 @@ mod smoke {
             &mut app,
             &mut GraphCache::new(),
             &mut events,
+            None,
         )
         .unwrap();
         assert_eq!(end, SessionEnd::UserQuit);
@@ -1602,6 +1625,44 @@ mod smoke {
             app.lines().any(|line| line.text == "ho"),
             "the typed turn was never echoed"
         );
+        session.shutdown().unwrap();
+    }
+
+    /// The soft update check's only visible effect: one line in the chat pane,
+    /// in mana's voice, and nothing else about the session changed.
+    #[test]
+    fn an_available_release_shows_as_one_line_in_the_chat_pane() {
+        use crate::tui::event::test_support::FakeEventSource;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new();
+        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut app = App::new(&session.cli_name);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut events =
+            FakeEventSource::new([KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)]);
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        tx.send("[mana] mana 9.9.9 available -- run `mana upgrade`".to_string())
+            .unwrap();
+
+        let end = run_loop(
+            &mut terminal,
+            &mut session,
+            &mut app,
+            &mut GraphCache::new(),
+            &mut events,
+            Some(rx),
+        )
+        .unwrap();
+
+        assert_eq!(end, SessionEnd::UserQuit);
+        let notices: Vec<_> = app
+            .lines()
+            .filter(|line| line.text.contains("9.9.9 available"))
+            .collect();
+        assert_eq!(notices.len(), 1, "expected exactly one update notice");
         session.shutdown().unwrap();
     }
 }
