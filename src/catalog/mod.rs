@@ -1,0 +1,445 @@
+//! The CLI catalogue: everything that differs between agent CLIs, as data.
+//!
+//! The rule this module exists to enforce is that no CLI-specific knowledge
+//! lives in Rust. Spawn flags, auto-approve flags, model ids, failure
+//! signatures and skill directories all rot on someone else's release schedule
+//! -- a hardcoded list already went stale within months -- so they belong in
+//! `catalog/*.toml`, where updating them is a data change and not a refactor.
+//! Nothing below may branch on which CLI it is holding.
+#![allow(dead_code)] // Consumers (spawner, router, PM drivers) land in later phases.
+
+mod embedded;
+mod schema;
+mod template;
+
+// Re-exported as globs so callers write `catalog::Subagent` and
+// `catalog::substitute`: the split into submodules is an organisation detail,
+// not something the rest of mana should have to track.
+pub use schema::*;
+pub use template::*;
+
+use anyhow::{Context, Result, bail};
+use std::path::Path;
+
+/// The only schema this build understands. The catalogue carries a version --
+/// unlike mana's internal contracts -- because outside humans edit these files
+/// and their editor may be older or newer than the binary reading them.
+pub const SCHEMA_VERSION: u32 = 1;
+
+/// The catalogue as mana sees it: the embedded entries, with the user's local
+/// override applied on top.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Catalog {
+    entries: Vec<CliEntry>,
+}
+
+impl Catalog {
+    /// Parses the embedded entries and applies `local_override` if that file
+    /// exists. A missing override is normal; an unparseable one is an error,
+    /// because silently ignoring it would leave the user staring at the old
+    /// behaviour with no clue their edit was thrown away.
+    ///
+    /// The override replaces a whole entry by id, or adds a new CLI if the id
+    /// is unknown. No field-level merge: a half-overridden entry is the kind
+    /// of state nobody can reason about while a CLI is broken on a Tuesday.
+    pub fn load(local_override: Option<&Path>) -> Result<Self> {
+        let mut catalog = Self::embedded()?;
+        let Some(path) = local_override else {
+            return Ok(catalog);
+        };
+        if !path.exists() {
+            return Ok(catalog);
+        }
+        let source = std::fs::read_to_string(path)
+            .with_context(|| format!("reading catalogue override {}", path.display()))?;
+        let entry = parse_entry(&source)
+            .with_context(|| format!("invalid catalogue override {}", path.display()))?;
+        catalog.upsert(entry);
+        Ok(catalog)
+    }
+
+    /// The entries baked into the binary, with no override applied. A failure
+    /// here is a build defect, which is why a unit test calls this: a
+    /// malformed catalogue must fail `cargo test`, never a user's dispatch.
+    pub fn embedded() -> Result<Self> {
+        Self::from_sources(embedded::FILES.iter().map(|f| (f.path, f.source)))
+    }
+
+    fn from_sources<'a>(sources: impl IntoIterator<Item = (&'a str, &'a str)>) -> Result<Self> {
+        let mut entries: Vec<CliEntry> = Vec::new();
+        for (label, source) in sources {
+            let entry = parse_entry(source)
+                .with_context(|| format!("catalogue file {label} is invalid"))?;
+            if entries.iter().any(|e| e.cli.id == entry.cli.id) {
+                bail!("catalogue file {label} redeclares id '{}'", entry.cli.id);
+            }
+            entries.push(entry);
+        }
+        Ok(Self { entries })
+    }
+
+    fn upsert(&mut self, entry: CliEntry) {
+        match self.entries.iter().position(|e| e.cli.id == entry.cli.id) {
+            Some(index) => self.entries[index] = entry,
+            None => self.entries.push(entry),
+        }
+    }
+
+    pub fn get(&self, id: &str) -> Option<&CliEntry> {
+        self.entries.iter().find(|e| e.cli.id == id)
+    }
+
+    pub fn entries(&self) -> &[CliEntry] {
+        &self.entries
+    }
+
+    pub fn ids(&self) -> Vec<&str> {
+        self.entries.iter().map(|e| e.cli.id.as_str()).collect()
+    }
+}
+
+/// Parses one catalogue file and checks everything the type system cannot.
+pub fn parse_entry(source: &str) -> Result<CliEntry> {
+    let entry: CliEntry = toml::from_str(source)?;
+    validate(&entry)?;
+    Ok(entry)
+}
+
+/// The checks that turn a syntactically valid file into a usable entry. They
+/// run at load time so the embedded catalogue's unit test is a real gate:
+/// every one of these would otherwise surface as a broken dispatch weeks later.
+fn validate(entry: &CliEntry) -> Result<()> {
+    if entry.schema != SCHEMA_VERSION {
+        bail!(
+            "catalogue schema {} is not supported by this build (expected {SCHEMA_VERSION}); \
+             upgrade mana or fix the file",
+            entry.schema
+        );
+    }
+    for (field, args) in argv_templates(entry) {
+        validate_placeholders(args, &field)?;
+    }
+
+    let id = &entry.cli.id;
+    // A oneshot driver spawns a fresh process per turn, so it has no use for
+    // `args` and is unusable without both of these.
+    if entry.pm.driver == PmDriver::OneshotContinue {
+        for (field, args) in [
+            ("first_args", &entry.pm.first_args),
+            ("continue_args", &entry.pm.continue_args),
+        ] {
+            if args.as_ref().is_none_or(|a| a.is_empty()) {
+                bail!("{id}: [pm].driver is oneshot-continue, which needs a non-empty {field}");
+            }
+        }
+    }
+
+    // A signature with nothing to match on would sit in the ordered list doing
+    // nothing, and the CLI would look like it had no known failure modes.
+    for (index, failure) in entry.failure.iter().enumerate() {
+        let matches_on = failure.exit_codes.is_some()
+            || failure.stderr_regex.is_some()
+            || failure.stdout_regex.is_some();
+        if !matches_on {
+            bail!(
+                "{id}: [[failure]] #{} has no exit_codes, stderr_regex or stdout_regex, so it can never match",
+                index + 1
+            );
+        }
+    }
+
+    // Cooldowns are applied to a pool, so a model pointing at a pool that does
+    // not exist would be exhaustion-proof by accident.
+    for model in &entry.models.static_models {
+        if !entry.quota.pools.iter().any(|p| p.id == model.pool) {
+            bail!(
+                "{id}: model '{}' is in pool '{}', which no [[quota.pools]] declares",
+                model.id,
+                model.pool
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Every argv template in an entry, labelled for error messages. Kept in one
+/// place so a new templated field cannot be added without deciding whether it
+/// takes placeholders.
+fn argv_templates(entry: &CliEntry) -> Vec<(String, &[String])> {
+    let id = &entry.cli.id;
+    let mut templates: Vec<(String, &[String])> = vec![
+        (format!("{id}: [cli].version_args"), &entry.cli.version_args),
+        (format!("{id}: [pm].args"), &entry.pm.args),
+        (format!("{id}: [tools].mcp_args"), &entry.tools.mcp_args),
+        (format!("{id}: [subagent].args"), &entry.subagent.args),
+        (
+            format!("{id}: [subagent].auto_approve_args"),
+            &entry.subagent.auto_approve_args,
+        ),
+        (
+            format!("{id}: [subagent].model_args"),
+            &entry.subagent.model_args,
+        ),
+        (
+            format!("{id}: [models].discovery_args"),
+            &entry.models.discovery_args,
+        ),
+    ];
+    if let Some(args) = &entry.pm.first_args {
+        templates.push((format!("{id}: [pm].first_args"), args));
+    }
+    if let Some(args) = &entry.pm.continue_args {
+        templates.push((format!("{id}: [pm].continue_args"), args));
+    }
+    templates
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A complete, valid entry for a CLI that does not exist. Tests mutate a
+    /// copy of it rather than depending on the shipped files, so a real
+    /// catalogue edit cannot quietly break unrelated tests.
+    const FIXTURE: &str = r#"
+schema = 1
+notes = "fixture"
+
+[cli]
+id = "alpha"
+name = "Alpha CLI"
+bin = "alpha"
+version_args = ["--version"]
+
+[pm]
+driver = "stream"
+args = ["-p"]
+prompt = "stdin-jsonl"
+
+[pm.events]
+text = "$.text"
+
+[tools]
+channel = "mcp"
+mcp_args = ["--mcp-config", "{config_path}"]
+
+[subagent]
+args = ["-p"]
+auto_approve_args = ["--yes"]
+model_args = ["--model", "{model}"]
+prompt = "argv"
+max_concurrent = 0
+cwd_required_in_brief = false
+
+[models]
+discovery_args = []
+
+[[models.static]]
+id = "mini"
+cost_class = "cheap"
+pool = "main"
+
+[[quota.pools]]
+id = "main"
+kind = "requests"
+period = "monthly"
+pool_scope = "global"
+
+[[failure]]
+means = "rate_limited"
+stdout_regex = "rate.?limit"
+cooldown_minutes = 30
+
+[skills]
+dirs = ["~/.alpha/skills"]
+
+[install]
+url = "https://example.invalid/alpha"
+"#;
+
+    fn fixture_with(from: &str, to: &str) -> String {
+        assert!(FIXTURE.contains(from), "fixture has no {from:?} to replace");
+        FIXTURE.replace(from, to)
+    }
+
+    fn write_override(contents: &str) -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("catalog.local.toml");
+        std::fs::write(&path, contents).unwrap();
+        (dir, path)
+    }
+
+    /// The build-time gate. If a shipped catalogue file is malformed this test
+    /// fails, so the bad data never reaches a release.
+    #[test]
+    fn every_embedded_file_parses_and_validates() {
+        let catalog = Catalog::embedded().unwrap();
+        assert_eq!(catalog.ids(), vec!["claude", "agy"]);
+
+        // `notes` is the only top-level key, so it has to be written before the
+        // first [table] header. Losing it means the file was reordered and the
+        // provenance of every flag went with it.
+        for entry in catalog.entries() {
+            assert!(!entry.notes.is_empty(), "{} lost its notes", entry.cli.id);
+        }
+
+        let claude = catalog.get("claude").unwrap();
+        assert_eq!(claude.pm.driver, PmDriver::Stream);
+        assert_eq!(claude.tools.channel, ToolChannel::Mcp);
+        assert_eq!(claude.subagent.max_concurrent, 0);
+        assert_eq!(
+            claude.pm.events.as_ref().unwrap().usage.as_deref(),
+            Some("$.usage")
+        );
+
+        let agy = catalog.get("agy").unwrap();
+        assert_eq!(agy.pm.driver, PmDriver::OneshotContinue);
+        assert_eq!(agy.tools.channel, ToolChannel::Sentinel);
+        assert_eq!(agy.subagent.max_concurrent, 1);
+        assert!(agy.subagent.cwd_required_in_brief);
+        assert_eq!(agy.models.discovery_args, vec!["models"]);
+        assert_eq!(agy.quota.pools[0].pool_scope, PoolScope::PerModel);
+        assert_eq!(agy.failure[0].means, FailureMeans::QuotaExhausted);
+    }
+
+    #[test]
+    fn load_without_override_returns_the_embedded_catalogue() {
+        let catalog = Catalog::load(None).unwrap();
+        assert_eq!(catalog.ids(), Catalog::embedded().unwrap().ids());
+    }
+
+    #[test]
+    fn missing_override_file_is_not_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let catalog = Catalog::load(Some(&dir.path().join("absent.toml"))).unwrap();
+        assert_eq!(catalog.entries().len(), embedded::FILES.len());
+    }
+
+    #[test]
+    fn override_replaces_the_whole_entry() {
+        let (_dir, path) = write_override(&fixture_with(r#"id = "alpha""#, r#"id = "claude""#));
+        let catalog = Catalog::load(Some(&path)).unwrap();
+
+        assert_eq!(catalog.entries().len(), embedded::FILES.len());
+        let claude = catalog.get("claude").unwrap();
+        assert_eq!(claude.cli.name, "Alpha CLI");
+        // The embedded entry's model list is gone rather than merged: wholesale
+        // replacement is the point of the escape valve.
+        assert_eq!(claude.models.static_models.len(), 1);
+        assert_eq!(claude.models.static_models[0].id, "mini");
+    }
+
+    #[test]
+    fn override_can_add_a_new_cli() {
+        let (_dir, path) = write_override(FIXTURE);
+        let catalog = Catalog::load(Some(&path)).unwrap();
+        assert_eq!(catalog.entries().len(), embedded::FILES.len() + 1);
+        assert_eq!(catalog.get("alpha").unwrap().cli.bin, "alpha");
+    }
+
+    #[test]
+    fn invalid_override_fails_loudly_and_names_the_file() {
+        let (_dir, path) = write_override("schema = 1\nthis is not toml");
+        let err = Catalog::load(Some(&path)).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("catalog.local.toml"), "{rendered}");
+    }
+
+    #[test]
+    fn unknown_field_is_rejected() {
+        let err = parse_entry(&fixture_with(
+            r#"bin = "alpha""#,
+            "bin = \"alpha\"\nbim = \"typo\"",
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("bim"), "{err}");
+    }
+
+    #[test]
+    fn unknown_enum_value_is_rejected() {
+        let err = parse_entry(&fixture_with(
+            r#"driver = "stream""#,
+            r#"driver = "telepathy""#,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("telepathy"), "{err}");
+    }
+
+    #[test]
+    fn unsupported_schema_version_is_rejected() {
+        let err = parse_entry(&fixture_with("schema = 1", "schema = 99")).unwrap_err();
+        assert!(err.to_string().contains("99"), "{err}");
+    }
+
+    #[test]
+    fn duplicate_ids_are_rejected() {
+        let err = Catalog::from_sources([("a.toml", FIXTURE), ("b.toml", FIXTURE)]).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("redeclares"), "{rendered}");
+        assert!(rendered.contains("b.toml"), "{rendered}");
+    }
+
+    #[test]
+    fn unknown_placeholder_in_a_template_is_caught_at_load() {
+        let err = parse_entry(&fixture_with(
+            r#"model_args = ["--model", "{model}"]"#,
+            r#"model_args = ["--model", "{modle}"]"#,
+        ))
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("modle"), "{rendered}");
+        assert!(rendered.contains("[subagent].model_args"), "{rendered}");
+    }
+
+    #[test]
+    fn oneshot_driver_without_turn_args_is_rejected() {
+        let err = parse_entry(&fixture_with(
+            r#"driver = "stream""#,
+            r#"driver = "oneshot-continue""#,
+        ))
+        .unwrap_err();
+        assert!(err.to_string().contains("first_args"), "{err}");
+    }
+
+    #[test]
+    fn failure_signature_with_nothing_to_match_on_is_rejected() {
+        let err = parse_entry(&fixture_with(r#"stdout_regex = "rate.?limit""#, "")).unwrap_err();
+        assert!(err.to_string().contains("never match"), "{err}");
+    }
+
+    #[test]
+    fn model_in_an_undeclared_pool_is_rejected() {
+        let err = parse_entry(&fixture_with(r#"pool = "main""#, r#"pool = "typo""#)).unwrap_err();
+        assert!(err.to_string().contains("typo"), "{err}");
+    }
+
+    #[test]
+    fn per_os_bin_override_wins_on_the_matching_platform() {
+        // An inline table keeps the replacement on one line: a `[cli.bin_overrides]`
+        // header here would swallow every [cli] key written after it.
+        let entry = parse_entry(&fixture_with(
+            r#"bin = "alpha""#,
+            &format!(
+                "bin = \"alpha\"\nbin_overrides = {{ {} = \"alpha.exe\" }}",
+                std::env::consts::OS
+            ),
+        ))
+        .unwrap();
+        assert_eq!(entry.cli.bin(), "alpha.exe");
+        assert_eq!(entry.cli.bin, "alpha");
+    }
+
+    #[test]
+    fn bin_falls_back_when_no_override_matches_this_os() {
+        let entry = parse_entry(FIXTURE).unwrap();
+        assert_eq!(entry.cli.bin(), "alpha");
+    }
+
+    /// Routing is "cheapest first, escalate on failure", which only works if
+    /// the ordinal survives parsing.
+    #[test]
+    fn cost_classes_order_cheapest_first() {
+        assert!(CostClass::Cheap < CostClass::Mid);
+        assert!(CostClass::Mid < CostClass::Expensive);
+    }
+}

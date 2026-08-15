@@ -1,0 +1,72 @@
+# Claude Code -- the reference entry. Every flag here was measured against a
+# real install on 2026-08-15; nothing is inferred from documentation.
+schema = 1
+
+# `notes` is a top-level key, so it has to sit before the first [table] header:
+# in TOML every key written after a header belongs to that table, and the same
+# line placed at the bottom of the file would silently become `install.notes`.
+notes = '''
+Never pass `--tools ""` to this CLI: it inflates the context to ~167k tokens
+and zeroes cache reads, which turned a $0.11-0.53 PM turn into $1.57 on
+2026-08-15. Leave the default tool set alone.
+
+The `stream` driver was verified multi-turn on 2026-08-15: one process, session
+continuity held across turns, clean exit.
+
+Only one model is listed statically. Routing wants the full cheap/mid/expensive
+spread, so this list grows as each id is confirmed against a real account.
+'''
+
+[cli]
+id           = "claude"
+name         = "Claude Code"
+bin          = "claude"            # optional [cli.bin_overrides] per OS
+version_args = ["--version"]
+
+[pm]
+driver = "stream"                  # acp | stream | oneshot-continue
+args   = ["-p", "--input-format", "stream-json",
+          "--output-format", "stream-json", "--verbose"]
+prompt = "stdin-jsonl"             # argv | stdin | stdin-jsonl
+
+[pm.events]                        # non-ACP drivers only; 2 fields MAX (design §4)
+text  = "$.message.content[?@.type=='text'].text"
+usage = "$.usage"
+
+[tools]
+channel  = "mcp"                   # mcp | sentinel
+mcp_args = ["--mcp-config", "{config_path}"]
+
+[subagent]
+args                  = ["-p", "--output-format", "stream-json"]
+auto_approve_args     = ["--dangerously-skip-permissions"]
+model_args            = ["--model", "{model}"]
+prompt                = "argv"
+max_concurrent        = 0          # 0 = unlimited
+cwd_required_in_brief = false
+
+[models]
+discovery_args = []                # empty = static list only
+# line_regex   = '^(\S+)\t'        # capture group = model id
+
+[[models.static]]
+id         = "opus"
+cost_class = "expensive"           # cheap | mid | expensive -- ordinal ONLY
+pool       = "plan"
+
+[[quota.pools]]
+id         = "plan"
+kind       = "tokens"              # requests | tokens | credits | unknown
+period     = "5h-window"
+pool_scope = "global"              # global | per-model
+
+[[failure]]                        # ordered; first match wins
+means            = "rate_limited"  # quota_exhausted | rate_limited | auth_expired
+stdout_regex     = "rate.?limit"
+cooldown_minutes = 60
+
+[skills]
+dirs = ["~/.claude/skills", "~/.agents/skills"]
+
+[install]
+url = "https://claude.com/claude-code"

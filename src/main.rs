@@ -1,4 +1,5 @@
 mod agents;
+mod catalog;
 mod cli;
 mod config;
 mod dependencies;
