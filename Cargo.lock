@@ -1224,6 +1224,7 @@ dependencies = [
  "notify",
  "portable-pty",
  "ratatui",
+ "regex",
  "self_update",
  "serde",
  "serde_json",

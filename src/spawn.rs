@@ -13,8 +13,6 @@
 //! `run` is blocking and always ends on the same two steps -- reap or kill,
 //! then report -- so no path leaves a sub-agent running behind mana's back.
 
-#![allow(dead_code)] // Consumers (executor/reviewer dispatch) land in task 1.3.
-
 use crate::catalog::PromptMode;
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
@@ -85,6 +83,9 @@ pub struct SpawnSpec {
 
 #[derive(Debug)]
 pub struct SpawnOutcome {
+    /// Also delivered via `on_spawn`; kept on the outcome for symmetry.
+    /// Unread until `mana ps` (4.2) — the registry row is the live consumer.
+    #[allow(dead_code)]
     pub pid: u32,
     /// `None` when the process was killed by a signal, which on unix is what a
     /// timeout looks like -- read it together with `timed_out`.

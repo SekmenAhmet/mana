@@ -12,7 +12,6 @@
 //! own git is the one whose behavior the project is configured for, and a
 //! failure carries git's own stderr, which is what makes a broken dispatch
 //! debuggable.
-#![allow(dead_code)] // Consumer (executor dispatch, task 1.3) lands next.
 
 use crate::project::project_name_from_dir;
 use std::ffi::OsStr;
@@ -140,6 +139,9 @@ pub fn create(
 /// still need. Tolerates a worktree that was already deleted or mangled by
 /// hand — cleanup that fails on a half-dead worktree just leaves the next
 /// dispatch to trip over the same corpse (managent's stale-lock failure).
+/// Unused by the dev command on purpose — M1 keeps worktrees inspectable and
+/// prints the manual hint; automated cleanup wires in with the router (2.x).
+#[allow(dead_code)]
 pub fn cleanup(project_root: &Path, info: &WorktreeInfo) -> anyhow::Result<()> {
     remove_worktree(project_root, &info.path)
 }
