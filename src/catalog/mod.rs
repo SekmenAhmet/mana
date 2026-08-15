@@ -121,6 +121,32 @@ fn validate(entry: &CliEntry) -> Result<()> {
     }
 
     let id = &entry.cli.id;
+    // ACP carries prose, tool calls, permissions and the end of a turn as
+    // typed notifications, so both of these describe something the driver will
+    // never look at. Rejecting them rather than ignoring them keeps design §4's
+    // "non-ACP drivers only" a rule the file has to obey, not a comment: a
+    // maintainer who copies claude's entry to add an ACP CLI finds out at
+    // `cargo test`, not from a chat pane that stayed empty.
+    if entry.pm.driver == PmDriver::Acp {
+        if entry.pm.events.is_some() {
+            bail!(
+                "{id}: [pm.events] must be absent for the acp driver, which reads typed \
+                 notifications rather than JSONPaths over a proprietary stream (design §4)"
+            );
+        }
+        if entry.pm.prompt.is_some() {
+            bail!(
+                "{id}: [pm].prompt must be absent for the acp driver, which sends turns as \
+                 typed content blocks rather than over argv or stdin"
+            );
+        }
+    } else if entry.pm.prompt.is_none() {
+        bail!(
+            "{id}: [pm].prompt is required for the {:?} driver",
+            entry.pm.driver
+        );
+    }
+
     // A oneshot driver spawns a fresh process per turn, so it has no use for
     // `args` and is unusable without both of these.
     if entry.pm.driver == PmDriver::OneshotContinue {
@@ -278,7 +304,7 @@ url = "https://example.invalid/alpha"
     #[test]
     fn every_embedded_file_parses_and_validates() {
         let catalog = Catalog::embedded().unwrap();
-        assert_eq!(catalog.ids(), vec!["claude", "agy"]);
+        assert_eq!(catalog.ids(), vec!["claude", "agy", "copilot", "opencode"]);
 
         // `notes` is the only top-level key, so it has to be written before the
         // first [table] header. Losing it means the file was reordered and the
@@ -322,6 +348,31 @@ url = "https://example.invalid/alpha"
         // and a signature borrowed from another CLI would trigger false
         // cooldowns (a copilot-measured one was removed on 2026-08-15).
         assert!(agy.failure.is_empty());
+
+        // The two ACP entries are what makes the PM role a role rather than a
+        // claude feature (milestone 3), and the pair is deliberately uneven:
+        // one attaches mana through the protocol, the other through argv,
+        // because that is what each CLI was measured doing.
+        for id in ["copilot", "opencode"] {
+            let entry = catalog.get(id).unwrap();
+            assert_eq!(entry.pm.driver, PmDriver::Acp, "{id}");
+            // Both are non-ACP fields; the validator rejects them here, and
+            // this is the assertion that the shipped files stay on that side.
+            assert!(entry.pm.events.is_none(), "{id}");
+            assert!(entry.pm.prompt.is_none(), "{id}");
+            // ACP has no allowlist flag: the permission flow is the
+            // enforcement, and inventing a flag would fail the launch.
+            assert!(entry.pm.permission_args.is_empty(), "{id}");
+            assert_eq!(entry.tools.channel, ToolChannel::Mcp, "{id}");
+        }
+        // opencode honours session/new's mcpServers, so it needs no flags...
+        assert!(catalog.get("opencode").unwrap().tools.mcp_args.is_empty());
+        // ...while copilot rejects stdio MCP servers offered that way and gets
+        // the config file over argv instead. One line of data, no code branch.
+        assert_eq!(
+            catalog.get("copilot").unwrap().tools.mcp_args,
+            ["--additional-mcp-config", "@{config_path}"]
+        );
     }
 
     #[test]
@@ -436,6 +487,39 @@ url = "https://example.invalid/alpha"
         ))
         .unwrap_err();
         assert!(err.to_string().contains("first_args"), "{err}");
+    }
+
+    /// Design §4 says `[pm.events]` is for non-ACP drivers only. Left as a
+    /// comment it would be copied away the first time somebody added an ACP
+    /// CLI by editing claude's entry; as a check it fails `cargo test`.
+    #[test]
+    fn an_acp_entry_may_not_carry_the_non_acp_fields() {
+        let acp = fixture_with(r#"driver = "stream""#, r#"driver = "acp""#);
+        let err = parse_entry(&acp).unwrap_err();
+        assert!(err.to_string().contains("[pm.events]"), "{err}");
+
+        let err = parse_entry(&acp.replace("[pm.events]\ntext = \"$.text\"\n", "")).unwrap_err();
+        assert!(err.to_string().contains("[pm].prompt"), "{err}");
+    }
+
+    #[test]
+    fn an_acp_entry_without_either_of_them_is_valid() {
+        let entry = parse_entry(
+            &fixture_with(r#"driver = "stream""#, r#"driver = "acp""#)
+                .replace("[pm.events]\ntext = \"$.text\"\n", "")
+                .replace("prompt = \"stdin-jsonl\"\n", ""),
+        )
+        .unwrap();
+        assert_eq!(entry.pm.driver, PmDriver::Acp);
+    }
+
+    /// The other half of the same rule: every driver that reads a stream needs
+    /// to be told how a turn gets *out*, and a missing `prompt` used to be
+    /// impossible rather than merely wrong.
+    #[test]
+    fn a_non_acp_entry_without_a_prompt_mode_is_rejected() {
+        let err = parse_entry(&fixture_with("prompt = \"stdin-jsonl\"\n", "")).unwrap_err();
+        assert!(err.to_string().contains("[pm].prompt"), "{err}");
     }
 
     #[test]

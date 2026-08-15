@@ -14,32 +14,23 @@
 //! catalogue, the meaning of each line comes from `[pm.events]`, and the only
 //! shape this module hardcodes is the one the catalogue's `prompt` field names.
 
+use super::child::{
+    CLOSE_GRACE, DRAIN_GRACE, POLL_INTERVAL, join_or_detach, kill_group, pump_stderr, read_lines,
+    reap, set_process_group,
+};
 use super::events::EventMap;
 use super::{PmEvent, PmTransport};
 use crate::catalog::{CliEntry, PmDriver, PromptMode, substitute};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
 use std::collections::HashMap;
-use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::{Child, ChildStdin, Command, Stdio};
-use std::sync::mpsc::{Receiver, Sender, channel};
+use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
-
-/// How often a wait loop asks whether the child is done. Small enough that
-/// shutdown feels immediate, large enough not to spin a core while a PM thinks.
-const POLL_INTERVAL: Duration = Duration::from_millis(20);
-
-/// How long shutdown lets the PM leave on its own after stdin closes, before
-/// killing it. Generous on purpose: an agent mid-turn may still be flushing a
-/// last message, and losing it to an impatient SIGKILL would look like the bug
-/// this driver exists to fix.
-const CLOSE_GRACE: Duration = Duration::from_secs(5);
-
-/// How long a reader thread gets to finish once its pipe is at EOF.
-const DRAIN_GRACE: Duration = Duration::from_secs(2);
 
 /// A live PM session.
 ///
@@ -88,7 +79,13 @@ impl StreamDriver {
             );
         }
         let map = EventMap::for_entry(entry)?;
-        match entry.pm.prompt {
+        // Absent only for `acp` entries, which the catalogue validates and the
+        // factory never routes here; saying so beats an `unwrap` that would
+        // panic on a hand-written local override.
+        let prompt = entry.pm.prompt.ok_or_else(|| {
+            anyhow!("{id}: [pm].prompt is missing, and the stream driver needs it to frame a turn")
+        })?;
+        match prompt {
             PromptMode::StdinJsonl | PromptMode::Stdin => {}
             // A one-shot argv prompt and a session that answers back are
             // mutually exclusive: there is no second argv to write into.
@@ -130,11 +127,7 @@ impl StreamDriver {
         let stderr = child.stderr.take().expect("stderr was piped");
 
         let (sender, events) = channel();
-        // stderr is drained on its own thread, not discarded: a PM that dies on
-        // startup says why there, and swallowing it is how v1 left users with a
-        // silently dead session. It is also why an unread pipe is not an
-        // option -- a full stderr buffer blocks the child mid-write.
-        let stderr_reader = pump(stderr, sender.clone(), |line| vec![PmEvent::Raw(line)]);
+        let stderr_reader = pump_stderr(stderr, sender.clone());
 
         let child = Arc::new(Mutex::new(child));
         let reaped = Arc::clone(&child);
@@ -159,7 +152,7 @@ impl StreamDriver {
             child,
             pid,
             stdin: Some(stdin),
-            prompt: entry.pm.prompt,
+            prompt,
             events,
             reader: Some(reader),
             close_grace: CLOSE_GRACE,
@@ -301,8 +294,9 @@ struct UserMessage<'a> {
 ///
 /// This shape belongs to `prompt = "stdin-jsonl"`, not to any CLI. A vendor
 /// framing turns differently gets a new value for that field, never a branch
-/// here.
-fn user_frame(text: &str) -> String {
+/// here. Shared with the oneshot driver for exactly that reason: the frame
+/// belongs to the prompt mode, and two copies of it would be free to drift.
+pub(super) fn user_frame(text: &str) -> String {
     let frame = UserFrame {
         kind: "user",
         message: UserMessage {
@@ -315,133 +309,6 @@ fn user_frame(text: &str) -> String {
         "{}\n",
         serde_json::to_string(&frame).expect("frame is plain strings")
     )
-}
-
-/// Reads `source` line by line until EOF, stopping early if `sink` says the
-/// other end is gone.
-fn read_lines(source: impl Read, mut sink: impl FnMut(String) -> bool) {
-    let mut reader = BufReader::new(source);
-    let mut buffer = Vec::new();
-    loop {
-        buffer.clear();
-        match reader.read_until(b'\n', &mut buffer) {
-            Ok(0) => return, // every write end closed
-            Ok(_) => {
-                while matches!(buffer.last(), Some(b'\n' | b'\r')) {
-                    buffer.pop();
-                }
-                // Lossy on purpose: a CLI's output is evidence to be read,
-                // never something to reject for encoding.
-                if !sink(String::from_utf8_lossy(&buffer).into_owned()) {
-                    return;
-                }
-            }
-            Err(err) if err.kind() == ErrorKind::Interrupted => continue,
-            // A broken pipe is the normal end of a killed child, and any other
-            // error is just as terminal for a stream we cannot read.
-            Err(_) => return,
-        }
-    }
-}
-
-/// Spawns a thread that turns each line of `source` into events.
-fn pump(
-    source: impl Read + Send + 'static,
-    sender: Sender<PmEvent>,
-    to_events: impl Fn(String) -> Vec<PmEvent> + Send + 'static,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        read_lines(source, |line| {
-            to_events(line)
-                .into_iter()
-                .all(|event| sender.send(event).is_ok())
-        });
-    })
-}
-
-/// Waits for the child to be gone and reports its exit code.
-///
-/// Polls instead of blocking in `wait` because the lock is shared with
-/// `shutdown`: a blocking wait held under the mutex would deadlock the one call
-/// meant to end a PM that stopped listening.
-fn reap(child: &Mutex<Child>) -> Option<i32> {
-    loop {
-        match child.lock().unwrap().try_wait() {
-            Ok(Some(status)) => return status.code(),
-            // Unreachable child: reporting no code is the honest answer and
-            // keeps `Exited` on its promise to always arrive.
-            Err(_) => return None,
-            Ok(None) => std::thread::sleep(POLL_INTERVAL),
-        }
-    }
-}
-
-/// Waits for a thread to finish, but never past `deadline`.
-///
-/// Waiting longer would hand mana's shutdown timing to whatever still holds the
-/// write end of a pipe -- a grandchild that survived the kill, say. A detached
-/// thread costs a blocked read on a stream nobody reads and no correctness.
-fn join_or_detach(handle: JoinHandle<()>, deadline: Instant) {
-    while !handle.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
-#[cfg(unix)]
-fn set_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // 0 = "become the leader of your own group", so the child's pgid equals its
-    // pid. Without this the PM shares mana's group, and killing that group on
-    // shutdown would kill mana -- while a Ctrl-C meant for the TUI would go to
-    // the PM instead.
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn set_process_group(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    // The PM and its descendants form a group of their own, so a console
-    // control event cannot travel back up into mana's TUI.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
-}
-
-/// Kills the PM and everything it started.
-///
-/// Deliberately not shared with `spawn.rs`, which does the same ten lines for a
-/// different policy: a sub-agent is killed the moment it blows its budget,
-/// while a PM is only killed after the graceful stdin-close window has passed.
-/// Folding both into one helper would mean a policy parameter around two libc
-/// calls.
-#[cfg(unix)]
-fn kill_group(child: &mut Child, pid: u32) {
-    // The PM leads its own group (see `set_process_group`), so the group covers
-    // what it spawned -- its MCP server above all, which would otherwise
-    // survive as a stdio process talking to nobody.
-    // The `!= 0` guard is not paranoia: killpg(0) signals *our own* group, mana
-    // included.
-    if let Ok(pgid) = i32::try_from(pid)
-        && pgid != 0
-    {
-        // SAFETY: killpg takes two integers, dereferences nothing, and reports
-        // an already-gone group as ESRCH -- which we ignore anyway.
-        let _ = unsafe { libc::killpg(pgid, libc::SIGKILL) };
-    }
-    // Then the child by name, in case the group signal reached nothing: a CLI
-    // that called setsid() has left our group, and killpg would return ESRCH
-    // while the process kept running -- turning the wait that follows into an
-    // unbounded one.
-    let _ = child.kill();
-}
-
-#[cfg(windows)]
-fn kill_group(child: &mut Child, _pid: u32) {
-    // Windows has no killpg. `Child::kill` is TerminateProcess, which ends the
-    // named process only -- anything the PM spawned survives it. Killing the
-    // tree properly needs a Job Object (`windows-sys`); until a Windows PM
-    // session has actually been measured, the honest statement is: the PM dies,
-    // its children may leak.
-    let _ = child.kill();
 }
 
 #[cfg(test)]

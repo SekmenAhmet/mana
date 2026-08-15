@@ -3,7 +3,8 @@
 //!
 //! Three transports are in the design (§4) -- `stream`, `acp`,
 //! `oneshot-continue` -- and the catalogue's `[pm].driver` field says which one
-//! a CLI needs. Only `stream` exists so far; the other two land in phase 3.
+//! a CLI needs. All three exist; between them they cover every agent CLI the
+//! catalogue has met, which is what makes a new CLI a data change.
 //!
 //! The shape here is a trait plus one factory, rather than an enum the callers
 //! match on. Both dispatch fine; the difference is where the knowledge sits. An
@@ -23,6 +24,9 @@
 //!         PmEvent::Text(text) => chat.push(text),
 //!         PmEvent::Usage(usage) => log.enrich(usage),
 //!         PmEvent::Raw(line) => chat.push_degraded(line),
+//!         PmEvent::PermissionRequest { id, options, .. } => {
+//!             pm.answer_permission(id, &options[0].id)?
+//!         }
 //!         PmEvent::Exited { code } => break,
 //!     }
 //! }
@@ -30,9 +34,14 @@
 //! ```
 #![allow(dead_code)] // Consumers land with the launch flow (2.3) and the TUI (2.4).
 
+mod acp;
+mod child;
 mod events;
+mod oneshot;
 mod stream;
 
+pub use acp::AcpDriver;
+pub use oneshot::OneshotDriver;
 pub use stream::StreamDriver;
 
 use crate::catalog::{CliEntry, PmDriver};
@@ -41,27 +50,63 @@ use std::sync::mpsc::Receiver;
 
 /// Everything mana is willing to learn from a PM session.
 ///
-/// Four variants and no more, because the contract is thin on purpose (design
-/// §4): tool calls, permissions and session control travel over MCP, ACP or the
-/// sentinel channel, never parsed out of a CLI's proprietary stream. That is
-/// the lesson vibe-kanban paid for -- parsing whole streams forces one Rust
-/// module per CLI.
+/// Five variants and no more, because the contract is thin on purpose (design
+/// §4): tool calls and session control travel over MCP, ACP or the sentinel
+/// channel, never parsed out of a CLI's proprietary stream. That is the lesson
+/// vibe-kanban paid for -- parsing whole streams forces one Rust module per
+/// CLI.
+///
+/// `PermissionRequest` is the one addition ACP forced (task 3.1), and it earns
+/// its place for the same reason the others do: it is *typed protocol*, not
+/// something scraped out of a stream. A CLI with no permission protocol simply
+/// never sends it.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PmEvent {
     /// Assistant prose, ready to render in the chat pane. One event per match:
-    /// a single frame may carry several text blocks.
+    /// a single frame may carry several text blocks, and a chunked transport
+    /// coalesces its chunks into whole lines before emitting them.
     Text(String),
     /// A usage snapshot exactly as the CLI reported it, for log enrichment.
     /// Opaque JSON: every CLI counts differently and mana only records.
     Usage(serde_json::Value),
-    /// A line no path matched, or that was not JSON at all. The visible half of
-    /// "degraded, never silent": a CLI that changes its stream shape shows up
-    /// as ugly lines in the chat pane, not as a PM that went quiet.
+    /// Something outside the thin contract, shown rather than dropped. On a
+    /// stream transport that is a line no path matched or that was not JSON at
+    /// all; on ACP it is also activity mana understood but that is not the PM
+    /// talking (a tool call, a thought, a turn that ended badly). The visible
+    /// half of "degraded, never silent": a CLI that changes shape shows up as
+    /// ugly lines in the chat pane, not as a PM that went quiet.
     Raw(String),
+    /// The PM is waiting on a human decision before it can act (ACP's
+    /// `session/request_permission`). Answer it with
+    /// `PmTransport::answer_permission`; leaving it unanswered stalls the PM's
+    /// turn but never mana, which keeps reading either way.
+    PermissionRequest {
+        /// Answers this request, and only this one. Opaque on purpose: the
+        /// transport's own request id may be a number or a string and nothing
+        /// above this module should have to know which.
+        id: u64,
+        /// What the PM wants to do, in one line.
+        description: String,
+        /// Never empty -- a request nobody could answer is refused by the
+        /// transport instead of surfaced.
+        options: Vec<PermissionChoice>,
+    },
     /// The PM process is gone. Always arrives, exactly once, last -- v1 could
     /// not tell a thinking PM from a dead one and waited forever on both.
     /// `None` means the process was signalled rather than exited.
     Exited { code: Option<i32> },
+}
+
+/// One answer the PM offered to a permission request.
+///
+/// `allows` is what lets the interface bind one key to yes and one to no
+/// however many options an agent lists: the protocol says which way each
+/// option goes, so mana does not have to read the label to find out.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PermissionChoice {
+    pub id: String,
+    pub label: String,
+    pub allows: bool,
 }
 
 /// What every PM transport owes its caller: send a turn, read events, end the
@@ -76,6 +121,17 @@ pub trait PmTransport: Send {
     /// owner of its process. `recv`/`try_recv` take `&self`, so nothing is lost.
     fn events(&self) -> &Receiver<PmEvent>;
 
+    /// Answers a `PermissionRequest` with one of the option ids it carried.
+    ///
+    /// Defaulted rather than required: a transport that never asks has nothing
+    /// to answer, and making every driver write an unreachable arm would be
+    /// ceremony. The default is loud instead of silent because reaching it
+    /// means the interface offered a decision the transport cannot deliver.
+    fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
+        let _ = option_id;
+        bail!("this PM transport never asks for permission, so there is nothing to answer ({id})")
+    }
+
     /// Ends the session and guarantees `Exited` is queued before returning.
     fn shutdown(&mut self) -> Result<()>;
 }
@@ -86,17 +142,9 @@ pub trait PmTransport: Send {
 /// The one place in mana that knows more than one driver exists.
 pub fn start(entry: &CliEntry, extra_args: &[String]) -> Result<Box<dyn PmTransport>> {
     match entry.pm.driver {
+        PmDriver::Acp => Ok(Box::new(AcpDriver::start(entry, extra_args)?)),
         PmDriver::Stream => Ok(Box::new(StreamDriver::start(entry, extra_args)?)),
-        // Not a gap in the catalogue but a transport mana cannot speak yet.
-        // Naming the task keeps the message useful to whoever hits it.
-        PmDriver::Acp => bail!(
-            "{}: [pm].driver is 'acp', which mana cannot speak yet (mana v2, task 3.1)",
-            entry.cli.id
-        ),
-        PmDriver::OneshotContinue => bail!(
-            "{}: [pm].driver is 'oneshot-continue', which mana cannot speak yet (mana v2, task 3.2)",
-            entry.cli.id
-        ),
+        PmDriver::OneshotContinue => Ok(Box::new(OneshotDriver::start(entry, extra_args)?)),
     }
 }
 
@@ -117,6 +165,17 @@ mod tests {
         )
     }
 
+    /// An ACP entry carries neither of the fields a stream entry needs, so it
+    /// cannot be built by patching one -- which is the catalogue rule working.
+    fn acp_entry() -> CliEntry {
+        events::fixture::parse(
+            &events::fixture::source("no-such-binary", &[], "stdin-jsonl", "$.text", None)
+                .replace(r#"driver = "stream""#, r#"driver = "acp""#)
+                .replace("[pm.events]\ntext = \"$.text\"\n", "")
+                .replace("prompt = \"stdin-jsonl\"\n", ""),
+        )
+    }
+
     /// `unwrap_err` would need `Debug` on a boxed live session, which is not
     /// worth requiring of every driver for the sake of a test message.
     fn start_err(entry: &CliEntry) -> String {
@@ -126,20 +185,19 @@ mod tests {
         }
     }
 
+    /// The factory reaches every driver in the set, and each one then fails on
+    /// its own terms (there is no such binary) rather than on the driver being
+    /// unknown. With 3.2 the set is closed: no `[pm].driver` value the
+    /// catalogue accepts is left without a transport.
     #[test]
-    fn an_unimplemented_driver_says_so_and_names_the_task() {
-        for (driver, task) in [("acp", "3.1"), ("oneshot-continue", "3.2")] {
-            let rendered = start_err(&entry_with(driver));
-            assert!(rendered.contains(driver), "{rendered}");
-            assert!(rendered.contains(task), "{rendered}");
+    fn every_driver_is_reached_and_fails_on_its_own_terms() {
+        for entry in [
+            entry_with("stream"),
+            entry_with("oneshot-continue"),
+            acp_entry(),
+        ] {
+            let rendered = start_err(&entry);
+            assert!(rendered.contains("no-such-binary"), "{rendered}");
         }
-    }
-
-    /// The factory reaches the stream driver, which then fails on its own terms
-    /// (there is no such binary) rather than on the driver being unknown.
-    #[test]
-    fn a_stream_entry_reaches_the_stream_driver() {
-        let rendered = start_err(&entry_with("stream"));
-        assert!(rendered.contains("no-such-binary"), "{rendered}");
     }
 }

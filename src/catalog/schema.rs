@@ -103,7 +103,10 @@ pub struct Pm {
     pub first_args: Option<Vec<String>>,
     /// `oneshot-continue` only: every turn after the first.
     pub continue_args: Option<Vec<String>>,
-    pub prompt: PromptMode,
+    /// How a turn reaches the process. Absent for `acp`, where the protocol
+    /// carries the prompt as typed content and every value of this field would
+    /// be a lie -- the same reason `events` is absent there.
+    pub prompt: Option<PromptMode>,
     /// Absent for `acp`, which carries its own typed notifications.
     pub events: Option<PmEvents>,
 }
@@ -265,6 +268,17 @@ pub struct Skills {
     /// the PM skill to the first one that exists, which is what makes role
     /// injection one code path for every CLI.
     pub dirs: Vec<String>,
+    /// Send the role text in the activation turn as well as writing it to
+    /// disk. Added (schema stays 1: it defaults to false, so every existing
+    /// file keeps its meaning) for a CLI that cannot read the file mana just
+    /// wrote for it: agy's print mode denies every tool permission request,
+    /// including `view_file` on the exact path mana names, so a skill left on
+    /// disk reaches nothing. Design §6 picks SKILL.md because ~40 tools read
+    /// that format; where a CLI cannot, the role has to travel in the message
+    /// or the PM is not the mana PM at all. Costly on a CLI that replays the
+    /// conversation each turn, which is why it is opt-in per entry.
+    #[serde(default)]
+    pub inline_in_activation: bool,
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]

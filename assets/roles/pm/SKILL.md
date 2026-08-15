@@ -48,13 +48,31 @@ track those.
   needs a specific one.
 - `get_review {task_id}` → `{verdict, attribution, issues[]}`.
 
-If these tools are not available in this session, mana told you so at launch
-and gave you the sentinel format instead: emit exactly one fenced block per
-action, and nothing else executes it —
+## When the tools are not available
+
+Some CLIs cannot host mana's tools. If you have no `create_task` tool in this
+session, call them by writing a fenced block instead — one call per block,
+nothing else inside it:
 
 ```mana
 {"tool": "create_task", "args": {"title": "...", "prompt": "..."}}
 ```
+
+mana reads those blocks out of your message, executes them itself, and sends
+you the results as your next turn, one numbered line per block:
+
+```
+[mana] tool results, in the order you wrote them:
+1. create_task ok: {"task_id":"..."}
+2. launch_subagent failed: unknown task "x" -- use the id create_task returned
+```
+
+The names and arguments are identical either way. Several blocks in one message
+run in the order you wrote them, which is how you dispatch independent tasks
+together. A block mana cannot read comes back as one line saying what was
+wrong — fix it and write it again. Never repeat a call that already returned a
+result: mana is the only thing executing these, so a second block is a second
+dispatch.
 
 ## Routing
 

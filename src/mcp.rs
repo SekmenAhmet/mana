@@ -238,9 +238,18 @@ impl ServerHandler for ManaTools {
 // exercise a file write. Every one of them is synchronous: the work is a few
 // small file reads, and the one operation that is not -- a dispatch, which
 // takes minutes -- is explicitly moved off this thread.
+//
+// `pub(crate)` for the second caller design §5 gives these tools: on a CLI with
+// no MCP surface, `crate::sentinel` parses the PM's fenced block and calls the
+// very same methods (task 3.2). Two channels, one implementation -- a sentinel
+// executor of its own would be a second validator free to disagree with this
+// one about what `launch_subagent` accepts.
 
 impl ManaTools {
-    fn create_task_impl(&self, params: CreateTaskParams) -> Result<CreateTaskOut, ErrorData> {
+    pub(crate) fn create_task_impl(
+        &self,
+        params: CreateTaskParams,
+    ) -> Result<CreateTaskOut, ErrorData> {
         let paths = self.paths()?;
         let depends_on = params.depends_on.unwrap_or_default();
         // Every dependency must already exist, since ids only come into being
@@ -277,7 +286,7 @@ impl ManaTools {
         Ok(CreateTaskOut { task_id })
     }
 
-    fn launch_subagent_impl(
+    pub(crate) fn launch_subagent_impl(
         &self,
         params: LaunchSubagentParams,
     ) -> Result<LaunchSubagentOut, ErrorData> {
@@ -373,7 +382,7 @@ impl ManaTools {
         })
     }
 
-    fn get_review_impl(&self, params: TaskRef) -> Result<ReviewOut, ErrorData> {
+    pub(crate) fn get_review_impl(&self, params: TaskRef) -> Result<ReviewOut, ErrorData> {
         let paths = self.paths()?;
         let task_id = validated_task_id(&params.task_id)?;
         let path = paths.reviews.join(format!("{task_id}.json"));
@@ -398,7 +407,7 @@ impl ManaTools {
         Ok(ReviewOut::from(&verdict))
     }
 
-    fn list_agents_impl(&self) -> Result<ListAgentsOut, ErrorData> {
+    pub(crate) fn list_agents_impl(&self) -> Result<ListAgentsOut, ErrorData> {
         let paths = self.paths()?;
         let entries = self.catalog.entries();
         let observations = Observations::gather(&paths, entries, chrono::Utc::now())

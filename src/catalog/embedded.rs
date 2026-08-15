@@ -29,4 +29,9 @@ macro_rules! embed {
 }
 
 /// Every embedded entry, in the order they are offered to the user.
-pub const FILES: &[EmbeddedFile] = &[embed!("catalog/claude.toml"), embed!("catalog/agy.toml")];
+pub const FILES: &[EmbeddedFile] = &[
+    embed!("catalog/claude.toml"),
+    embed!("catalog/agy.toml"),
+    embed!("catalog/copilot.toml"),
+    embed!("catalog/opencode.toml"),
+];

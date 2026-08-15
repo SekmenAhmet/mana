@@ -13,6 +13,7 @@ mod project;
 mod prompts;
 mod pty;
 mod review;
+mod sentinel;
 mod spawn;
 mod subprocess;
 mod task;
