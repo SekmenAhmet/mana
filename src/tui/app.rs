@@ -4,7 +4,7 @@
 //! Everything here is a plain value with no I/O in sight, so the render tests
 //! drive it directly and the launch flow only has to push events at it.
 
-use crate::pm::PmEvent;
+use crate::pm::{PermissionChoice, PmEvent};
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -35,6 +35,10 @@ pub enum Source {
     Raw,
     /// mana's own voice: completion notifications, session notices.
     Mana,
+    /// The PM is blocked on a human decision. Its own source because it is the
+    /// one line in the pane that is not a report but a question: it stays on
+    /// screen while the PM waits, and the status bar carries the keys.
+    Permission,
     /// Echoed back so the transcript reads as a conversation -- the PM's
     /// answer arrives minutes later, and a pane that showed only its half
     /// would leave the user guessing what they had asked.
@@ -61,9 +65,38 @@ pub struct App {
     /// which arrives here -- and the chat pane is gone by the time mana can
     /// print anything, so the launch flow reads it back from here.
     pub last_raw: Option<String>,
+    /// The permission the PM is waiting on, if any. `Some` blocks nothing in
+    /// mana -- the loop keeps drawing and the user keeps typing -- but it is
+    /// what the status bar and the answer keys act on.
+    ///
+    /// One at a time on purpose: an agent asks for permission and then waits
+    /// for the answer before doing anything else, so a queue would be a
+    /// structure that never holds two.
+    pub pending_permission: Option<PendingPermission>,
     /// When this session started, which drives the graph's running blink
     /// without a render-loop clock in the tests (`graph::is_blink_visible`).
     pub started_at: Instant,
+}
+
+/// A permission request as the interface holds it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingPermission {
+    pub id: u64,
+    pub description: String,
+    pub options: Vec<PermissionChoice>,
+}
+
+impl PendingPermission {
+    /// The option a yes or a no maps to, or `None` when the PM offered no way
+    /// to say it.
+    ///
+    /// First match wins, which is the protocol's own order of preference:
+    /// agents list the narrow option ("allow once") before the broad one
+    /// ("allow always"), and answering for someone else is a decision that
+    /// should stay as small as it can.
+    pub fn choice(&self, allow: bool) -> Option<&PermissionChoice> {
+        self.options.iter().find(|option| option.allows == allow)
+    }
 }
 
 impl App {
@@ -75,6 +108,7 @@ impl App {
             cli_name: cli_name.to_string(),
             usage: None,
             last_raw: None,
+            pending_permission: None,
             started_at: Instant::now(),
         }
     }
@@ -89,9 +123,41 @@ impl App {
                 self.last_raw = Some(line.clone());
                 self.push(Source::Raw, line);
             }
-            PmEvent::Usage(usage) => self.usage = summarize_usage(usage),
+            // Kept when a snapshot has nothing countable in it rather than
+            // blanked: ACP agents report a context-window update mid-turn and
+            // the token totals only at the end, so overwriting on every event
+            // would erase the figure the moment the next turn started.
+            PmEvent::Usage(usage) => {
+                if let Some(summary) = summarize_usage(usage) {
+                    self.usage = Some(summary);
+                }
+            }
+            PmEvent::PermissionRequest {
+                id,
+                description,
+                options,
+            } => {
+                // Written into the transcript as well as held as state: the
+                // status bar says what the keys are *now*, and the chat line is
+                // what remains afterwards to explain why the PM paused.
+                self.push(
+                    Source::Permission,
+                    &format!("the PM asks permission to: {description}"),
+                );
+                self.pending_permission = Some(PendingPermission {
+                    id: *id,
+                    description: description.clone(),
+                    options: options.clone(),
+                });
+            }
             PmEvent::Exited { .. } => {}
         }
+    }
+
+    /// Clears the pending request and returns it, so the caller can answer the
+    /// transport with one of its option ids.
+    pub fn take_permission(&mut self) -> Option<PendingPermission> {
+        self.pending_permission.take()
     }
 
     /// Appends text as chat lines, one entry per `\n`-separated line, dropping
@@ -130,15 +196,21 @@ impl App {
 /// One short line of token counts, or `None` when the CLI reported nothing
 /// countable.
 ///
-/// Deliberately generic over the shape: `[pm.events].usage` hands over
-/// whatever object that CLI happened to emit, and mana promised only to record
-/// it (design §4). So every numeric field whose name mentions tokens is shown,
+/// Deliberately generic over the shape: a usage event hands over whatever
+/// object that CLI happened to emit, and mana promised only to record it
+/// (design §4). So every numeric field whose name mentions tokens is shown,
 /// in the map's own (sorted) order, and a vendor who names things differently
 /// still gets a status bar instead of a special case in this function.
+///
+/// Names are normalised to snake_case first, because that is the one thing
+/// that genuinely differs without meaning anything: claude reports
+/// `output_tokens` and ACP agents report `outputTokens`, and a case-sensitive
+/// match would have left half the CLIs with a permanently empty status bar.
 fn summarize_usage(usage: &serde_json::Value) -> Option<String> {
     let fields = usage.as_object()?;
     let parts: Vec<String> = fields
         .iter()
+        .map(|(name, value)| (snake_case(name), value))
         .filter(|(name, _)| name.contains("token"))
         .filter_map(|(name, value)| {
             let count = value.as_u64()?;
@@ -149,6 +221,19 @@ fn summarize_usage(usage: &serde_json::Value) -> Option<String> {
         })
         .collect();
     (!parts.is_empty()).then(|| parts.join(" · "))
+}
+
+/// `cachedReadTokens` -> `cached_read_tokens`; anything already snake_case is
+/// only lowercased.
+fn snake_case(name: &str) -> String {
+    let mut out = String::with_capacity(name.len() + 4);
+    for (index, character) in name.char_indices() {
+        if character.is_ascii_uppercase() && index > 0 {
+            out.push('_');
+        }
+        out.extend(character.to_lowercase());
+    }
+    out
 }
 
 #[cfg(test)]
@@ -250,6 +335,109 @@ mod tests {
         app.apply(&PmEvent::Usage(json!({"output_tokens": 1})));
         app.apply(&PmEvent::Usage(json!({"output_tokens": 2})));
         assert_eq!(app.usage.as_deref(), Some("output 2"));
+    }
+
+    /// ACP agents report `outputTokens`; claude reports `output_tokens`. One
+    /// status bar has to serve both without knowing which CLI it is looking at.
+    #[test]
+    fn camel_case_usage_fields_are_summarised_like_snake_case_ones() {
+        let mut app = App::new("Fixture CLI");
+        app.apply(&PmEvent::Usage(json!({
+            "totalTokens": 81876,
+            "inputTokens": 202,
+            "outputTokens": 10,
+            "cachedReadTokens": 81664,
+        })));
+        assert_eq!(
+            app.usage.as_deref(),
+            Some("cached read 81664 · input 202 · output 10 · total 81876")
+        );
+    }
+
+    /// ACP sends a context-window update mid-turn and the token totals only at
+    /// the end, so a snapshot with nothing countable must not wipe the last
+    /// one that had something.
+    #[test]
+    fn a_usage_snapshot_with_nothing_countable_keeps_the_previous_figures() {
+        let mut app = App::new("Fixture CLI");
+        app.apply(&PmEvent::Usage(json!({"output_tokens": 44})));
+        app.apply(&PmEvent::Usage(json!({"used": 81866, "size": 200_000})));
+        assert_eq!(app.usage.as_deref(), Some("output 44"));
+    }
+
+    fn permission_request() -> PmEvent {
+        PmEvent::PermissionRequest {
+            id: 7,
+            description: "write README.md".to_string(),
+            options: vec![
+                PermissionChoice {
+                    id: "once".to_string(),
+                    label: "Allow once".to_string(),
+                    allows: true,
+                },
+                PermissionChoice {
+                    id: "always".to_string(),
+                    label: "Always allow".to_string(),
+                    allows: true,
+                },
+                PermissionChoice {
+                    id: "no".to_string(),
+                    label: "Reject".to_string(),
+                    allows: false,
+                },
+            ],
+        }
+    }
+
+    #[test]
+    fn a_permission_request_becomes_both_a_chat_line_and_pending_state() {
+        let mut app = App::new("Fixture CLI");
+        app.apply(&permission_request());
+
+        let line = app.lines().next_back().unwrap();
+        assert_eq!(line.source, Source::Permission);
+        assert_eq!(line.text, "the PM asks permission to: write README.md");
+        assert_eq!(app.pending_permission.as_ref().unwrap().id, 7);
+    }
+
+    /// Agents list the narrow option before the broad one, and answering for
+    /// somebody else is a decision that should stay as small as it can.
+    #[test]
+    fn a_yes_picks_the_first_allowing_option_and_a_no_the_first_refusing_one() {
+        let mut app = App::new("Fixture CLI");
+        app.apply(&permission_request());
+        let pending = app.pending_permission.as_ref().unwrap();
+        assert_eq!(pending.choice(true).unwrap().id, "once");
+        assert_eq!(pending.choice(false).unwrap().id, "no");
+    }
+
+    /// An agent that offered no way to say no. The interface has to notice
+    /// rather than send an "allow" because it was the only option there.
+    #[test]
+    fn an_answer_the_pm_never_offered_is_reported_as_missing() {
+        let PmEvent::PermissionRequest {
+            id,
+            description,
+            options,
+        } = permission_request()
+        else {
+            unreachable!()
+        };
+        let pending = PendingPermission {
+            id,
+            description,
+            options: options.into_iter().filter(|option| option.allows).collect(),
+        };
+        assert!(pending.choice(false).is_none());
+    }
+
+    #[test]
+    fn taking_the_permission_clears_it() {
+        let mut app = App::new("Fixture CLI");
+        app.apply(&permission_request());
+        assert_eq!(app.take_permission().unwrap().id, 7);
+        assert!(app.pending_permission.is_none());
+        assert!(app.take_permission().is_none());
     }
 
     #[test]

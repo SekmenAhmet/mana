@@ -164,6 +164,10 @@ impl Session {
         self.pm.send_user(text)
     }
 
+    fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
+        self.pm.answer_permission(id, option_id)
+    }
+
     /// Injects one user turn per dispatch that finished since the last poll,
     /// and returns what was injected so the chat pane can show it too.
     ///
@@ -489,6 +493,7 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
     match event {
         AppEvent::Quit => return false,
         AppEvent::ToggleGraph => app.toggle_graph(),
+        AppEvent::AnswerPermission(allow) => answer_permission(allow, app, session),
         AppEvent::Key(c) => app.input.push(c),
         AppEvent::Backspace => {
             app.input.pop();
@@ -511,6 +516,40 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
         }
     }
     true
+}
+
+/// Answers the permission the PM is waiting on, if there is one.
+///
+/// The request is taken out of the app before the transport is called, so a
+/// failed answer cannot leave a prompt on screen that nothing will ever clear
+/// -- an agent that died mid-question is not going to ask again.
+fn answer_permission(allow: bool, app: &mut App, session: &mut Session) {
+    let Some(pending) = app.take_permission() else {
+        // A key pressed when nothing was asked. Silent on purpose: telling the
+        // user off for a keystroke is noise in the one pane they are reading.
+        return;
+    };
+    let Some(choice) = pending.choice(allow) else {
+        app.push(
+            Source::Mana,
+            &format!(
+                "[mana] the PM offered no way to {} that -- it is still waiting",
+                if allow { "allow" } else { "reject" }
+            ),
+        );
+        // Nothing was answered, so the request goes back: the operator can
+        // still press the other key.
+        app.pending_permission = Some(pending);
+        return;
+    };
+    let verdict = choice.label.clone();
+    match session.answer_permission(pending.id, &choice.id) {
+        Ok(()) => app.push(Source::Mana, &format!("[mana] answered: {verdict}")),
+        Err(error) => app.push(
+            Source::Mana,
+            &format!("[mana] that answer did not reach the PM: {error:#}"),
+        ),
+    }
 }
 
 #[cfg(test)]
@@ -737,6 +776,45 @@ url = "https://example.invalid/fixture"
                 .is_empty()
         );
         assert!(!paths.root.join(MCP_CONFIG).exists());
+    }
+
+    /// The one place the shipped ACP entries meet the launch flow: whether a
+    /// CLI gets a config file and a flag, or nothing at all, is catalogue data
+    /// and this is what proves the data reaches the argv.
+    #[test]
+    fn the_shipped_acp_entries_get_exactly_the_tool_flags_they_declare() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let project = tmp.path().join("code/demo");
+        let catalog = Catalog::embedded().unwrap();
+
+        // opencode is attached through the ACP handshake, so there is nothing
+        // to pass on the command line...
+        let opencode = catalog.get("opencode").unwrap();
+        assert!(
+            tool_channel_args(opencode, &paths, &project)
+                .unwrap()
+                .is_empty()
+        );
+
+        // ...while copilot refuses stdio MCP servers offered that way, so it
+        // gets mana's config file by path, with the `@` its flag needs.
+        let copilot = catalog.get("copilot").unwrap();
+        let args = tool_channel_args(copilot, &paths, &project).unwrap();
+        let config = paths.root.join(MCP_CONFIG);
+        assert_eq!(
+            args,
+            vec![
+                "--additional-mcp-config".to_string(),
+                format!("@{}", config.display()),
+            ]
+        );
+        let written: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config).unwrap()).unwrap();
+        assert_eq!(
+            written["mcpServers"]["mana"]["command"],
+            std::env::current_exe().unwrap().to_string_lossy().as_ref()
+        );
     }
 
     pub(super) fn notification(role: Role, task_id: &str, outcome: &str) -> Notification {
@@ -1117,6 +1195,73 @@ mod smoke {
         let lines: Vec<&str> = app.lines().map(|line| line.text.as_str()).collect();
         assert_eq!(lines[0], "are you there");
         assert!(lines[1].contains("did not reach the PM"), "{:?}", lines);
+    }
+
+    fn pending(options: Vec<crate::pm::PermissionChoice>) -> crate::tui::app::PendingPermission {
+        crate::tui::app::PendingPermission {
+            id: 1,
+            description: "write README.md".to_string(),
+            options,
+        }
+    }
+
+    fn choice(id: &str, allows: bool) -> crate::pm::PermissionChoice {
+        crate::pm::PermissionChoice {
+            id: id.to_string(),
+            label: id.to_string(),
+            allows,
+        }
+    }
+
+    /// The stream transport never asks for permission, so answering one has
+    /// nowhere to go -- and that has to land in the pane rather than take the
+    /// session down with it.
+    #[test]
+    fn an_answer_the_transport_cannot_deliver_is_reported_in_the_chat_pane() {
+        let fixture = Fixture::new();
+        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut app = App::new(&session.cli_name);
+        app.pending_permission = Some(pending(vec![choice("yes", true)]));
+
+        assert!(
+            apply_app_event(AppEvent::AnswerPermission(true), &mut app, &mut session),
+            "a failed answer ended the session"
+        );
+        let last = app.lines().next_back().unwrap().text.clone();
+        assert!(last.contains("did not reach the PM"), "{last}");
+        // Cleared either way: an agent that could not be answered is not going
+        // to ask again, and a prompt nothing can clear would sit there for ever.
+        assert!(app.pending_permission.is_none());
+        session.shutdown().unwrap();
+    }
+
+    /// An agent that offered no way to refuse. The request stays up, because
+    /// the other key may still work.
+    #[test]
+    fn an_answer_the_pm_never_offered_leaves_the_request_pending() {
+        let fixture = Fixture::new();
+        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut app = App::new(&session.cli_name);
+        app.pending_permission = Some(pending(vec![choice("yes", true)]));
+
+        apply_app_event(AppEvent::AnswerPermission(false), &mut app, &mut session);
+        let last = app.lines().next_back().unwrap().text.clone();
+        assert!(last.contains("no way to reject"), "{last}");
+        assert!(app.pending_permission.is_some());
+        session.shutdown().unwrap();
+    }
+
+    /// The keys exist all session long; pressing one when nothing was asked
+    /// must be a no-op, not a line of noise in the pane being read.
+    #[test]
+    fn a_permission_key_with_nothing_pending_says_nothing() {
+        let fixture = Fixture::new();
+        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut app = App::new(&session.cli_name);
+
+        apply_app_event(AppEvent::AnswerPermission(true), &mut app, &mut session);
+        assert_eq!(app.lines().count(), 0);
+        session.shutdown().unwrap();
     }
 
     /// A PM that dies on its own must end the loop rather than leave mana

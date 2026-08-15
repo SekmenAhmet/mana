@@ -103,7 +103,10 @@ pub struct Pm {
     pub first_args: Option<Vec<String>>,
     /// `oneshot-continue` only: every turn after the first.
     pub continue_args: Option<Vec<String>>,
-    pub prompt: PromptMode,
+    /// How a turn reaches the process. Absent for `acp`, where the protocol
+    /// carries the prompt as typed content and every value of this field would
+    /// be a lie -- the same reason `events` is absent there.
+    pub prompt: Option<PromptMode>,
     /// Absent for `acp`, which carries its own typed notifications.
     pub events: Option<PmEvents>,
 }

@@ -7,6 +7,9 @@ pub enum AppEvent {
     Enter,
     Backspace,
     ToggleGraph,
+    /// Answers the permission the PM is waiting on: `true` allows, `false`
+    /// rejects. Does nothing when there is none.
+    AnswerPermission(bool),
     Quit,
 }
 
@@ -19,6 +22,11 @@ pub enum AppEvent {
 /// instead. Ctrl+C is the one way out now. mana does not forward Escape
 /// either -- the stream transport carries turns as JSON frames, and there is
 /// no keypress channel to a PM that is not attached to a terminal.
+///
+/// Permission answers are Ctrl+Y and Ctrl+N rather than bare `y`/`n` for the
+/// same class of reason: a bare letter is a letter somebody is in the middle
+/// of typing, and stealing it the instant an agent asks for permission would
+/// mangle the turn being written and answer on the user's behalf.
 pub fn map_key_event(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -26,6 +34,8 @@ pub fn map_key_event(
     use crossterm::event::{KeyCode, KeyModifiers};
     match (code, modifiers) {
         (KeyCode::Char('g'), KeyModifiers::CONTROL) => Some(AppEvent::ToggleGraph),
+        (KeyCode::Char('y'), KeyModifiers::CONTROL) => Some(AppEvent::AnswerPermission(true)),
+        (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(AppEvent::AnswerPermission(false)),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(AppEvent::Quit),
         (KeyCode::Enter, _) => Some(AppEvent::Enter),
         (KeyCode::Backspace, _) => Some(AppEvent::Backspace),
@@ -131,6 +141,24 @@ mod tests {
     #[test]
     fn escape_no_longer_quits() {
         assert_eq!(map_key_event(KeyCode::Esc, KeyModifiers::NONE), None);
+    }
+
+    /// Bare `y`/`n` are letters somebody may be halfway through typing; the
+    /// answer keys must never steal them.
+    #[test]
+    fn ctrl_y_allows_and_ctrl_n_rejects_while_the_bare_letters_still_type() {
+        assert_eq!(
+            map_key_event(KeyCode::Char('y'), KeyModifiers::CONTROL),
+            Some(AppEvent::AnswerPermission(true))
+        );
+        assert_eq!(
+            map_key_event(KeyCode::Char('n'), KeyModifiers::CONTROL),
+            Some(AppEvent::AnswerPermission(false))
+        );
+        assert_eq!(
+            map_key_event(KeyCode::Char('y'), KeyModifiers::NONE),
+            Some(AppEvent::Key('y'))
+        );
     }
 
     #[test]

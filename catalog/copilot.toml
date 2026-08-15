@@ -1,0 +1,123 @@
+# GitHub Copilot CLI. Every flag here was measured against a real install
+# (1.0.80) on 2026-08-15; nothing is inferred from documentation.
+schema = 1
+
+# Top-level key, so it has to precede the first [table] header -- see the same
+# note in claude.toml for why the bottom of the file would not work.
+notes = '''
+ACP conformance, measured 2026-08-15 (`copilot --acp`): initialize answers
+protocolVersion 1 and session/new returns a sessionId, so the transport works.
+But **session/new's mcpServers is rejected**: with --log-level debug the CLI
+prints `Rejecting non-http/sse MCP server "mana" from client`, and the server
+process is never spawned. Its advertised mcpCapabilities are http and sse only.
+This is exactly the uneven area design §4 warns about, and mana does not work
+around it in code -- the entry attaches mana over argv instead, which is
+catalogue data.
+
+That path is verified: `--additional-mcp-config @<file>` with mana's own
+mcp-config.json logs "MCP config loaded: 1 servers configured" and then
+"Service initialized as client ... name: \"mana\", version: \"0.1.0\"", i.e.
+mana's MCP server connected and its instructions were read. The `@` prefix
+means "this is a file path"; the flag also accepts inline JSON, which mana
+cannot template because argv placeholders have no escape for a literal `{`.
+Passing the config twice (over ACP and over argv) is harmless: the ACP copy is
+refused with the warning above and the argv copy is the one that works.
+
+Quota, measured the hard way: this account's monthly allowance was already
+exhausted, so the one full ACP turn attempted returned stopReason "end_turn"
+with a single agent_message_chunk reading "Error: You have exceeded your
+monthly quota (Request ID: ...)". Note the shape -- a *quota failure looks
+like an ordinary answer* over ACP. In headless `-p` mode the same failure is
+exit code 1 with that sentence on stderr, which is what the [[failure]]
+signature below matches. The plan quota is 200 premium requests per month on
+the legacy billing platform (AI credits on the current one); either way it is
+one global monthly pool and nothing on the CLI can report the balance --
+/usage, /limits and the footer are all in-session only.
+
+Models could not be enumerated. There is no `models` subcommand, and while
+--model validates its argument before any model call ("Model \"x\" from
+--model flag is not available"), every plausible id tried on 2026-08-15
+(gpt-5, gpt-5-mini, gpt-5.1, gpt-5.1-codex, claude-sonnet-4.5,
+claude-haiku-4.5, claude-opus-4.5) was rejected while `auto` was accepted --
+most likely because the exhausted quota left the account with no model list at
+all. So the static list is `auto` alone: it is the only id verified to work
+here, it is what the CLI recommends ("use 'auto' to let Copilot pick
+automatically"), and inventing the rest would fail dispatches for no reason.
+Re-measure when the quota resets; the ids belong in [[models.static]] with
+their cost classes.
+
+Unverified, and each is a candidate for a check before it is relied on:
+- The permission flow (session/request_permission) never fired, because the
+  turn never reached the model. The session does expose an "Allow All" config
+  option defaulting to "off", so approval requests are expected to arrive.
+- Sub-agent behaviour: the argv below is assembled from --help
+  (--allow-all-tools is documented as required for non-interactive mode) but
+  no dispatch has completed, again for quota reasons.
+- max_concurrent is 1 out of caution, not measurement. With a 200/month pool
+  and no evidence, the conservative value is the honest one.
+'''
+
+[cli]
+id           = "copilot"
+name         = "GitHub Copilot CLI"
+bin          = "copilot"
+version_args = ["--version"]        # prints two lines; callers keep the first
+
+[pm]
+driver = "acp"                      # acp | stream | oneshot-continue
+args   = ["--acp"]                  # Agent Client Protocol server on stdio
+
+# No permission_args: ACP has no allowlist flag, and the flags this CLI does
+# have all point the wrong way -- --allow-all, --yolo and --allow-all-tools are
+# sub-agent flags and must never appear here. What is left is the session's own
+# "Allow All" option, which defaults to "off" (seen in session/new's
+# configOptions), so this CLI is *expected* to send session/request_permission
+# and mana's TUI is where it would land. Expected, not measured: the quota wall
+# meant no tool ever ran. Until it is, treat the PM's no-code rule here as
+# carried by the skill text, the way opencode's measurably is.
+
+# No [pm.events] and no [pm].prompt: both are non-ACP fields (design §4), and
+# the catalogue rejects them for this driver.
+
+[tools]
+channel  = "mcp"                    # mcp | sentinel
+# Not the ACP-native path: this CLI refuses stdio MCP servers offered through
+# session/new (see notes). The `@` prefix marks the value as a file path.
+mcp_args = ["--additional-mcp-config", "@{config_path}"]
+
+[subagent]
+args                  = ["-p", "{prompt}", "--output-format", "json"]
+auto_approve_args     = ["--allow-all-tools"]  # required for non-interactive
+model_args            = ["--model", "{model}"]
+prompt                = "argv"      # placed by the {prompt} template above
+max_concurrent        = 1           # unmeasured; conservative on a 200/mo pool
+cwd_required_in_brief = false
+
+[models]
+discovery_args = []                 # no models subcommand exists
+
+[[models.static]]
+id         = "auto"                 # the only id this install accepts (notes)
+cost_class = "expensive"            # cheap | mid | expensive -- ordinal ONLY
+pool       = "premium"
+
+[[quota.pools]]
+id         = "premium"
+kind       = "credits"              # requests | tokens | credits | unknown
+period     = "monthly"              # 200 premium requests/month on the legacy plan
+pool_scope = "global"               # global | per-model
+
+[[failure]]                         # ordered; first match wins
+means            = "quota_exhausted"
+exit_codes       = [1]
+stderr_regex     = "exceeded your monthly quota"
+# A monthly pool does not come back in an hour and the CLI never says when it
+# resets, so the cooldown is a day: long enough not to burn retries, short
+# enough that a reset is noticed the next day rather than at the end of it.
+cooldown_minutes = 1440
+
+[skills]
+dirs = ["~/.copilot/skills", "~/.agents/skills"]  # both documented by `copilot skill --help`
+
+[install]
+url = "https://github.com/github/copilot-cli"

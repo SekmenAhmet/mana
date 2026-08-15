@@ -1,0 +1,103 @@
+# opencode -- the reference `acp` entry. Every flag here was measured against a
+# real install (1.14.30) on 2026-08-15; nothing is inferred from documentation.
+schema = 1
+
+# Top-level key, so it has to precede the first [table] header -- see the same
+# note in claude.toml for why the bottom of the file would not work.
+notes = '''
+ACP conformance, measured 2026-08-15 with a full client loop (`opencode acp`):
+initialize answers protocolVersion 1; session/new returns a sessionId; and
+**mcpServers is honoured** -- opencode spawned mana's MCP server from the
+session/new payload and the agent really called `mana_list_agents`, answering
+with the number of CLIs the tool returned. That is why [tools].mcp_args is
+empty: the ACP handshake attaches mana, so no config file and no flag are
+needed. This is the uneven area design §4 warns about, and opencode is the
+side that works (copilot is the side that does not -- see its entry).
+
+The turn shape, same probe: 39 agent_thought_chunk, 1 tool_call + 2
+tool_call_update, 9 agent_message_chunk, 1 usage_update, then stopReason
+"end_turn" carrying a usage object (totalTokens / inputTokens / outputTokens /
+cachedReadTokens). Prose arrives token by token -- the nine chunks were "MAN",
+"A", "-", "TO", "OLS", "-", "OK", " ", "2" -- which is why the driver coalesces
+chunks into whole lines. Closing stdin exits cleanly (code 0).
+
+Two session/prompt requests sent 0.3 s apart on one session were both answered
+end_turn rather than refused, so mana's fire-and-forget turns (a user typing
+while a dispatch notification is injected) do not need queueing here.
+
+Sub-agent flags: `opencode run --format json` emits JSONL (`{"type":"text",
+"part":{"text":...}}`, then a step_finish carrying tokens and cost) and takes
+the prompt as a trailing positional. Two parallel `opencode run` dispatches
+both completed with exit 0, so max_concurrent stays 0.
+
+Quota: none of it is queryable. `opencode stats` is historical only (44
+sessions, total cost $0.00 on this machine) and the models available here are
+the free OpenCode Zen tier, so kind/period are recorded as unknown rather than
+guessed. No [[failure]] entry: no quota-shaped failure has ever been observed
+from this CLI, and a signature borrowed from another one would trigger false
+cooldowns (the mistake caught on agy's entry on 2026-08-15).
+
+DEGRADATION -- the PM is not mechanically read-only here. During a real
+`mana launch opencode` on 2026-08-15 the PM ran opencode's own `bash` and
+`read` tools and **no session/request_permission was ever sent**, even though
+mana advertises no filesystem and no terminal capability in `initialize`.
+Those client capabilities only govern what the agent may ask *mana* to do;
+they say nothing about the tools the agent already has. So on this CLI the
+PM's no-code rule rests on the skill text alone, which design §6 accepts as
+the fallback where a CLI offers no mechanism -- the same position agy is in,
+for a different reason. If opencode grows a read-only agent or mode, it
+belongs in [pm].args and this note goes away.
+
+Unverified, and each is a candidate for a check before it is relied on:
+- cwd_required_in_brief is set from the absence of evidence, not from a
+  measurement: `opencode run` was only ever driven with mana's own cwd.
+- The permission flow was therefore never exercised against this CLI at all:
+  what it would ask for, and with which options, is still unmeasured.
+'''
+
+[cli]
+id           = "opencode"
+name         = "opencode"
+bin          = "opencode"
+version_args = ["--version"]        # prints a bare "1.14.30"
+
+[pm]
+driver = "acp"                      # acp | stream | oneshot-continue
+args   = ["acp"]                    # `opencode acp` -- an ACP server on stdio
+
+# No permission_args, and none is missing: ACP has no allowlist flag at all,
+# and no read-only flag was found on this CLI either. Measured consequence (see
+# notes): this PM can run bash without asking, so the no-code rule is carried by
+# the skill text alone. Inventing a flag would be worse than having none -- an
+# unrecognised argument is how a launch fails at startup for no reason.
+
+# No [pm.events] and no [pm].prompt: both are non-ACP fields (design §4), and
+# the catalogue rejects them for this driver. ACP carries typed notifications
+# and typed content blocks instead.
+
+[tools]
+channel  = "mcp"                    # mcp | sentinel
+mcp_args = []                       # attached through session/new's mcpServers
+
+[subagent]
+args                  = ["run", "--format", "json"]
+auto_approve_args     = ["--dangerously-skip-permissions"]
+model_args            = ["--model", "{model}"]   # ids are "provider/model"
+prompt                = "argv"      # `opencode run [message..]`
+max_concurrent        = 0           # 0 = unlimited; two in parallel measured OK
+cwd_required_in_brief = false
+
+[models]
+discovery_args = ["models"]         # runtime discovery, so no curated list
+# No line_regex: the output is one bare "provider/model" id per line, unlike
+# agy's TSV, so the whole line is the id.
+
+# No [[quota.pools]]: nothing about this CLI's quota is observable here -- the
+# tier in use is free, `opencode stats` reports history rather than a balance,
+# and a pool nobody can exhaust would only produce cooldowns that mean nothing.
+
+[skills]
+dirs = ["~/.agents/skills"]         # verified: opencode reads SKILL.md from it
+
+[install]
+url = "https://opencode.ai"

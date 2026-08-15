@@ -16,7 +16,7 @@
 //! The graph pane is hidden until Ctrl+G, so a session that is just a
 //! conversation looks like one.
 
-use super::app::{App, AppMode, ChatLine, Source};
+use super::app::{App, AppMode, ChatLine, PendingPermission, Source};
 use super::graph::{BLINK_INTERVAL, GraphNode, is_blink_visible, node_line};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -116,6 +116,14 @@ fn decoration(source: Source) -> (&'static str, Style) {
         Source::Pm => ("", Style::default()),
         Source::User => ("›", Style::default().add_modifier(Modifier::BOLD)),
         Source::Mana => ("*", Style::default().fg(Color::Cyan)),
+        // Yellow and bold because it is the only line in the pane that is
+        // waiting on the reader rather than informing them.
+        Source::Permission => (
+            "?",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
         Source::Raw => (
             "·",
             Style::default()
@@ -180,17 +188,45 @@ fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
 }
 
 /// One line, no border: which CLI is driving the PM, what the last turn cost,
-/// and the two keys that do anything.
+/// and the keys that do anything.
+///
+/// While the PM is waiting on a permission it says so instead, in full width
+/// and in yellow: the agent is blocked until somebody answers, and burying
+/// that behind the usual usage figures is how a session looks hung.
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let usage = app.usage.as_deref().unwrap_or("no usage reported yet");
-    frame.render_widget(
-        Paragraph::new(format!(
-            " PM {} · {usage} · Ctrl+G graph · Ctrl+C quit",
-            app.cli_name
-        ))
-        .style(Style::default().fg(Color::DarkGray)),
-        area,
-    );
+    let (text, style) = match &app.pending_permission {
+        Some(pending) => (
+            format!(
+                " PERMISSION: {} · {} · {}",
+                pending.description,
+                key_hint(pending, true, "Ctrl+Y"),
+                key_hint(pending, false, "Ctrl+N"),
+            ),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        None => (
+            format!(
+                " PM {} · {} · Ctrl+G graph · Ctrl+C quit",
+                app.cli_name,
+                app.usage.as_deref().unwrap_or("no usage reported yet")
+            ),
+            Style::default().fg(Color::DarkGray),
+        ),
+    };
+    frame.render_widget(Paragraph::new(text).style(style), area);
+}
+
+/// The agent's own wording for a key, so the operator approves the thing the
+/// agent named rather than mana's paraphrase of it.
+fn key_hint(pending: &PendingPermission, allow: bool, key: &str) -> String {
+    match pending.choice(allow) {
+        Some(choice) => format!("{key} {}", choice.label),
+        // An agent that offered no way to say no. Saying so beats offering a
+        // key that would do nothing.
+        None => format!("{key} unavailable"),
+    }
 }
 
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
@@ -309,6 +345,69 @@ mod tests {
             "{:?}",
             buffer[(5, 1)].style()
         );
+    }
+
+    /// The permission prompt, in both places it lives: a marked line in the
+    /// transcript and the keys taking over the status bar. An agent is blocked
+    /// until somebody answers, so this must not look like ordinary chatter.
+    #[test]
+    fn a_pending_permission_takes_over_the_status_bar_and_marks_its_chat_line() {
+        let mut app = App::new("opencode");
+        app.usage = Some("output 44".to_string());
+        app.apply(&crate::pm::PmEvent::PermissionRequest {
+            id: 1,
+            description: "write README.md".to_string(),
+            options: vec![
+                crate::pm::PermissionChoice {
+                    id: "once".to_string(),
+                    label: "Allow once".to_string(),
+                    allows: true,
+                },
+                crate::pm::PermissionChoice {
+                    id: "no".to_string(),
+                    label: "Reject".to_string(),
+                    allows: false,
+                },
+            ],
+        });
+
+        let rows = screen(&app, &[], 78, 10);
+        let rendered = dump(&rows);
+        assert!(
+            rendered.contains("? the PM asks permission to: write README.md"),
+            "{rendered}"
+        );
+        // The status line names the agent's own options, not mana's paraphrase.
+        assert!(
+            rendered.contains("PERMISSION: write README.md · Ctrl+Y Allow once · Ctrl+N Reject"),
+            "{rendered}"
+        );
+        // ...and the usual status content is gone while the PM is waiting.
+        assert!(!rendered.contains("output 44"), "{rendered}");
+
+        // Yellow, because it is the one line waiting on the reader.
+        let mut terminal = Terminal::new(TestBackend::new(78, 10)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        let buffer = terminal.backend().buffer().clone();
+        assert_eq!(buffer[(1, 6)].style().fg, Some(Color::Yellow));
+    }
+
+    /// An agent that offered no way to refuse must not be answered by a key
+    /// that silently does nothing.
+    #[test]
+    fn a_missing_answer_is_named_in_the_status_bar_rather_than_offered() {
+        let mut app = App::new("opencode");
+        app.pending_permission = Some(PendingPermission {
+            id: 1,
+            description: "run tests".to_string(),
+            options: vec![crate::pm::PermissionChoice {
+                id: "once".to_string(),
+                label: "Allow once".to_string(),
+                allows: true,
+            }],
+        });
+        let rendered = dump(&screen(&app, &[], 78, 10));
+        assert!(rendered.contains("Ctrl+N unavailable"), "{rendered}");
     }
 
     #[test]
