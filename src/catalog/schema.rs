@@ -90,6 +90,15 @@ pub struct Pm {
     /// `oneshot-continue`, which spawns a fresh process per turn instead.
     #[serde(default)]
     pub args: Vec<String>,
+    /// Argv that takes power away from the PM, appended after `args` at
+    /// launch. The PM plans and delegates and must be *mechanically* unable
+    /// to write code (design §6): a constraint the model merely reads is one
+    /// it can talk itself out of on a long session, and every line it writes
+    /// itself is expensive quota spent where cheap quota was the whole point.
+    /// Empty where the CLI has no such flag -- the skill text says it, and
+    /// that is all mana can do there.
+    #[serde(default)]
+    pub permission_args: Vec<String>,
     /// `oneshot-continue` only: the first turn of a session.
     pub first_args: Option<Vec<String>>,
     /// `oneshot-continue` only: every turn after the first.

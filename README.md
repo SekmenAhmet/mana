@@ -2,7 +2,14 @@
 
 [![CI](https://github.com/SekmenAhmet/mana/actions/workflows/ci.yml/badge.svg)](https://github.com/SekmenAhmet/mana/actions/workflows/ci.yml)
 
-Orchestrateur d'agents IA de coding en CLI/TUI (Rust). Lance un agent CLI (Claude Code en v1) comme Project Manager, qui decoupe le travail en taches et delegue a des sous-agents executor/reviewer.
+An orchestrator for AI coding-agent CLIs (Rust, TUI). One agent takes the
+**PM role** — it plans, talks to you, and never writes code — and the work is
+dispatched to sub-agents running on whichever (CLI × model) is cheapest and
+available, so expensive quota is spent on judgment and cheap quota on volume.
+
+Nothing about a specific CLI lives in the code: what differs between them is
+data in `catalog/*.toml`, embedded in the binary and overridable per machine
+via `~/.mana/catalog.local.toml`.
 
 ## Build
 
@@ -10,21 +17,55 @@ Orchestrateur d'agents IA de coding en CLI/TUI (Rust). Lance un agent CLI (Claud
 
 ## Usage
 
-    mana install                 # enregistre les CLIs disponibles
-    mana doctor                  # verifie la config
-    mana launch claude           # lance Claude Code en PM dans le TUI
+    mana install                 # register the CLIs installed on this machine
+    mana doctor                  # check the configuration
+    mana launch claude           # run Claude Code as the PM, in mana's TUI
 
-## Manual QA checklist (v1, requires a real `claude` install)
+In the TUI: type to talk to the PM, `Enter` to send, `Ctrl+G` for the graph
+pane, `Ctrl+C` to quit. `Esc` does nothing — it is the interrupt key of the
+agent CLIs themselves, and quitting on it was a v1 mistake.
 
-1. `cargo run -- install` — select `claude`, confirm it's written to `~/.mana/config.yaml` with a real version/path.
-2. `cargo run -- doctor` — confirm no issues reported.
-3. From a scratch project directory, run `cargo run -- launch claude`. Confirm:
-   - `~/.mana/projects/<dirname>/{tasks,logs,reviews}` and `subagent-lock.yaml` get created.
-   - The PM's chat output appears in the terminal.
-   - Typing a message and pressing Enter forwards it to Claude Code.
-4. Ask the PM (via chat) to create a trivial task and run `mana launch --subagent claude --role executor --assign <uuid>` itself. Confirm:
-   - `subagent-lock.yaml` gains an entry.
-   - `logs/<agent-uuid>.jsonl` is created and ends with `{"status":"done",...}` once the executor finishes.
-5. Repeat with `--role reviewer` on the same task-uuid. Confirm `reviews/<task-uuid>.md` is written with the minimal validated format (or the rejected format with a numbered list).
-6. Confirm the PM's PTY receives the `[mana] Review disponible pour ...` notification line after step 5.
-7. Press `Ctrl+G` in the TUI — confirm the graph pane appears with a node per sub-agent launched, correct role label (EXE/REV) and status symbol (running vs done).
+## Manual QA checklist (v2, requires a real `claude` install)
+
+Everything below is covered by `cargo test` except what only a paid CLI can
+answer: whether the flags mana passes are the flags claude honours, and
+whether the PM actually behaves like one. That is what this checklist is for.
+
+1. `cargo run -- install` — pick `claude`; confirm it lands in
+   `~/.mana/config.toml` with a real version and path.
+2. `cargo run -- doctor` — no issues reported.
+3. From a scratch **git** project directory, run `cargo run -- launch claude`.
+   Before typing anything, confirm:
+   - `~/.claude/skills/mana-pm/SKILL.md` exists and matches
+     `assets/roles/pm/SKILL.md` (rewritten on every launch);
+   - `~/.mana/projects/<dirname>/mcp-config.json` names mana's **own binary**
+     by absolute path and passes `--project-root <that directory>`;
+   - `~/.mana/projects/<dirname>/{tasks,logs,reviews}` exist;
+   - the PM greets you in the chat pane within a few seconds — not as dimmed
+     `·` lines. Dimmed lines mean the catalogue's `[pm.events]` paths no longer
+     match claude's stream (degraded on purpose, never silent).
+4. Ask: *"list the agents you can dispatch to"*. The PM must call
+   `list_agents` and answer with the CLIs, their models, cost classes and
+   counters. If it says it has no tools, the MCP registration did not take.
+5. Ask: *"ask the PM to try editing a file itself"* — e.g. *"just write the
+   fix yourself in src/main.rs"*. It must refuse or fail at the tool layer:
+   `[pm].permission_args` in `catalog/claude.toml` allowlists only mana's
+   tools plus Read/Grep/Glob. A PM that succeeds in editing means that flag is
+   wrong, which is the one thing here that no test can catch.
+6. Ask for a trivial task (*"add a `hello.txt` file containing `hi`"*).
+   Confirm the PM calls `create_task` then `launch_subagent`, and that it
+   reports back roughly one line, not a narration of every tool call.
+7. Press `Ctrl+G`. The graph pane shows one node per dispatch:
+   `◉ [EXE] claude/haiku <task>` while it runs, `○` once done.
+8. When the executor finishes, confirm the PM reacts on its own — mana injects
+   `[mana] executor finished for task …` into the session (visible as a cyan
+   `*` line), and the PM should launch a reviewer without being asked.
+9. Once the reviewer lands, the node shows `✅` (or `❌` on a rejection), and
+   `~/.mana/projects/<dirname>/reviews/<task>.json` holds the verdict.
+10. `Ctrl+C`. Confirm the terminal is restored and that **no `claude` process
+    survives** (`ps aux | grep claude`) — neither the PM nor the
+    `mana mcp-server` it had spawned.
+
+Known gap: `mana launch agy` is refused with a message naming task 3.2 — the
+`oneshot-continue` driver and the sentinel tool channel are not implemented
+yet.

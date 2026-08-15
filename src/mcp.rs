@@ -28,7 +28,12 @@
 //! this server can be restarted mid-session and the PM cannot tell.
 
 mod routing;
-mod runs;
+// `pub(crate)` for the consumer named in its own module doc: the PM driver
+// (`cli::launch_pm`) tails `notifications.jsonl` and injects each line into the
+// PM session. It reads that file back through `runs::Notification`, so the
+// field names stay one contract with one owner instead of two structs free to
+// drift apart.
+pub(crate) mod runs;
 
 use crate::catalog::{Catalog, CliEntry, CostClass};
 use crate::dispatch::{self, DispatchOutcome};

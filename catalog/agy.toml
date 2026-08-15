@@ -52,6 +52,13 @@ first_args    = ["--print", "--output-format", "stream-json", "{prompt}"]
 continue_args = ["--print", "--continue", "--output-format", "stream-json", "{prompt}"]
 prompt        = "argv"             # argv | stdin | stdin-jsonl
 
+# No permission_args on purpose: nothing equivalent to an allowlist was measured
+# on this CLI (only the opposite -- `--dangerously-skip-permissions`, which
+# sub-agents want and a PM must never have). So the PM's no-code rule is carried
+# by the skill text alone here, which design §6 accepts as the fallback where a
+# CLI offers no mechanism. Inventing a flag would be worse than having none: an
+# unrecognised argument is how a launch fails at startup for no reason.
+
 [pm.events]                        # non-ACP drivers only; 2 fields MAX (design §4)
 text  = "$.message.content[?@.type=='text'].text"
 usage = "$.usage"
