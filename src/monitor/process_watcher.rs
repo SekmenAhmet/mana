@@ -23,7 +23,7 @@ pub fn watch_and_log(
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // every test here execs unix shell fixtures
 mod tests {
     use super::*;
     use crate::log::read_last_status;

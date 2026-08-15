@@ -72,7 +72,7 @@ pub(crate) fn write_version_script(
     script
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // every test here execs unix shell fixtures
 mod tests {
     use super::*;
 

@@ -146,7 +146,7 @@ pub(crate) mod test_support {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))] // every test here execs unix shell fixtures
 mod tests {
     use super::*;
 
