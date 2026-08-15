@@ -64,7 +64,10 @@ impl EventSource for CrosstermEventSource {
     }
 }
 
-#[cfg(test)]
+// unix-gated with its only consumer (launch_pm's session tests, which drive a
+// real child process): on Windows the struct would be dead code under
+// -D warnings. Widen back to plain cfg(test) with the first Windows user.
+#[cfg(all(test, unix))]
 pub(crate) mod test_support {
     use super::EventSource;
     use crossterm::event::KeyEvent;
