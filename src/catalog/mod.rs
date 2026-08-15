@@ -299,7 +299,10 @@ url = "https://example.invalid/alpha"
         assert!(agy.subagent.cwd_required_in_brief);
         assert_eq!(agy.models.discovery_args, vec!["models"]);
         assert_eq!(agy.quota.pools[0].pool_scope, PoolScope::PerModel);
-        assert_eq!(agy.failure[0].means, FailureMeans::QuotaExhausted);
+        // Deliberately empty: agy has never shown an observable quota signal,
+        // and a signature borrowed from another CLI would trigger false
+        // cooldowns (a copilot-measured one was removed on 2026-08-15).
+        assert!(agy.failure.is_empty());
     }
 
     #[test]
