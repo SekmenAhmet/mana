@@ -35,7 +35,7 @@ anyhow = "1"
 # exhausted". Already in the tree transitively, so it adds nothing to audit.
 regex = "1"
 dirs = "6"
-which = "6"
+which = "8"
 dialoguer = "0.11"
 # The MCP server the PM talks to (`mana mcp-server`, design §5). `rmcp` is the
 # official SDK under the modelcontextprotocol org; the alternative
