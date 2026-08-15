@@ -292,7 +292,12 @@ fn apply_app_event(event: AppEvent, app: &mut App, writer: &mut dyn Write) -> an
         }
         AppEvent::Enter => {
             let message = std::mem::take(&mut app.input);
-            if !message.is_empty() {
+            if message.trim() == "/graph" {
+                // Local UI command, per TUI.md ("/graph ou Ctrl+G") — toggled
+                // here instead of being sent to the PM, which would just see
+                // an unexplained "/graph" chat message.
+                app.toggle_graph();
+            } else if !message.is_empty() {
                 writer.write_all(message.as_bytes())?;
                 writer.write_all(b"\n")?;
             }
@@ -690,6 +695,36 @@ mod tests {
         let mut writer: Vec<u8> = Vec::new();
         apply_app_event(AppEvent::Enter, &mut app, &mut writer).unwrap();
         assert!(writer.is_empty());
+    }
+
+    #[test]
+    fn apply_app_event_enter_with_slash_graph_toggles_mode_without_writing() {
+        let mut app = App::new();
+        app.input = "/graph".to_string();
+        let mut writer: Vec<u8> = Vec::new();
+        apply_app_event(AppEvent::Enter, &mut app, &mut writer).unwrap();
+        assert_eq!(app.mode, AppMode::Graph);
+        assert!(writer.is_empty());
+        assert!(app.input.is_empty());
+    }
+
+    #[test]
+    fn apply_app_event_enter_with_slash_graph_toggles_back_to_chat() {
+        let mut app = App::new();
+        app.toggle_graph();
+        app.input = "/graph".to_string();
+        let mut writer: Vec<u8> = Vec::new();
+        apply_app_event(AppEvent::Enter, &mut app, &mut writer).unwrap();
+        assert_eq!(app.mode, AppMode::Chat);
+    }
+
+    #[test]
+    fn apply_app_event_enter_with_slash_graph_surrounded_by_whitespace_still_toggles() {
+        let mut app = App::new();
+        app.input = "  /graph  ".to_string();
+        let mut writer: Vec<u8> = Vec::new();
+        apply_app_event(AppEvent::Enter, &mut app, &mut writer).unwrap();
+        assert_eq!(app.mode, AppMode::Graph);
     }
 
     #[test]
