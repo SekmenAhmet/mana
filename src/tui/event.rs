@@ -26,6 +26,70 @@ pub fn map_key_event(
     }
 }
 
+/// Source of raw key events for the PM's render loop. `launch_pm::run`
+/// depends on this instead of calling `crossterm::event::poll`/`read`
+/// directly, so the loop's per-tick logic is testable against a scripted
+/// key sequence instead of only against a real terminal's stdin.
+pub trait EventSource {
+    fn poll_key(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<crossterm::event::KeyEvent>>;
+}
+
+pub struct CrosstermEventSource;
+
+impl EventSource for CrosstermEventSource {
+    fn poll_key(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> anyhow::Result<Option<crossterm::event::KeyEvent>> {
+        if crossterm::event::poll(timeout)?
+            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
+        {
+            return Ok(Some(key));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::EventSource;
+    use crossterm::event::KeyEvent;
+    use std::collections::VecDeque;
+
+    /// Replays a fixed sequence of key events, one per `poll_key` call,
+    /// ignoring the timeout entirely (tests don't want to actually wait).
+    /// The sequence MUST end with a key that `map_key_event` maps to
+    /// `AppEvent::Quit` (e.g. `KeyCode::Esc`) — once exhausted, `poll_key`
+    /// returns an error instead of blocking forever, so a test that forgot
+    /// the trailing quit key fails fast instead of hanging.
+    pub(crate) struct FakeEventSource {
+        queue: VecDeque<KeyEvent>,
+    }
+
+    impl FakeEventSource {
+        pub(crate) fn new(events: impl IntoIterator<Item = KeyEvent>) -> Self {
+            FakeEventSource {
+                queue: events.into_iter().collect(),
+            }
+        }
+    }
+
+    impl EventSource for FakeEventSource {
+        fn poll_key(&mut self, _timeout: std::time::Duration) -> anyhow::Result<Option<KeyEvent>> {
+            self.queue.pop_front().map(Some).ok_or_else(|| {
+                anyhow::anyhow!(
+                    "FakeEventSource exhausted without a Quit-mapped key — the test likely \
+                     forgot to end its scripted sequence with one, which would otherwise loop \
+                     forever against a real EventSource"
+                )
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

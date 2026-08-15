@@ -1,21 +1,20 @@
-use crate::config::{Config, load_config};
+use crate::config::{ensure_agent_registered, load_config};
 use crate::lock::load_lock;
 use crate::monitor::file_watcher::{FsEvent, watch};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
 use crate::prompts::pm_prompt;
-use crate::pty;
+use crate::pty::{PtySession, RealSpawner, Spawner};
 use crate::tui::app::{App, AppMode};
-use crate::tui::event::{AppEvent, map_key_event};
+use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, map_key_event};
 use crate::tui::graph::{GraphNode, build_nodes, role_label, status_symbol};
-use crossterm::event::{self, Event};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
+use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use std::io::{Read, Write};
@@ -37,16 +36,6 @@ pub fn build_notification(event_path: &Path, reviews_dir: &Path) -> Option<Strin
         "[mana] Review disponible pour {task_uuid} : {}",
         event_path.display()
     ))
-}
-
-fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Result<()> {
-    if config.models.contains_key(agent_cli) {
-        Ok(())
-    } else {
-        anyhow::bail!(
-            "agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer."
-        )
-    }
 }
 
 /// Reads the PM's PTY output on a background thread so the render loop never
@@ -73,19 +62,7 @@ fn spawn_pty_reader(mut reader: Box<dyn Read + Send>) -> Receiver<Vec<u8>> {
 
 pub fn run(agent_cli: &str) -> anyhow::Result<()> {
     let home = mana_home()?;
-    let cwd = std::env::current_dir()?;
-    let project_name = project_name_from_dir(&cwd);
-    let paths = resolve_project_paths(&home, &project_name);
-    ensure_project_structure(&paths)?;
-
-    let config = load_config(&home.join("config.yaml"))?;
-    ensure_agent_registered(&config, agent_cli)?;
-
-    let mut session = pty::spawn(agent_cli, &[])?;
-    session
-        .writer
-        .write_all(pm_prompt(&project_name).as_bytes())?;
-    session.writer.write_all(b"\n")?;
+    let (mut session, paths, _project_name) = prepare_session(&home, &RealSpawner, agent_cli)?;
 
     let (_fs_watcher, fs_events) = watch(&paths.root)?;
     let pty_output = spawn_pty_reader(session.reader);
@@ -97,6 +74,7 @@ pub fn run(agent_cli: &str) -> anyhow::Result<()> {
     let mut terminal = Terminal::new(backend)?;
 
     let mut app = App::new();
+    let mut events = CrosstermEventSource;
     let result = run_event_loop(
         &mut terminal,
         &mut app,
@@ -104,6 +82,7 @@ pub fn run(agent_cli: &str) -> anyhow::Result<()> {
         &pty_output,
         &fs_events,
         &paths,
+        &mut events,
     );
 
     disable_raw_mode()?;
@@ -113,13 +92,41 @@ pub fn run(agent_cli: &str) -> anyhow::Result<()> {
     result
 }
 
-fn run_event_loop(
-    terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+/// Does everything `run` needs before it can touch a real terminal: resolve
+/// the project's paths, check the agent is registered, spawn its PTY
+/// session and send it the PM prompt. Split out so this — the part with
+/// actual decisions in it — is testable against a tempdir `home` and a
+/// `pty::test_support::FakeSpawner`, without needing a real terminal.
+fn prepare_session(
+    home: &Path,
+    spawner: &dyn Spawner,
+    agent_cli: &str,
+) -> anyhow::Result<(PtySession, ProjectPaths, String)> {
+    let cwd = std::env::current_dir()?;
+    let project_name = project_name_from_dir(&cwd);
+    let paths = resolve_project_paths(home, &project_name);
+    ensure_project_structure(&paths)?;
+
+    let config = load_config(&home.join("config.yaml"))?;
+    ensure_agent_registered(&config, agent_cli)?;
+
+    let mut session = spawner.spawn(agent_cli, &[])?;
+    session
+        .writer
+        .write_all(pm_prompt(&project_name).as_bytes())?;
+    session.writer.write_all(b"\n")?;
+
+    Ok((session, paths, project_name))
+}
+
+fn run_event_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
     app: &mut App,
-    writer: &mut Box<dyn Write + Send>,
+    writer: &mut dyn Write,
     pty_output: &Receiver<Vec<u8>>,
     fs_events: &Receiver<FsEvent>,
     paths: &ProjectPaths,
+    events: &mut dyn EventSource,
 ) -> anyhow::Result<()> {
     loop {
         while let Ok(chunk) = pty_output.try_recv() {
@@ -138,8 +145,7 @@ fn run_event_loop(
 
         terminal.draw(|frame| draw(frame, app, &nodes))?;
 
-        if event::poll(Duration::from_millis(50))?
-            && let Event::Key(key) = event::read()?
+        if let Some(key) = events.poll_key(Duration::from_millis(50))?
             && let Some(app_event) = map_key_event(key.code, key.modifiers)
             && !apply_app_event(app_event, app, writer)?
         {
@@ -249,24 +255,156 @@ mod tests {
         assert!(build_notification(logs_path, reviews_dir).is_none());
     }
 
-    #[test]
-    fn ensure_agent_registered_rejects_unknown_agent() {
-        let config = crate::config::Config::default();
-        assert!(ensure_agent_registered(&config, "claude").is_err());
+    fn agent_config(path: &str) -> crate::config::AgentConfig {
+        crate::config::AgentConfig {
+            name: "claude".into(),
+            version: "1.0".into(),
+            path: path.into(),
+        }
     }
 
     #[test]
-    fn ensure_agent_registered_accepts_known_agent() {
+    fn prepare_session_errors_when_agent_not_registered() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
+        crate::config::save_config(&home.join("config.yaml"), &crate::config::Config::default())
+            .unwrap();
+
+        let spawner = crate::pty::test_support::FakeSpawner::new(vec![]);
+        assert!(prepare_session(home, &spawner, "claude").is_err());
+    }
+
+    #[test]
+    fn prepare_session_creates_project_structure_and_sends_pm_prompt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path();
         let mut config = crate::config::Config::default();
-        config.models.insert(
-            "claude".to_string(),
-            crate::config::AgentConfig {
-                name: "claude".into(),
-                version: "1.0".into(),
-                path: "/usr/local/bin/claude".into(),
-            },
-        );
-        assert!(ensure_agent_registered(&config, "claude").is_ok());
+        config
+            .models
+            .insert("claude".to_string(), agent_config("/usr/local/bin/claude"));
+        crate::config::save_config(&home.join("config.yaml"), &config).unwrap();
+
+        let spawner = crate::pty::test_support::FakeSpawner::new(vec![]);
+        let (_session, paths, project_name) = prepare_session(home, &spawner, "claude").unwrap();
+
+        assert!(paths.tasks.is_dir());
+        assert!(paths.logs.is_dir());
+        assert!(paths.reviews.is_dir());
+
+        let calls = spawner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].0, "claude");
+
+        let sent = String::from_utf8_lossy(&spawner.written.lock().unwrap()).to_string();
+        assert!(sent.contains(&project_name));
+        assert!(sent.contains("Project Manager"));
+    }
+
+    fn fake_paths(home: &Path) -> ProjectPaths {
+        let paths = resolve_project_paths(home, "proj");
+        ensure_project_structure(&paths).unwrap();
+        paths
+    }
+
+    #[test]
+    fn run_event_loop_pushes_pty_output_into_app_and_quits_on_scripted_key() {
+        use crate::tui::event::test_support::FakeEventSource;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = fake_paths(tmp.path());
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+
+        let (pty_tx, pty_rx) = channel();
+        pty_tx.send(b"hello from pm".to_vec()).unwrap();
+        let (_fs_tx, fs_rx) = channel();
+        let mut events = FakeEventSource::new([KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)]);
+
+        run_event_loop(
+            &mut terminal,
+            &mut app,
+            &mut writer,
+            &pty_rx,
+            &fs_rx,
+            &paths,
+            &mut events,
+        )
+        .unwrap();
+
+        assert_eq!(app.chat_lines, vec!["hello from pm".to_string()]);
+    }
+
+    #[test]
+    fn run_event_loop_writes_notification_on_review_fs_event_then_quits() {
+        use crate::tui::event::test_support::FakeEventSource;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = fake_paths(tmp.path());
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+
+        let (_pty_tx, pty_rx) = channel();
+        let (fs_tx, fs_rx) = channel();
+        fs_tx
+            .send(FsEvent::Changed(paths.reviews.join("task-1.md")))
+            .unwrap();
+        let mut events = FakeEventSource::new([KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)]);
+
+        run_event_loop(
+            &mut terminal,
+            &mut app,
+            &mut writer,
+            &pty_rx,
+            &fs_rx,
+            &paths,
+            &mut events,
+        )
+        .unwrap();
+
+        let sent = String::from_utf8_lossy(&writer);
+        assert!(sent.contains("task-1"));
+        assert!(sent.contains("Review disponible"));
+    }
+
+    #[test]
+    fn run_event_loop_enter_sends_typed_input_to_writer() {
+        use crate::tui::event::test_support::FakeEventSource;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = fake_paths(tmp.path());
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+
+        let (_pty_tx, pty_rx) = channel();
+        let (_fs_tx, fs_rx) = channel();
+        let mut events = FakeEventSource::new([
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Char('i'), KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+        ]);
+
+        run_event_loop(
+            &mut terminal,
+            &mut app,
+            &mut writer,
+            &pty_rx,
+            &fs_rx,
+            &paths,
+            &mut events,
+        )
+        .unwrap();
+
+        assert_eq!(writer, b"hi\n");
     }
 
     #[test]
