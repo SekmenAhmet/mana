@@ -26,7 +26,7 @@ anyhow = "1"
 # sub-agent's output is what turns "the CLI exited 1" into "the quota pool is
 # exhausted". Already in the tree transitively, so it adds nothing to audit.
 regex = "1"
-dirs = "5"
+dirs = "6"
 which = "6"
 dialoguer = "0.11"
 
