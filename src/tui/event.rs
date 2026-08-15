@@ -1,3 +1,6 @@
+//! Key events, decoded once and away from the render loop so the mapping is
+//! testable without a terminal.
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppEvent {
     Key(char),
@@ -7,8 +10,15 @@ pub enum AppEvent {
     Quit,
 }
 
-/// Translates a crossterm key event into an AppEvent. Kept as a pure
-/// function so the mapping is unit-testable without a real terminal.
+/// Translates a crossterm key event into an `AppEvent`, or `None` for a key
+/// mana has nothing to do with.
+///
+/// Escape is deliberately absent. In v1 it quit the session, which was wrong
+/// on both ends: it is the key every agent CLI uses to interrupt itself, so
+/// the reflex of pressing it to stop a runaway answer killed the whole PM
+/// instead. Ctrl+C is the one way out now. mana does not forward Escape
+/// either -- the stream transport carries turns as JSON frames, and there is
+/// no keypress channel to a PM that is not attached to a terminal.
 pub fn map_key_event(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -17,7 +27,6 @@ pub fn map_key_event(
     match (code, modifiers) {
         (KeyCode::Char('g'), KeyModifiers::CONTROL) => Some(AppEvent::ToggleGraph),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(AppEvent::Quit),
-        (KeyCode::Esc, _) => Some(AppEvent::Quit),
         (KeyCode::Enter, _) => Some(AppEvent::Enter),
         (KeyCode::Backspace, _) => Some(AppEvent::Backspace),
         (KeyCode::Char(c), KeyModifiers::NONE) => Some(AppEvent::Key(c)),
@@ -26,10 +35,9 @@ pub fn map_key_event(
     }
 }
 
-/// Source of raw key events for the PM's render loop. `launch_pm::run`
-/// depends on this instead of calling `crossterm::event::poll`/`read`
-/// directly, so the loop's per-tick logic is testable against a scripted
-/// key sequence instead of only against a real terminal's stdin.
+/// Source of raw key events for the PM's render loop. The loop depends on
+/// this instead of calling `crossterm::event::poll`/`read` directly, so its
+/// per-tick logic is testable against a scripted key sequence.
 pub trait EventSource {
     fn poll_key(
         &mut self,
@@ -46,6 +54,9 @@ impl EventSource for CrosstermEventSource {
     ) -> anyhow::Result<Option<crossterm::event::KeyEvent>> {
         if crossterm::event::poll(timeout)?
             && let crossterm::event::Event::Key(key) = crossterm::event::read()?
+            // Windows reports press *and* release for every key; without this
+            // filter each character would be typed twice there.
+            && key.kind == crossterm::event::KeyEventKind::Press
         {
             return Ok(Some(key));
         }
@@ -53,7 +64,10 @@ impl EventSource for CrosstermEventSource {
     }
 }
 
-#[cfg(test)]
+// unix-gated with its only consumer (launch_pm's session tests, which drive a
+// real child process): on Windows the struct would be dead code under
+// -D warnings. Widen back to plain cfg(test) with the first Windows user.
+#[cfg(all(test, unix))]
 pub(crate) mod test_support {
     use super::EventSource;
     use crossterm::event::KeyEvent;
@@ -62,9 +76,9 @@ pub(crate) mod test_support {
     /// Replays a fixed sequence of key events, one per `poll_key` call,
     /// ignoring the timeout entirely (tests don't want to actually wait).
     /// The sequence MUST end with a key that `map_key_event` maps to
-    /// `AppEvent::Quit` (e.g. `KeyCode::Esc`) — once exhausted, `poll_key`
-    /// returns an error instead of blocking forever, so a test that forgot
-    /// the trailing quit key fails fast instead of hanging.
+    /// `AppEvent::Quit` (Ctrl+C) -- once exhausted, `poll_key` returns an
+    /// error instead of blocking forever, so a test that forgot the trailing
+    /// quit key fails fast instead of hanging.
     pub(crate) struct FakeEventSource {
         queue: VecDeque<KeyEvent>,
     }
@@ -81,9 +95,9 @@ pub(crate) mod test_support {
         fn poll_key(&mut self, _timeout: std::time::Duration) -> anyhow::Result<Option<KeyEvent>> {
             self.queue.pop_front().map(Some).ok_or_else(|| {
                 anyhow::anyhow!(
-                    "FakeEventSource exhausted without a Quit-mapped key — the test likely \
-                     forgot to end its scripted sequence with one, which would otherwise loop \
-                     forever against a real EventSource"
+                    "FakeEventSource exhausted without a Quit-mapped key -- the test likely \
+                     forgot to end its scripted sequence with Ctrl+C, which would otherwise \
+                     loop forever against a real EventSource"
                 )
             })
         }
@@ -111,12 +125,12 @@ mod tests {
         );
     }
 
+    /// The v1 behaviour that had to go: Escape is the interrupt key of every
+    /// agent CLI, and quitting the session on it is the opposite of what the
+    /// reflex means.
     #[test]
-    fn escape_quits() {
-        assert_eq!(
-            map_key_event(KeyCode::Esc, KeyModifiers::NONE),
-            Some(AppEvent::Quit)
-        );
+    fn escape_no_longer_quits() {
+        assert_eq!(map_key_event(KeyCode::Esc, KeyModifiers::NONE), None);
     }
 
     #[test]

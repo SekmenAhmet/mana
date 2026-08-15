@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand};
+use std::path::PathBuf;
 
 pub mod dev;
 pub mod doctor;
@@ -34,6 +35,21 @@ pub enum Command {
     Dev {
         #[command(subcommand)]
         command: dev::DevCommand,
+    },
+    /// mana's orchestration tools, spoken over MCP on stdin/stdout.
+    ///
+    /// Hidden because no human runs it: mana registers this exact invocation
+    /// with the PM's CLI via the catalogue's `mcp_args` template, pointing at
+    /// `current_exe()`. Documenting it would invite users to wire it up by
+    /// hand against a surface that is an internal contract (design §5).
+    #[command(hide = true, name = "mcp-server")]
+    McpServer {
+        /// Absolute path to the project the PM is orchestrating. Required
+        /// rather than inferred from the working directory: the PM CLI spawns
+        /// this process from wherever it happens to be, and which project a
+        /// task belongs to is not negotiable at that point.
+        #[arg(long, value_name = "PATH")]
+        project_root: PathBuf,
     },
 }
 

@@ -15,6 +15,12 @@ continuity held across turns, clean exit.
 
 The static models are the CLI's own aliases (--model "Provide an alias for the
 latest model"), so they track vendor releases without catalogue edits.
+
+Verified live (2026-08-15, headless probe with this exact argv): the mana MCP
+server connects and its four tools are callable under the mcp__mana__ prefix
+without a permission prompt, while a Write attempt is refused with "requested
+permissions ... but you haven't granted it" and no file appears. The PM is
+mechanically read-only, as [pm].permission_args intends.
 '''
 
 [cli]
@@ -28,6 +34,17 @@ driver = "stream"                  # acp | stream | oneshot-continue
 args   = ["-p", "--input-format", "stream-json",
           "--output-format", "stream-json", "--verbose"]
 prompt = "stdin-jsonl"             # argv | stdin | stdin-jsonl
+
+# The PM must be mechanically unable to write code (design §6). An allowlist is
+# the only enforcement this CLI offers, so it gets one: mana's four
+# orchestration tools (`mcp__mana__*`, the MCP server registers under the name
+# `mana`), plus the three read-only tools a planner needs to look at the project
+# before writing a brief. Edit, Write, Bash and Task are absent, so an attempt
+# to implement the work itself fails at the tool layer instead of quietly
+# burning the expensive quota this whole design exists to spend on judgment.
+#
+# Not `--tools`: see the note above about what that flag does to the context.
+permission_args = ["--allowedTools", "mcp__mana__*,Read,Grep,Glob"]
 
 [pm.events]                        # non-ACP drivers only; 2 fields MAX (design §4)
 text  = "$.message.content[?@.type=='text'].text"

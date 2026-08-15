@@ -170,6 +170,10 @@ fn argv_templates(entry: &CliEntry) -> Vec<(String, &[String])> {
     let mut templates: Vec<(String, &[String])> = vec![
         (format!("{id}: [cli].version_args"), &entry.cli.version_args),
         (format!("{id}: [pm].args"), &entry.pm.args),
+        (
+            format!("{id}: [pm].permission_args"),
+            &entry.pm.permission_args,
+        ),
         (format!("{id}: [tools].mcp_args"), &entry.tools.mcp_args),
         (format!("{id}: [subagent].args"), &entry.subagent.args),
         (
@@ -286,6 +290,18 @@ url = "https://example.invalid/alpha"
         let claude = catalog.get("claude").unwrap();
         assert_eq!(claude.pm.driver, PmDriver::Stream);
         assert_eq!(claude.tools.channel, ToolChannel::Mcp);
+        // The PM's no-code rule is data, not code (design §6). Assert the
+        // shape rather than the exact string: what matters is that the
+        // allowlist reaches mana's own tools and grants nothing that writes.
+        assert_eq!(claude.pm.permission_args[0], "--allowedTools");
+        let allowed = &claude.pm.permission_args[1];
+        assert!(allowed.contains("mcp__mana__*"), "{allowed}");
+        for writing in ["Edit", "Write", "Bash"] {
+            assert!(
+                !allowed.contains(writing),
+                "the PM may {writing}: {allowed}"
+            );
+        }
         assert_eq!(claude.subagent.max_concurrent, 0);
         assert_eq!(
             claude.pm.events.as_ref().unwrap().usage.as_deref(),
@@ -298,6 +314,9 @@ url = "https://example.invalid/alpha"
         assert_eq!(agy.subagent.max_concurrent, 1);
         assert!(agy.subagent.cwd_required_in_brief);
         assert_eq!(agy.models.discovery_args, vec!["models"]);
+        // Deliberately absent: no allowlist-shaped flag was ever measured on
+        // this CLI, and inventing one would fail the launch at startup.
+        assert!(agy.pm.permission_args.is_empty());
         assert_eq!(agy.quota.pools[0].pool_scope, PoolScope::PerModel);
         // Deliberately empty: agy has never shown an observable quota signal,
         // and a signature borrowed from another CLI would trigger false
@@ -392,6 +411,21 @@ url = "https://example.invalid/alpha"
         let rendered = format!("{err:#}");
         assert!(rendered.contains("modle"), "{rendered}");
         assert!(rendered.contains("[subagent].model_args"), "{rendered}");
+    }
+
+    /// Every templated field is checked, including the one added last: the
+    /// list in `argv_templates` is easy to forget to extend, and a field
+    /// missing from it silently stops being validated.
+    #[test]
+    fn unknown_placeholder_in_permission_args_is_caught_at_load() {
+        let err = parse_entry(&fixture_with(
+            r#"prompt = "stdin-jsonl""#,
+            "prompt = \"stdin-jsonl\"\npermission_args = [\"--allow\", \"{tolls}\"]",
+        ))
+        .unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("tolls"), "{rendered}");
+        assert!(rendered.contains("[pm].permission_args"), "{rendered}");
     }
 
     #[test]

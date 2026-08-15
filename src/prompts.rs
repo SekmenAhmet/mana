@@ -1,6 +1,12 @@
 use crate::task::Task;
 use std::path::Path;
 
+/// Orphaned by the v2 launch flow (mana v2, task 2.3): the PM's instructions
+/// are now `assets/roles/pm/SKILL.md` installed on disk plus the MCP tool
+/// schemas, so nothing calls this. Kept compiling rather than deleted because
+/// the whole of `prompts.rs` goes in the 4.5 kill sweep, together with the
+/// shell-out protocol it describes -- which design §10 lists as dead.
+#[allow(dead_code)]
 pub fn pm_prompt(project_name: &str) -> String {
     format!(
         "You are the Main Agent (Project Manager) orchestrated by mana for the project '{project_name}'.\n\

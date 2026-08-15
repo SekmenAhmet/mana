@@ -120,7 +120,7 @@ pub fn read_last_status(path: &Path) -> anyhow::Result<Option<Status>> {
 ///
 /// Only called by `counters` today (see its own `#[allow(dead_code)]` note).
 #[allow(dead_code)]
-fn read_last_exit(path: &Path) -> anyhow::Result<Option<ExitEntry>> {
+pub(crate) fn read_last_exit(path: &Path) -> anyhow::Result<Option<ExitEntry>> {
     if !path.exists() {
         return Ok(None);
     }

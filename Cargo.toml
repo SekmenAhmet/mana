@@ -14,6 +14,14 @@ portable-pty = "0.8"
 notify = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# The `[pm.events]` map is JSONPath, because that is the one query language a
+# catalogue author can be expected to already know, and it is now RFC 9535 --
+# so "what mana extracts from a CLI's stream" is a spec, not a homegrown
+# selector dialect. This crate implements that RFC; the alternative was writing
+# the matcher by hand, which is exactly the per-CLI parsing the design forbids.
+# Default features bring the RFC's function extensions (`match`, `search`) via
+# regex, already a direct dependency here, so they add no new audit surface.
+serde_json_path = "0.7"
 serde_yaml = "0.9"
 toml = "0.8"
 self_update = { version = "0.41", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
@@ -29,6 +37,17 @@ regex = "1"
 dirs = "6"
 which = "6"
 dialoguer = "0.11"
+# The MCP server the PM talks to (`mana mcp-server`, design §5). `rmcp` is the
+# official SDK under the modelcontextprotocol org; the alternative
+# (`rust-mcp-sdk`) is a third-party stack with ~1% of the downloads and a
+# slower release cadence -- see the module comment in src/mcp.rs for the full
+# comparison. Features cut to the bone: a server on stdio and the derive
+# macros, no HTTP/SSE/OAuth/client transports.
+rmcp = { version = "3", default-features = false, features = ["server", "transport-io", "macros"] }
+# rmcp is async; mana is not. One current-thread runtime is built inside the
+# `mcp-server` subcommand and nowhere else, so this stays a leaf dependency of
+# that one command rather than a colour spreading through the codebase.
+tokio = { version = "1", default-features = false, features = ["rt", "io-util"] }
 
 # Only for `killpg`: a sub-agent that times out must die together with anything
 # it spawned, and std can only signal the direct child (`Child::kill`). No

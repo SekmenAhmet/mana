@@ -6,7 +6,9 @@ mod dependencies;
 mod dispatch;
 mod lock;
 mod log;
+mod mcp;
 mod monitor;
+mod pm;
 mod project;
 mod prompts;
 mod pty;
@@ -48,6 +50,7 @@ fn main() -> anyhow::Result<()> {
         Command::Doctor => cli::doctor::run()?,
         Command::Upgrade => cli::upgrade::run()?,
         Command::Dev { command } => cli::dev::run(&command)?,
+        Command::McpServer { project_root } => mcp::serve(&project_root)?,
     }
     Ok(())
 }
