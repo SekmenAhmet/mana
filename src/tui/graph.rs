@@ -1,4 +1,4 @@
-use crate::lock::Lock;
+use crate::lock::Registry;
 use crate::log::{Status, read_last_status};
 use crate::task::Role;
 use std::path::Path;
@@ -20,27 +20,27 @@ pub fn is_blink_visible(elapsed: Duration, interval: Duration) -> bool {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct GraphNode {
-    pub agent_uuid: String,
+    pub agent_id: String,
     pub role: Role,
     pub model: String,
-    pub task_uuid: String,
+    pub task_id: String,
     pub status: Option<Status>,
 }
 
-pub fn build_nodes(lock: &Lock, logs_dir: &Path) -> anyhow::Result<Vec<GraphNode>> {
+pub fn build_nodes(registry: &Registry, logs_dir: &Path) -> anyhow::Result<Vec<GraphNode>> {
     let mut nodes = Vec::new();
-    for (agent_uuid, entry) in lock.iter() {
-        let log_path = logs_dir.join(format!("{agent_uuid}.jsonl"));
+    for record in &registry.records {
+        let log_path = logs_dir.join(format!("{}.jsonl", record.agent_id));
         let status = read_last_status(&log_path).unwrap_or(None);
         nodes.push(GraphNode {
-            agent_uuid: agent_uuid.clone(),
-            role: entry.role.clone(),
-            model: entry.model.clone(),
-            task_uuid: entry.task_uuid.clone(),
+            agent_id: record.agent_id.clone(),
+            role: record.role.clone(),
+            model: record.model.clone(),
+            task_id: record.task_id.clone(),
             status,
         });
     }
-    nodes.sort_by(|a, b| a.agent_uuid.cmp(&b.agent_uuid));
+    nodes.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
     Ok(nodes)
 }
 
@@ -68,21 +68,25 @@ pub fn role_label(role: &Role) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::lock::LockEntry;
+    use crate::lock::SubagentRecord;
     use crate::log::{LogEntry, append_log, now_iso8601};
+
+    fn record(agent_id: &str, role: Role, task_id: &str) -> SubagentRecord {
+        SubagentRecord {
+            agent_id: agent_id.to_string(),
+            cli: "claude".into(),
+            model: "claude".into(),
+            role,
+            task_id: task_id.to_string(),
+            pid: None,
+            started_at: now_iso8601(),
+        }
+    }
 
     #[test]
     fn build_nodes_reads_status_from_logs() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut lock = Lock::new();
-        lock.insert(
-            "agent-1".to_string(),
-            LockEntry {
-                model: "claude".into(),
-                role: Role::Executor,
-                task_uuid: "task-a".into(),
-            },
-        );
+        let registry = Registry::from_records(vec![record("agent-1", Role::Executor, "task-a")]);
         append_log(
             &tmp.path().join("agent-1.jsonl"),
             &LogEntry {
@@ -93,44 +97,28 @@ mod tests {
         )
         .unwrap();
 
-        let nodes = build_nodes(&lock, tmp.path()).unwrap();
+        let nodes = build_nodes(&registry, tmp.path()).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].status, Some(Status::Running));
-        assert_eq!(nodes[0].task_uuid, "task-a");
+        assert_eq!(nodes[0].task_id, "task-a");
     }
 
     #[test]
     fn build_nodes_handles_missing_log_as_none() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut lock = Lock::new();
-        lock.insert(
-            "agent-1".to_string(),
-            LockEntry {
-                model: "claude".into(),
-                role: Role::Reviewer,
-                task_uuid: "task-a".into(),
-            },
-        );
+        let registry = Registry::from_records(vec![record("agent-1", Role::Reviewer, "task-a")]);
 
-        let nodes = build_nodes(&lock, tmp.path()).unwrap();
+        let nodes = build_nodes(&registry, tmp.path()).unwrap();
         assert_eq!(nodes[0].status, None);
     }
 
     #[test]
     fn build_nodes_degrades_to_none_status_on_malformed_log() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut lock = Lock::new();
-        lock.insert(
-            "agent-1".to_string(),
-            LockEntry {
-                model: "claude".into(),
-                role: Role::Executor,
-                task_uuid: "task-a".into(),
-            },
-        );
+        let registry = Registry::from_records(vec![record("agent-1", Role::Executor, "task-a")]);
         std::fs::write(tmp.path().join("agent-1.jsonl"), "not valid json\n").unwrap();
 
-        let nodes = build_nodes(&lock, tmp.path()).unwrap();
+        let nodes = build_nodes(&registry, tmp.path()).unwrap();
         assert_eq!(nodes.len(), 1);
         assert_eq!(nodes[0].status, None);
     }

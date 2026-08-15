@@ -5,7 +5,7 @@ pub struct ProjectPaths {
     pub tasks: PathBuf,
     pub logs: PathBuf,
     pub reviews: PathBuf,
-    pub lock_file: PathBuf,
+    pub subagents_file: PathBuf,
 }
 
 pub fn mana_home() -> anyhow::Result<PathBuf> {
@@ -25,18 +25,20 @@ pub fn resolve_project_paths(mana_home: &Path, project_name: &str) -> ProjectPat
         tasks: root.join("tasks"),
         logs: root.join("logs"),
         reviews: root.join("reviews"),
-        lock_file: root.join("subagent-lock.yaml"),
+        subagents_file: root.join("subagents.jsonl"),
         root,
     }
 }
 
+/// Only creates the directories. `subagents.jsonl` is deliberately not
+/// pre-created here: it's an append-only log (`crate::lock::append_record`
+/// creates it, and its parent dir, on first write), and `load_registry`
+/// already treats a missing file as an empty registry — so there is no
+/// "empty but present" state worth writing to disk ahead of time.
 pub fn ensure_project_structure(paths: &ProjectPaths) -> anyhow::Result<()> {
     std::fs::create_dir_all(&paths.tasks)?;
     std::fs::create_dir_all(&paths.logs)?;
     std::fs::create_dir_all(&paths.reviews)?;
-    if !paths.lock_file.exists() {
-        std::fs::write(&paths.lock_file, "")?;
-    }
     Ok(())
 }
 
@@ -59,30 +61,30 @@ mod tests {
         assert_eq!(paths.logs, home.join("projects/my-api/logs"));
         assert_eq!(paths.reviews, home.join("projects/my-api/reviews"));
         assert_eq!(
-            paths.lock_file,
-            home.join("projects/my-api/subagent-lock.yaml")
+            paths.subagents_file,
+            home.join("projects/my-api/subagents.jsonl")
         );
     }
 
     #[test]
-    fn ensure_project_structure_creates_dirs_and_empty_lock_file() {
+    fn ensure_project_structure_creates_dirs_without_precreating_subagents_file() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = resolve_project_paths(tmp.path(), "demo");
         ensure_project_structure(&paths).unwrap();
         assert!(paths.tasks.is_dir());
         assert!(paths.logs.is_dir());
         assert!(paths.reviews.is_dir());
-        assert!(paths.lock_file.is_file());
+        assert!(!paths.subagents_file.exists());
     }
 
     #[test]
-    fn ensure_project_structure_is_idempotent() {
+    fn ensure_project_structure_is_idempotent_and_preserves_existing_subagents_file() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = resolve_project_paths(tmp.path(), "demo");
         ensure_project_structure(&paths).unwrap();
-        std::fs::write(&paths.lock_file, "existing: content\n").unwrap();
+        std::fs::write(&paths.subagents_file, "{\"agent_id\":\"a\"}\n").unwrap();
         ensure_project_structure(&paths).unwrap();
-        let contents = std::fs::read_to_string(&paths.lock_file).unwrap();
-        assert_eq!(contents, "existing: content\n");
+        let contents = std::fs::read_to_string(&paths.subagents_file).unwrap();
+        assert_eq!(contents, "{\"agent_id\":\"a\"}\n");
     }
 }

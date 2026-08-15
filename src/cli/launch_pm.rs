@@ -1,5 +1,5 @@
 use crate::config::{ensure_agent_registered, load_config};
-use crate::lock::load_lock;
+use crate::lock::load_registry;
 use crate::monitor::file_watcher::{FsEvent, watch};
 use crate::monitor::pty_listener::{extract_commands, strip_ansi};
 use crate::project::{
@@ -265,8 +265,8 @@ fn run_event_loop<B: Backend>(
             }
         }
 
-        let lock = load_lock(&ctx.paths.lock_file).unwrap_or_default();
-        let nodes = build_nodes(&lock, &ctx.paths.logs).unwrap_or_default();
+        let registry = load_registry(&ctx.paths.subagents_file).unwrap_or_default();
+        let nodes = build_nodes(&registry, &ctx.paths.logs).unwrap_or_default();
 
         terminal.draw(|frame| draw(frame, app, &nodes))?;
 
@@ -355,7 +355,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App, nodes: &[GraphNode]) {
                     role_label(&n.role),
                     status_symbol(&n.status, blink_visible),
                     n.model,
-                    n.task_uuid
+                    n.task_id
                 ))
             })
             .collect();
@@ -781,10 +781,10 @@ mod tests {
         let mut app = App::new();
         app.toggle_graph();
         let nodes = vec![GraphNode {
-            agent_uuid: "agent-1".to_string(),
+            agent_id: "agent-1".to_string(),
             model: "claude".to_string(),
             role: Role::Executor,
-            task_uuid: "task-1".to_string(),
+            task_id: "task-1".to_string(),
             status: None,
         }];
 
