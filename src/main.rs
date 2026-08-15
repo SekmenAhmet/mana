@@ -25,7 +25,7 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Install => cli::install::run()?,
         Command::Uninstall { cli } => cli::uninstall::run(&cli)?,
-        Command::Launch { agent } => cli::launch_pm::run(&agent)?,
+        Command::Launch { agent, resume } => cli::launch_pm::run(agent.as_deref(), resume)?,
         Command::Ps { all, project } => cli::ps::run(all, project.as_deref())?,
         Command::Kill {
             agent_id,

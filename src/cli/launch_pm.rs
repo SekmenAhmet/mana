@@ -30,25 +30,29 @@
 //! without paying a real CLI.
 
 use crate::catalog::{Catalog, CliEntry, ToolChannel, substitute};
+use crate::cli::kill::{Verdict, kill_dispatch};
 use crate::mcp::runs::{Notification, notifications_path};
-use crate::pm::{self, PmEvent, PmTransport};
+use crate::pm::{self, PmEvent, PmTransport, Resume};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
 use crate::sentinel::Sentinel;
+use crate::status::{self, DispatchStatus, short};
 use crate::task::Role;
 use crate::tui::app::{App, Source};
 use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, map_key_event};
 use crate::tui::graph::GraphCache;
 use crate::tui::render;
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Utc};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -82,8 +86,27 @@ const SENTINEL_ACTIVATION: &str = " This CLI cannot host mana's tools, so call \
     them the other way the skill describes: one fenced ```mana block per call. \
     mana executes those blocks and sends you the results.";
 
+/// What mana says instead of the activation when `--continue` picks a
+/// conversation back up.
+///
+/// The activation is a briefing, and a continued conversation has already had
+/// it: re-sending it would re-teach a PM that already knows, and on the CLIs
+/// that inline the whole role text (agy) it would replay the entire skill into
+/// a context that still holds it -- on a CLI that resends its conversation
+/// every turn, for the rest of the session. What actually changed while mana
+/// was away is the state of the work, so that is where the line points.
+const RESUMED: &str = "[mana] session resumed -- you are still the mana PM for this project and \
+    the mana-pm skill still applies. Check where the work stands before deciding the next step.";
+
 /// Directory name the skill is installed under, inside the CLI's skills dir.
 const SKILL_NAME: &str = "mana-pm";
+
+/// What a project-local skills directory gets so it stays out of the user's
+/// commits. See `write_inner_gitignore`.
+const IGNORE_EVERYTHING: &str = "*\n";
+
+/// Per-project memory, written next to the project's tasks and logs.
+const STATE_FILE: &str = "state.toml";
 
 /// The user's catalogue escape valve (design §7), read from the same place
 /// every other command reads it. A missing file is normal.
@@ -100,7 +123,7 @@ const NOTIFICATION_POLL: Duration = Duration::from_millis(500);
 /// How long the loop blocks waiting for a key before redrawing.
 const TICK: Duration = Duration::from_millis(50);
 
-pub fn run(agent_cli: &str) -> Result<()> {
+pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     let home = mana_home()?;
     // Started before the session is prepared, so the answer is usually already
     // waiting by the first frame. It is the only command that looks: `ps`,
@@ -109,16 +132,25 @@ pub fn run(agent_cli: &str) -> Result<()> {
     // be a genuine defect (design §5).
     let update_notice = crate::cli::upgrade::spawn_check(&home);
     let project_root = std::env::current_dir()?;
-    let mut session = prepare_session(&home, &project_root, agent_cli)?;
+    let paths = resolve_project_paths(&home, &project_name_from_dir(&project_root));
+    let agent_cli = resolve_cli(&paths, agent_cli, resume)?;
+    let mut session = prepare_session(&home, &project_root, &agent_cli, resume)?;
     let mut app = App::new(&session.cli_name);
     app.push(
         Source::Mana,
         &format!(
-            "[mana] PM session started on {}. The mana-pm skill is installed at {}.",
+            "[mana] PM session {} on {}. The mana-pm skill is installed at {}.",
+            if resume { "resumed" } else { "started" },
             session.cli_name,
             session.skill_path.display()
         ),
     );
+    // Anything the launch did to the user's disk beyond writing that one file
+    // -- a stale copy of the role deleted out of another skills directory --
+    // is said here rather than done quietly.
+    for line in std::mem::take(&mut session.startup) {
+        app.push(Source::Mana, &line);
+    }
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -139,6 +171,14 @@ pub fn run(agent_cli: &str) -> Result<()> {
     terminal.show_cursor()?;
 
     let _ = session.shutdown();
+    // Both ways out of the loop lead here, and both mean the same thing for a
+    // sub-agent: the process that dispatched it is leaving. Nothing else would
+    // ever stop it -- its observer thread died with mana, so it would run to
+    // completion writing into logs nobody reads, holding a quota slot and a
+    // worktree, and `mana ps` would call it running until someone noticed.
+    for line in sweep_in_flight(&home, &session.project, Utc::now()) {
+        println!("{line}");
+    }
     match outcome? {
         SessionEnd::UserQuit => Ok(()),
         // A PM that died on its own took the session with it, and the only
@@ -177,11 +217,18 @@ enum SessionEnd {
 struct Session {
     pm: Box<dyn PmTransport>,
     paths: ProjectPaths,
+    /// The `~/.mana/projects` name this session belongs to. Carried so the
+    /// teardown sweep can find this project's dispatches -- and only this
+    /// project's.
+    project: String,
     /// Product name of the CLI driving the PM, for the status bar.
     cli_name: String,
     /// Where the skill was written this launch. Reported to the user, because
     /// "mana rewrote a file in your config directory" should not be silent.
     skill_path: PathBuf,
+    /// Lines the launch produced before the first frame, drained into the chat
+    /// pane by `run`. Empty on an ordinary launch.
+    startup: Vec<String>,
     notifications: NotificationTail,
     /// `Some` only for `[tools].channel = "sentinel"`. An MCP CLI reaches the
     /// same four tools over its own protocol, and scanning its prose for
@@ -268,7 +315,12 @@ struct ToolPass {
 
 /// Resolves the CLI, installs the skill, wires the tool channel and starts the
 /// session -- everything up to the first frame.
-fn prepare_session(home: &Path, project_root: &Path, agent_cli: &str) -> Result<Session> {
+fn prepare_session(
+    home: &Path,
+    project_root: &Path,
+    agent_cli: &str,
+    resume: bool,
+) -> Result<Session> {
     let catalog = Catalog::load(Some(&home.join(CATALOG_OVERRIDE)))?;
     let entry = catalog.get(agent_cli).with_context(|| {
         format!(
@@ -277,10 +329,14 @@ fn prepare_session(home: &Path, project_root: &Path, agent_cli: &str) -> Result<
         )
     })?;
 
-    let paths = resolve_project_paths(home, &project_name_from_dir(project_root));
+    let project = project_name_from_dir(project_root);
+    let paths = resolve_project_paths(home, &project);
     ensure_project_structure(&paths)?;
 
-    let skill_path = install_pm_skill(entry, dirs::home_dir().as_deref())?;
+    // Installed on a resumed launch too: the file is generated output, this
+    // binary may be newer than the one that wrote it, and a PM that reloads
+    // its skill mid-session must find what this build serves.
+    let skill = install_pm_skill(entry, dirs::home_dir().as_deref(), project_root)?;
     let extra_args = tool_channel_args(entry, &paths, project_root)?;
     // Built before the CLI starts, so a PM that emits a block in its very
     // first answer finds mana already listening.
@@ -289,19 +345,110 @@ fn prepare_session(home: &Path, project_root: &Path, agent_cli: &str) -> Result<
         ToolChannel::Sentinel => Some(Sentinel::new(project_root, home, catalog.clone())),
     };
 
-    let activation = activation(entry, &skill_path);
-    let mut pm = pm::start(entry, &extra_args)?;
-    pm.send_user(&activation)
-        .context("sending the activation message to the PM")?;
+    let mut state = load_state(&paths);
+    // Cloned out of the state before it is written back to: the resume borrows
+    // it, and the id mana stores after the handshake is the same string either
+    // way.
+    let stored = state.sessions.get(agent_cli).cloned();
+    let mut pm = pm::start(
+        entry,
+        &extra_args,
+        resume.then_some(Resume {
+            session_id: stored.as_deref(),
+        }),
+    )?;
+
+    // Written now rather than at the end of the session: this is the moment
+    // both facts are true and known, and a mana killed outright (or a machine
+    // that lost power) would otherwise leave `-c` with nothing to go on. The
+    // session id cannot change afterwards -- a resumed ACP session keeps the
+    // one it was loaded by.
+    state.last_cli = Some(agent_cli.to_string());
+    if let Some(session_id) = pm.session_id() {
+        state
+            .sessions
+            .insert(agent_cli.to_string(), session_id.to_string());
+    }
+    save_state(&paths, &state)?;
+
+    let opening = if resume {
+        RESUMED.to_string()
+    } else {
+        activation(entry, &skill.path)
+    };
+    pm.send_user(&opening)
+        .context("sending the opening message to the PM")?;
 
     Ok(Session {
         pm,
         cli_name: entry.cli.name.clone(),
-        skill_path,
+        skill_path: skill.path,
+        startup: skill.notes,
         notifications: NotificationTail::new(notifications_path(&paths)),
         sentinel,
+        project,
         paths,
     })
+}
+
+/// Which CLI this launch is for.
+///
+/// `mana launch -c` with no CLI is the whole reason `last_cli` is stored: the
+/// user resumed *this project*, and naming the CLI again is a detail mana
+/// already knows. A project mana has never launched in has nothing to read, and
+/// says so rather than guessing at the catalogue's first entry.
+fn resolve_cli(paths: &ProjectPaths, agent_cli: Option<&str>, resume: bool) -> Result<String> {
+    if let Some(id) = agent_cli {
+        return Ok(id.to_string());
+    }
+    if !resume {
+        bail!(
+            "mana launch needs a CLI to run as PM (for example `mana launch claude`), or \
+             --continue to resume the last one used in this project"
+        );
+    }
+    load_state(paths).last_cli.ok_or_else(|| {
+        anyhow::anyhow!(
+            "mana has no record of a PM session in this project, so `--continue` has nothing to \
+             resume. Name the CLI once (`mana launch claude --continue`) and mana will remember \
+             it for next time."
+        )
+    })
+}
+
+/// What mana remembers about a project between launches.
+///
+/// Deliberately not in `~/.mana/config.toml`: this is per-project cache, it is
+/// written by mana and read by mana, and losing it costs one extra word on a
+/// command line. Anything unreadable is therefore treated as absent rather than
+/// as an error -- a launch must not fail over a cache.
+#[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+struct ProjectState {
+    /// The CLI the last session that started successfully was run on.
+    last_cli: Option<String>,
+    /// Session ids to resume by, keyed by catalogue id, for the transports
+    /// whose protocol hands one out (ACP). Per CLI because the last opencode
+    /// session is not something copilot could ever load.
+    #[serde(default)]
+    sessions: BTreeMap<String, String>,
+}
+
+fn state_path(paths: &ProjectPaths) -> PathBuf {
+    paths.root.join(STATE_FILE)
+}
+
+fn load_state(paths: &ProjectPaths) -> ProjectState {
+    std::fs::read_to_string(state_path(paths))
+        .ok()
+        .and_then(|source| toml::from_str(&source).ok())
+        .unwrap_or_default()
+}
+
+fn save_state(paths: &ProjectPaths, state: &ProjectState) -> Result<()> {
+    let path = state_path(paths);
+    std::fs::create_dir_all(&paths.root)?;
+    let document = toml::to_string_pretty(state).context("rendering this project's state")?;
+    std::fs::write(&path, document).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The one turn mana writes itself: who the PM is, where its role text is, and
@@ -322,40 +469,157 @@ fn activation(entry: &CliEntry, skill_path: &Path) -> String {
     message
 }
 
-/// Writes the PM skill where this CLI will read it, and returns the path.
+/// Where the PM role ended up this launch, and what installing it disturbed.
+#[derive(Debug)]
+struct SkillInstall {
+    path: PathBuf,
+    /// One line per stale copy removed from another directory in the entry's
+    /// list. Shown in the chat pane: deleting a directory under someone's home
+    /// is not something to do silently.
+    notes: Vec<String>,
+}
+
+/// Writes the PM skill where this CLI will read it, and takes mana's own
+/// earlier copies out of the other directories the entry lists.
 ///
 /// Rewritten on every launch on purpose: the file is generated output, and a
 /// user who edited it (or an older mana that wrote an older version) would
 /// otherwise leave the PM following instructions that no longer match the
 /// tools it is served.
-fn install_pm_skill(entry: &CliEntry, home: Option<&Path>) -> Result<PathBuf> {
+///
+/// The cleanup is the other half of the same idea. `mana-pm` in a *global*
+/// skills directory is a skill every agent in every project sees for ever --
+/// mana pollutes the one list the user actually curates, for a role that only
+/// means anything inside a mana session. So the entry's first directory is
+/// project-local where the CLI supports it, and every other directory in the
+/// list has its `mana-pm/` removed. Only that one name is touched, and mana is
+/// the only thing that ever writes it.
+fn install_pm_skill(
+    entry: &CliEntry,
+    home: Option<&Path>,
+    project_root: &Path,
+) -> Result<SkillInstall> {
     let candidates: Vec<PathBuf> = entry
         .skills
         .dirs
         .iter()
-        .map(|dir| expand_home(dir, home))
+        .map(|dir| resolve_skill_dir(dir, home, project_root))
         .collect();
-    // Most specific first, and the first one that already exists wins: a user
-    // who has `~/.claude/skills` gets the skill where that CLI looks first,
-    // and the vendor-neutral `~/.agents/skills` is the fallback the catalogue
-    // lists after it.
-    let dir = candidates
+    if candidates.is_empty() {
+        bail!(
+            "{}: [skills].dirs is empty, so mana has nowhere to install the PM role",
+            entry.cli.id
+        );
+    }
+    // Most specific first. A directory that already exists wins -- a user who
+    // has `~/.claude/skills` gets the skill where that CLI looks first, and the
+    // vendor-neutral `~/.agents/skills` is the fallback listed after it -- and
+    // a *project-local* entry wins whether it exists or not, because mana
+    // creates it in the project it was launched in and that is the entire
+    // reason the catalogue lists it first.
+    let first = entry
+        .skills
+        .dirs
         .iter()
-        .find(|dir| dir.is_dir())
-        .or_else(|| candidates.first())
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "{}: [skills].dirs is empty, so mana has nowhere to install the PM role",
-                entry.cli.id
-            )
-        })?;
+        .zip(&candidates)
+        .position(|(spec, path)| is_project_local(spec) || path.is_dir())
+        .unwrap_or(0);
 
+    let mut notes = Vec::new();
+    // "The first *usable* one": a project-local directory is chosen before mana
+    // knows the project is writable at all (a read-only checkout, a directory
+    // owned by somebody else), and refusing to launch over that would be mana
+    // breaking on a project it could perfectly well have run in. So a failure
+    // to write falls through to the next directory in the entry's list, out
+    // loud, and only a list with no usable directory at all fails the launch.
+    let mut installed = None;
+    for (index, dir) in candidates.iter().enumerate().skip(first) {
+        match write_skill(dir, is_project_local(&entry.skills.dirs[index])) {
+            Ok(path) => {
+                installed = Some((index, path));
+                break;
+            }
+            Err(error) => notes.push(format!(
+                "[mana] could not install the PM skill in {}, trying the next directory: {error:#}",
+                dir.display()
+            )),
+        }
+    }
+    let (chosen, path) = installed.ok_or_else(|| {
+        anyhow::anyhow!(
+            "{}: none of [skills].dirs could be written, so the PM has no role text:\n{}",
+            entry.cli.id,
+            notes.join("\n")
+        )
+    })?;
+    // A first choice that worked leaves nothing to report; the notes only
+    // matter when mana had to go somewhere else than it said it would.
+    if chosen == first {
+        notes.clear();
+    }
+
+    let dir = &candidates[chosen];
+    for (index, other) in candidates.iter().enumerate() {
+        // The same path twice in one list (a project that *is* the home
+        // directory) would otherwise delete what was just written.
+        if index == chosen || other == dir {
+            continue;
+        }
+        let stale = other.join(SKILL_NAME);
+        if !stale.is_dir() {
+            continue;
+        }
+        notes.push(match std::fs::remove_dir_all(&stale) {
+            Ok(()) => format!(
+                "[mana] removed the PM skill an earlier launch left in {}",
+                stale.display()
+            ),
+            Err(error) => format!(
+                "[mana] could not remove the stale PM skill at {}: {error}",
+                stale.display()
+            ),
+        });
+    }
+    Ok(SkillInstall { path, notes })
+}
+
+/// Writes the role into one skills directory, creating it, and returns the
+/// file's path.
+fn write_skill(dir: &Path, project_local: bool) -> Result<PathBuf> {
     let path = dir.join(SKILL_NAME).join("SKILL.md");
-    std::fs::create_dir_all(path.parent().expect("joined two components above"))
+    let skill_dir = path.parent().expect("joined two components above");
+    std::fs::create_dir_all(skill_dir)
         .with_context(|| format!("creating the skill directory {}", dir.display()))?;
     std::fs::write(&path, PM_SKILL)
         .with_context(|| format!("writing the PM skill to {}", path.display()))?;
+    if project_local {
+        write_inner_gitignore(skill_dir)?;
+    }
     Ok(path)
+}
+
+/// Keeps a project-local install out of the user's commits without touching
+/// the user's own `.gitignore`.
+///
+/// mana writes into the project here, and generated output should not turn up
+/// in `git status` -- but editing somebody's `.gitignore` is an edit to a file
+/// they wrote, tracked in their history, for a tool they may be trying out.
+/// A `.gitignore` holding `*` *inside* the directory mana created ignores that
+/// directory's contents (itself included) from within, needs no permission and
+/// leaves nothing behind when the directory is deleted. It is written
+/// unconditionally rather than only when the project's own ignore file misses
+/// the path: matching gitignore semantics by hand is how a check like that gets
+/// it wrong, and a second ignore file where one already covers it costs
+/// nothing.
+fn write_inner_gitignore(skill_dir: &Path) -> Result<()> {
+    let path = skill_dir.join(".gitignore");
+    std::fs::write(&path, IGNORE_EVERYTHING).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Whether a catalogue skills directory belongs to the project rather than to
+/// the user. `~/...` is the user's; anything else relative is the project's.
+fn is_project_local(dir: &str) -> bool {
+    !dir.starts_with('~') && Path::new(dir).is_relative()
 }
 
 /// The argv that attaches mana's tools to this PM, plus the argv that takes
@@ -427,14 +691,89 @@ fn mcp_config(exe: &Path, project_root: &Path) -> serde_json::Value {
     })
 }
 
-/// Expands a leading `~`, which is how the catalogue writes skills
-/// directories -- it is the notation the CLIs' own documentation uses, and it
-/// is the only place mana has to understand it.
-fn expand_home(path: &str, home: Option<&Path>) -> PathBuf {
-    match (path.strip_prefix("~/"), home) {
-        (Some(rest), Some(home)) => home.join(rest),
-        _ => PathBuf::from(path),
+/// Turns one `[skills].dirs` entry into a real path.
+///
+/// Two notations, both taken from the CLIs' own documentation: a leading `~`
+/// is the user's home, and a relative path is *the project's* -- `.claude/skills`
+/// means what it means in that documentation, which is a directory inside the
+/// repository you are working in. Resolving it against the project root rather
+/// than the process's working directory is what makes it hold for a mana
+/// launched from anywhere.
+fn resolve_skill_dir(path: &str, home: Option<&Path>, project_root: &Path) -> PathBuf {
+    if let (Some(rest), Some(home)) = (path.strip_prefix("~/"), home) {
+        return home.join(rest);
     }
+    if is_project_local(path) {
+        return project_root.join(path);
+    }
+    PathBuf::from(path)
+}
+
+/// Stops every sub-agent this project still has in flight, and reports what
+/// happened in one or two lines.
+///
+/// Quitting mana ends the only thing watching a dispatch: the thread that would
+/// have written its exit record and notified the PM went with the process. So a
+/// sub-agent left alive after Ctrl+C is a run nobody will ever read, holding a
+/// quota slot and a worktree, that `mana ps` keeps calling `running` until
+/// somebody notices. Killing it is the honest end of the session.
+///
+/// It goes through the same `kill_dispatch` as `mana kill`, guard included: the
+/// pid in a registry record may have been recycled onto a bystander, and a
+/// refusal there is exactly as binding at teardown as it is at the command
+/// line. Only *this* project is swept -- another mana in another directory has
+/// its own agents and its own session, and quitting this one says nothing about
+/// them.
+///
+/// Never fails: this runs on the way out, after the terminal has been restored,
+/// and a session that already ended cannot be failed any harder.
+fn sweep_in_flight(home: &Path, project: &str, now: DateTime<Utc>) -> Vec<String> {
+    let dispatches = match status::dispatches_in(home, project) {
+        Ok(dispatches) => dispatches,
+        Err(error) => {
+            return vec![format!(
+                "mana: could not read this project's dispatches, so nothing was stopped: {error:#}"
+            )];
+        }
+    };
+    let paths = resolve_project_paths(home, project);
+    let (mut killed, mut spared, mut failed) = (Vec::new(), Vec::new(), Vec::new());
+    for dispatch in dispatches
+        .iter()
+        .filter(|dispatch| dispatch.status == DispatchStatus::Running)
+    {
+        let agent = short(&dispatch.record.agent_id);
+        match kill_dispatch(&paths, dispatch, now) {
+            Ok(report) => match report.verdict {
+                Verdict::Refused(reason) => spared.push(format!("{agent} -- {reason}")),
+                _ => killed.push(agent.to_string()),
+            },
+            Err(error) => failed.push(format!("{agent} -- {error:#}")),
+        }
+    }
+
+    let mut lines = Vec::new();
+    if !killed.is_empty() {
+        lines.push(format!(
+            "mana: killed {} in-flight agent(s): {}",
+            killed.len(),
+            killed.join(", ")
+        ));
+    }
+    if !spared.is_empty() {
+        lines.push(format!(
+            "mana: left {} in-flight agent(s) alone (pid guard refused)",
+            spared.len()
+        ));
+        // In full, one per agent: the operator now owns a process mana would
+        // not touch, and a count with no id and no reason is not something
+        // anybody can act on.
+        lines.extend(spared.into_iter().map(|reason| format!("  {reason}")));
+    }
+    for reason in failed {
+        lines.push(format!("mana: could not stop {reason}"));
+    }
+    lines
 }
 
 /// Follows `notifications.jsonl` from wherever it was when the session
@@ -755,6 +1094,11 @@ url = "https://example.invalid/fixture"
         paths
     }
 
+    /// Most tests here have nothing to say about the project directory.
+    fn install(entry: &CliEntry, home: Option<&Path>) -> SkillInstall {
+        install_pm_skill(entry, home, Path::new("/nonexistent-project")).unwrap()
+    }
+
     #[test]
     fn the_skill_lands_in_the_first_directory_that_already_exists() {
         let tmp = tempfile::tempdir().unwrap();
@@ -765,11 +1109,12 @@ url = "https://example.invalid/fixture"
             second.to_str().unwrap(),
         ]);
 
-        let path = install_pm_skill(&entry, None).unwrap();
-        assert_eq!(path, second.join("mana-pm/SKILL.md"));
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), PM_SKILL);
+        let skill = install(&entry, None);
+        assert_eq!(skill.path, second.join("mana-pm/SKILL.md"));
+        assert_eq!(std::fs::read_to_string(&skill.path).unwrap(), PM_SKILL);
         // The directory that did not exist is left alone.
         assert!(!tmp.path().join("claude/skills").exists());
+        assert!(skill.notes.is_empty(), "{:?}", skill.notes);
     }
 
     /// A fresh machine has none of them, and refusing to launch over a
@@ -783,9 +1128,9 @@ url = "https://example.invalid/fixture"
             tmp.path().join("agents/skills").to_str().unwrap(),
         ]);
 
-        let path = install_pm_skill(&entry, None).unwrap();
-        assert_eq!(path, first.join("mana-pm/SKILL.md"));
-        assert!(path.exists());
+        let skill = install(&entry, None);
+        assert_eq!(skill.path, first.join("mana-pm/SKILL.md"));
+        assert!(skill.path.exists());
     }
 
     /// The drift-proofing: whatever was there is replaced by what shipped in
@@ -797,16 +1142,295 @@ url = "https://example.invalid/fixture"
         std::fs::create_dir_all(dir.join(SKILL_NAME)).unwrap();
         std::fs::write(dir.join(SKILL_NAME).join("SKILL.md"), "stale v1 text").unwrap();
 
-        let path = install_pm_skill(&entry(&[dir.to_str().unwrap()]), None).unwrap();
-        assert_eq!(std::fs::read_to_string(path).unwrap(), PM_SKILL);
+        let skill = install(&entry(&[dir.to_str().unwrap()]), None);
+        assert_eq!(std::fs::read_to_string(skill.path).unwrap(), PM_SKILL);
+    }
+
+    /// The pollution fix: a relative directory belongs to the project, wins
+    /// over the global ones whether it exists yet or not, and carries its own
+    /// `.gitignore` so it never turns up in the user's `git status`.
+    #[test]
+    fn a_project_local_directory_wins_and_ignores_itself_from_within() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("code/demo");
+        let global = tmp.path().join("home/.claude/skills");
+        // The global one exists and the project one does not, which under the
+        // old rule ("first that exists") is exactly how the skill ended up in
+        // everybody's global list.
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        let entry = entry(&[".claude/skills", global.to_str().unwrap()]);
+
+        let skill = install_pm_skill(&entry, None, &project).unwrap();
+        assert_eq!(skill.path, project.join(".claude/skills/mana-pm/SKILL.md"));
+        // Ignored from inside the directory mana created, so the user's own
+        // .gitignore is never touched.
+        assert_eq!(
+            std::fs::read_to_string(project.join(".claude/skills/mana-pm/.gitignore")).unwrap(),
+            "*\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join(".gitignore")).ok(),
+            None
+        );
+    }
+
+    /// A relative directory is resolved against the project, not against
+    /// whatever directory the mana process happens to be in.
+    #[test]
+    fn skills_directories_are_read_as_home_project_or_absolute() {
+        let home = PathBuf::from("/home/x");
+        let project = PathBuf::from("/code/demo");
+        assert_eq!(
+            resolve_skill_dir("~/.claude/skills", Some(&home), &project),
+            PathBuf::from("/home/x/.claude/skills")
+        );
+        assert_eq!(
+            resolve_skill_dir(".claude/skills", Some(&home), &project),
+            PathBuf::from("/code/demo/.claude/skills")
+        );
+        assert_eq!(
+            resolve_skill_dir("/etc/skills", Some(&home), &project),
+            PathBuf::from("/etc/skills")
+        );
+        // `~someone/skills` is another user's home, which is not a thing mana
+        // resolves -- and not a thing any catalogue entry writes. It is not the
+        // project's either.
+        assert_eq!(
+            resolve_skill_dir("~other/skills", Some(&home), &project),
+            PathBuf::from("~other/skills")
+        );
+        // No home directory to expand against: better a relative path than a
+        // panic on a machine without one.
+        assert_eq!(
+            resolve_skill_dir("~/skills", None, &project),
+            PathBuf::from("~/skills")
+        );
+    }
+
+    /// The half that cleans up after older versions of mana: the copy an
+    /// earlier launch left in the global list is deleted, said out loud, and
+    /// nothing else in that directory is touched.
+    #[test]
+    fn a_stale_copy_in_another_directory_is_removed_and_reported() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("demo");
+        let global = tmp.path().join("home/.claude/skills");
+        std::fs::create_dir_all(global.join(SKILL_NAME)).unwrap();
+        std::fs::write(global.join(SKILL_NAME).join("SKILL.md"), "an older role").unwrap();
+        // Somebody else's skill, in the same directory. Not mana's to delete.
+        std::fs::create_dir_all(global.join("their-skill")).unwrap();
+        std::fs::write(global.join("their-skill/SKILL.md"), "theirs").unwrap();
+
+        let entry = entry(&[".claude/skills", global.to_str().unwrap()]);
+        let skill = install_pm_skill(&entry, None, &project).unwrap();
+
+        assert!(skill.path.exists());
+        assert!(!global.join(SKILL_NAME).exists(), "the stale copy survived");
+        assert!(global.join("their-skill/SKILL.md").exists());
+        assert_eq!(skill.notes.len(), 1, "{:?}", skill.notes);
+        assert!(
+            skill.notes[0].contains(global.to_str().unwrap()),
+            "{:?}",
+            skill.notes
+        );
+    }
+
+    /// mana now writes into the user's repository, and a repository is not
+    /// always writable. Falling through to the next directory beats refusing
+    /// to launch in a project the CLI itself would have been happy in.
+    ///
+    /// Unix-only: the failure is produced with a mode, and Windows spells
+    /// "you may not write here" differently.
+    #[cfg(unix)]
+    #[test]
+    fn an_unwritable_first_choice_falls_through_to_the_next_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("read-only");
+        let global = tmp.path().join("home/.claude/skills");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let entry = entry(&[".claude/skills", global.to_str().unwrap()]);
+
+        let skill = install_pm_skill(&entry, None, &project).unwrap();
+
+        assert_eq!(skill.path, global.join("mana-pm/SKILL.md"));
+        assert!(skill.path.exists());
+        assert_eq!(skill.notes.len(), 1, "{:?}", skill.notes);
+        assert!(
+            skill.notes[0].contains("trying the next directory"),
+            "{:?}",
+            skill.notes
+        );
+
+        // So the temp dir can be cleaned up.
+        std::fs::set_permissions(&project, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// The shipped claude entry, end to end -- because the whole feature is
+    /// data and a fixture entry cannot prove the data is right. Both halves at
+    /// once: the role lands in the project, and the copy an earlier mana left
+    /// in the user's global skill list is gone.
+    #[test]
+    fn the_shipped_claude_entry_installs_into_the_project_and_clears_the_global_copy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("code/demo");
+        std::fs::create_dir_all(&project).unwrap();
+        // What every launch before this change left behind, in the list the
+        // user actually curates.
+        std::fs::create_dir_all(home.join(".claude/skills/mana-pm")).unwrap();
+        std::fs::write(
+            home.join(".claude/skills/mana-pm/SKILL.md"),
+            "an older role",
+        )
+        .unwrap();
+
+        let catalog = Catalog::embedded().unwrap();
+        let skill =
+            install_pm_skill(catalog.get("claude").unwrap(), Some(&home), &project).unwrap();
+
+        assert_eq!(skill.path, project.join(".claude/skills/mana-pm/SKILL.md"));
+        assert!(
+            !home.join(".claude/skills/mana-pm").exists(),
+            "the global copy survived"
+        );
+        // The user's own skills directory is still there -- only `mana-pm/`
+        // inside it was mana's to remove.
+        assert!(home.join(".claude/skills").is_dir());
+        assert_eq!(
+            std::fs::read_to_string(project.join(".claude/skills/mana-pm/.gitignore")).unwrap(),
+            IGNORE_EVERYTHING
+        );
+        assert_eq!(skill.notes.len(), 1, "{:?}", skill.notes);
+    }
+
+    /// The claim the inner `.gitignore` makes, checked against git itself: a
+    /// project mana installed into shows nothing to commit.
+    #[test]
+    fn a_project_local_install_leaves_git_status_clean() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&project)
+                .output()
+                .expect("git is installed")
+        };
+        git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+
+        let catalog = Catalog::embedded().unwrap();
+        install_pm_skill(catalog.get("claude").unwrap(), None, &project).unwrap();
+
+        let status = git(&["status", "--porcelain"]);
+        assert_eq!(
+            String::from_utf8_lossy(&status.stdout),
+            "",
+            "mana's own output turned up in the user's git status"
+        );
+    }
+
+    /// Nothing to clean is the normal case, and it says nothing at all.
+    #[test]
+    fn a_launch_with_no_stale_copy_anywhere_reports_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let entry = entry(&[
+            ".claude/skills",
+            tmp.path().join("global").to_str().unwrap(),
+        ]);
+        let skill = install_pm_skill(&entry, None, &tmp.path().join("demo")).unwrap();
+        assert!(skill.notes.is_empty(), "{:?}", skill.notes);
     }
 
     #[test]
     fn a_catalogue_entry_with_nowhere_to_put_the_skill_says_so() {
-        let error = install_pm_skill(&entry(&[]), None).unwrap_err();
+        let error = install_pm_skill(&entry(&[]), None, Path::new("/tmp")).unwrap_err();
         let rendered = format!("{error:#}");
         assert!(rendered.contains("[skills].dirs"), "{rendered}");
         assert!(rendered.contains("fixture"), "{rendered}");
+    }
+
+    /// The round trip `mana launch -c` rests on: what one launch wrote, the
+    /// next one reads, including the ACP session id it will resume by.
+    #[test]
+    fn the_project_state_survives_a_write_and_a_read() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        assert_eq!(load_state(&paths), ProjectState::default());
+
+        let mut state = ProjectState {
+            last_cli: Some("opencode".to_string()),
+            sessions: BTreeMap::new(),
+        };
+        state
+            .sessions
+            .insert("opencode".to_string(), "ses_ff91".to_string());
+        save_state(&paths, &state).unwrap();
+
+        assert_eq!(load_state(&paths), state);
+        // Kept where the rest of the project's state lives, in the one format
+        // mana reads and writes.
+        assert!(paths.root.join("state.toml").is_file());
+    }
+
+    /// It is a cache, not configuration: a launch must not fail because
+    /// something scribbled in it.
+    #[test]
+    fn an_unreadable_state_file_reads_as_no_state_rather_than_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        std::fs::write(state_path(&paths), "this is not toml at all").unwrap();
+        assert_eq!(load_state(&paths), ProjectState::default());
+    }
+
+    #[test]
+    fn a_named_cli_is_taken_as_given_whether_or_not_the_launch_continues() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        assert_eq!(
+            resolve_cli(&paths, Some("claude"), false).unwrap(),
+            "claude"
+        );
+        assert_eq!(resolve_cli(&paths, Some("agy"), true).unwrap(), "agy");
+    }
+
+    /// The whole point of remembering: `mana launch -c`, no argument.
+    #[test]
+    fn a_bare_continue_uses_the_last_cli_this_project_launched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        save_state(
+            &paths,
+            &ProjectState {
+                last_cli: Some("opencode".to_string()),
+                sessions: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(resolve_cli(&paths, None, true).unwrap(), "opencode");
+    }
+
+    #[test]
+    fn a_bare_continue_with_nothing_remembered_says_to_name_a_cli_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rendered = format!("{:#}", resolve_cli(&paths, None, true).unwrap_err());
+        assert!(rendered.contains("--continue"), "{rendered}");
+        assert!(rendered.contains("mana launch claude"), "{rendered}");
+    }
+
+    /// `mana launch` with no CLI and no --continue is not a resume, it is a
+    /// missing argument.
+    #[test]
+    fn a_bare_launch_asks_for_a_cli() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths_in(tmp.path());
+        let rendered = format!("{:#}", resolve_cli(&paths, None, false).unwrap_err());
+        assert!(rendered.contains("needs a CLI"), "{rendered}");
     }
 
     /// The activation is where a CLI learns everything mana will not repeat:
@@ -848,26 +1472,15 @@ url = "https://example.invalid/fixture"
     fn skills_directories_are_written_with_a_tilde_and_read_from_the_home_dir() {
         let tmp = tempfile::tempdir().unwrap();
         let entry = entry(&["~/.fixture/skills"]);
-        let path = install_pm_skill(&entry, Some(tmp.path())).unwrap();
-        assert_eq!(path, tmp.path().join(".fixture/skills/mana-pm/SKILL.md"));
-    }
-
-    #[test]
-    fn expand_home_leaves_absolute_and_bare_paths_alone() {
-        let home = PathBuf::from("/home/x");
+        let skill = install(&entry, Some(tmp.path()));
         assert_eq!(
-            expand_home("/etc/skills", Some(&home)),
-            PathBuf::from("/etc/skills")
+            skill.path,
+            tmp.path().join(".fixture/skills/mana-pm/SKILL.md")
         );
-        // `~someone/skills` is another user's home, which is not a thing mana
-        // resolves -- and not a thing any catalogue entry writes.
-        assert_eq!(
-            expand_home("~other/skills", Some(&home)),
-            PathBuf::from("~other/skills")
-        );
-        // No home directory to expand against: better a relative path than a
-        // panic on a machine without one.
-        assert_eq!(expand_home("~/skills", None), PathBuf::from("~/skills"));
+        // A global install gets no inner .gitignore: it is not in anybody's
+        // repository, and a stray ignore file in a skills directory the user
+        // curates would be mana leaving litter.
+        assert!(!skill.path.parent().unwrap().join(".gitignore").exists());
     }
 
     /// The `$PATH` blocker, structurally: the config names a binary by its
@@ -1195,10 +1808,16 @@ mod smoke {
         }
 
         fn write_override_on(&self, bin: &str, channel: &str) {
+            self.write_override_with(bin, channel, "");
+        }
+
+        /// The same, plus whatever extra `[pm]` keys the test needs -- which
+        /// is how a resumable entry is built without a second fixture.
+        fn write_override_with(&self, bin: &str, channel: &str, extra_pm: &str) {
             let source = super::tests::entry_source(
                 bin,
                 &[self.skills.to_str().unwrap()],
-                r#"permission_args = ["--allowedTools", "mcp__mana__*"]"#,
+                &format!(r#"permission_args = ["--allowedTools", "mcp__mana__*"]{extra_pm}"#),
                 channel,
             );
             std::fs::write(self.home.join(CATALOG_OVERRIDE), source).unwrap();
@@ -1230,8 +1849,8 @@ mod smoke {
     #[test]
     fn a_launch_installs_the_skill_registers_mana_and_activates_the_pm() {
         let fixture = Fixture::new();
-        let mut session =
-            prepare_session(&fixture.home, &fixture.project, "fixture").expect("the PM started");
+        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture", false)
+            .expect("the PM started");
 
         // 1. The role text is on disk where the CLI reads skills from.
         let skill = fixture.skills.join("mana-pm/SKILL.md");
@@ -1311,13 +1930,67 @@ mod smoke {
         );
     }
 
+    /// `mana launch -c` end to end, at the one layer where the decision is
+    /// visible: the resume flag reaches the CLI's argv, and the PM is handed a
+    /// re-entry line rather than the activation it has already had.
+    #[test]
+    fn a_resumed_launch_sends_one_re_entry_line_instead_of_the_activation() {
+        let fixture = Fixture::new();
+        fixture.write_override_with(&fixture.fake_pm(), "mcp", "\nresume_args = [\"--resumed\"]");
+
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", true).unwrap();
+
+        // The catalogue's resume argv reached the process.
+        let argv = fixture.wait_for(&fixture.argv, "--resumed");
+        assert!(argv.contains("--resumed"), "{argv}");
+
+        // ...and the opening turn is the short one. Re-sending the activation
+        // would re-teach a PM that already knows -- and on the entries that
+        // inline the whole role text, replay the skill into a context that
+        // still holds it.
+        let received = fixture.wait_for(&fixture.received, "resumed");
+        assert_eq!(received.lines().count(), 1, "{received}");
+        let frame: serde_json::Value =
+            serde_json::from_str(received.lines().next().unwrap()).unwrap();
+        assert_eq!(frame["message"]["content"], RESUMED);
+        let content = frame["message"]["content"].as_str().unwrap();
+        assert!(!content.contains(ACTIVATION), "{content}");
+        assert!(!content.contains(PM_SKILL), "the role text was replayed");
+
+        // The skill file is still rewritten: it is generated output, and this
+        // binary may be newer than the one that wrote it.
+        assert_eq!(
+            std::fs::read_to_string(fixture.skills.join("mana-pm/SKILL.md")).unwrap(),
+            PM_SKILL
+        );
+        session.shutdown().unwrap();
+    }
+
+    /// What makes a bare `mana launch -c` possible next time.
+    #[test]
+    fn a_successful_launch_remembers_which_cli_this_project_used() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        assert_eq!(load_state(&paths).last_cli, None);
+
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        assert_eq!(load_state(&paths).last_cli.as_deref(), Some("fixture"));
+        // The stream driver's CLI keys its conversation by directory, so there
+        // is no session id to store and mana stores none.
+        assert!(load_state(&paths).sessions.is_empty());
+        session.shutdown().unwrap();
+    }
+
     /// The sentinel channel is wired from catalogue data and nowhere else: an
     /// MCP CLI reaches the same tools over its own protocol, and scanning its
     /// prose as well would be a second, unasked-for way in.
     #[test]
     fn only_a_sentinel_channel_gets_a_block_scanner() {
         let fixture = Fixture::new();
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         assert!(session.sentinel.is_none());
         // ...and a fenced block from an MCP PM is just text it wrote.
         let pass = session.apply_tools("```mana\n{\"tool\": \"list_agents\"}\n```");
@@ -1357,7 +2030,8 @@ mod smoke {
         std::fs::set_permissions(&pm, std::fs::Permissions::from_mode(0o755)).unwrap();
         fixture.write_override_on(&pm.to_string_lossy(), "sentinel");
 
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         assert!(session.sentinel.is_some());
 
         // A sentinel PM has no tool list to discover the channel from, so the
@@ -1401,7 +2075,7 @@ mod smoke {
         let fixture = Fixture::new();
         // `unwrap_err` would need `Debug` on a live PM session, which is not
         // worth deriving for a type nobody prints.
-        let rendered = match prepare_session(&fixture.home, &fixture.project, "nosuchcli") {
+        let rendered = match prepare_session(&fixture.home, &fixture.project, "nosuchcli", false) {
             Ok(_) => panic!("a session started for a CLI the catalogue does not know"),
             Err(error) => format!("{error:#}"),
         };
@@ -1418,7 +2092,8 @@ mod smoke {
         let paths = fixture.paths();
         assert!(!paths.tasks.exists());
 
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         assert!(paths.tasks.is_dir());
         assert!(paths.logs.is_dir());
         assert!(paths.reviews.is_dir());
@@ -1447,7 +2122,8 @@ mod smoke {
     #[test]
     fn a_turn_that_cannot_be_delivered_is_reported_in_the_chat_pane() {
         let fixture = Fixture::new();
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         session.shutdown().unwrap();
 
         let mut app = App::new(&session.cli_name);
@@ -1484,7 +2160,8 @@ mod smoke {
     #[test]
     fn an_answer_the_transport_cannot_deliver_is_reported_in_the_chat_pane() {
         let fixture = Fixture::new();
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         let mut app = App::new(&session.cli_name);
         app.pending_permission = Some(pending(vec![choice("yes", true)]));
 
@@ -1505,7 +2182,8 @@ mod smoke {
     #[test]
     fn an_answer_the_pm_never_offered_leaves_the_request_pending() {
         let fixture = Fixture::new();
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         let mut app = App::new(&session.cli_name);
         app.pending_permission = Some(pending(vec![choice("yes", true)]));
 
@@ -1521,7 +2199,8 @@ mod smoke {
     #[test]
     fn a_permission_key_with_nothing_pending_says_nothing() {
         let fixture = Fixture::new();
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         let mut app = App::new(&session.cli_name);
 
         apply_app_event(AppEvent::AnswerPermission(true), &mut app, &mut session);
@@ -1549,7 +2228,8 @@ mod smoke {
         std::fs::set_permissions(&dying, std::fs::Permissions::from_mode(0o755)).unwrap();
         fixture.write_override(&dying.to_string_lossy());
 
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         let mut app = App::new(&session.cli_name);
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut events = Idle {
@@ -1578,7 +2258,8 @@ mod smoke {
         use ratatui::backend::TestBackend;
 
         let fixture = Fixture::new();
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         let mut app = App::new(&session.cli_name);
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut events = FakeEventSource::new([
@@ -1637,7 +2318,8 @@ mod smoke {
         use ratatui::backend::TestBackend;
 
         let fixture = Fixture::new();
-        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         let mut app = App::new(&session.cli_name);
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut events =
@@ -1664,5 +2346,221 @@ mod smoke {
             .collect();
         assert_eq!(notices.len(), 1, "expected exactly one update notice");
         session.shutdown().unwrap();
+    }
+}
+
+/// Quitting mana stops the sub-agents mana started -- and only those.
+///
+/// Unix-only: every test here spawns a real process and checks whether it
+/// survived, the same shape (and the same reason) as `cli::kill`'s own process
+/// tests.
+#[cfg(all(test, unix))]
+mod teardown_tests {
+    use super::*;
+    use crate::lock::{SubagentRecord, append_record};
+    use crate::log::now_iso8601;
+    use crate::status::Liveness;
+    use std::process::{Child, Command, Stdio};
+
+    /// A stand-in for a dispatched sub-agent, killed on drop so a failing
+    /// assertion cannot leak a sleeper into the test runner's session.
+    ///
+    /// `own_group` mirrors what `crate::spawn` does for every real sub-agent.
+    /// A child spawned without it stays in the runner's process group, which is
+    /// exactly the shape `status::guard` refuses -- the recycled-pid case.
+    struct Sleeper(Child);
+
+    impl Sleeper {
+        fn new(own_group: bool) -> Sleeper {
+            let mut command = Command::new("sleep");
+            command
+                .arg("30")
+                .stdout(Stdio::null())
+                .stderr(Stdio::null());
+            if own_group {
+                use std::os::unix::process::CommandExt;
+                command.process_group(0);
+            }
+            Sleeper(command.spawn().unwrap())
+        }
+
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+
+        /// Whether the process is gone, reaping it on the way.
+        ///
+        /// The reap is not tidiness: these children belong to the test runner,
+        /// which never waits on them, so a killed one lingers as a zombie --
+        /// and a zombie still answers `kill(pid, 0)`, exactly as `crate::status`
+        /// documents. Asking the handle is the only way to see the death.
+        fn died(&mut self) -> bool {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                if matches!(self.0.try_wait(), Ok(Some(_))) {
+                    return true;
+                }
+                if Instant::now() >= deadline {
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        }
+
+        fn still_running(&mut self) -> bool {
+            matches!(self.0.try_wait(), Ok(None))
+        }
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn seed(home: &Path, project: &str, agent_id: &str, pid: u32) {
+        append_record(
+            &resolve_project_paths(home, project).subagents_file,
+            &SubagentRecord {
+                agent_id: agent_id.to_string(),
+                cli: "fixture".into(),
+                model: "cheapo".into(),
+                role: Role::Executor,
+                task_id: "3f2a1b6c-9d4e-4a7b-8c1d-2e5f0a9b8c7d".into(),
+                pid: Some(pid),
+                started_at: now_iso8601(),
+            },
+        )
+        .unwrap();
+    }
+
+    fn status_of(home: &Path, project: &str, agent_id: &str) -> DispatchStatus {
+        status::dispatches_in(home, project)
+            .unwrap()
+            .into_iter()
+            .find(|dispatch| dispatch.record.agent_id == agent_id)
+            .expect("the dispatch was seeded")
+            .status
+    }
+
+    /// The point of the whole feature: a PM session that ends takes its
+    /// in-flight sub-agents with it, through the same machinery `mana kill`
+    /// uses -- so the PM is notified, `mana ps` stops calling it running, and
+    /// the operator is told in one line.
+    #[test]
+    fn quitting_kills_this_projects_running_agents_and_records_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut agent = Sleeper::new(true);
+        seed(tmp.path(), "demo", "agent-live", agent.pid());
+
+        let lines = sweep_in_flight(tmp.path(), "demo", Utc::now());
+
+        assert!(
+            agent.died(),
+            "the sub-agent survived the end of the session"
+        );
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        assert!(
+            lines[0].contains("killed 1 in-flight agent(s)"),
+            "{lines:?}"
+        );
+        assert!(lines[0].contains("agent-li"), "{lines:?}");
+
+        // The two records a completion always leaves, written by the same
+        // function `mana kill` writes them with.
+        assert_eq!(
+            status_of(tmp.path(), "demo", "agent-live"),
+            DispatchStatus::Done
+        );
+        let paths = resolve_project_paths(tmp.path(), "demo");
+        let notifications = std::fs::read_to_string(notifications_path(&paths)).unwrap();
+        assert!(notifications.contains("agent-live"), "{notifications}");
+    }
+
+    /// The guard is exactly as binding at teardown as it is at the command
+    /// line: this pid is somebody else's process, so mana signals nothing,
+    /// records nothing, and says which agent it walked away from and why.
+    #[test]
+    fn a_pid_the_guard_refuses_is_left_alone_and_named() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Alive, but not the leader of its own group -- what a recycled pid
+        // looks like from the outside.
+        let mut bystander = Sleeper::new(false);
+        seed(tmp.path(), "demo", "agent-recycled", bystander.pid());
+
+        let lines = sweep_in_flight(tmp.path(), "demo", Utc::now());
+
+        assert!(bystander.still_running(), "a bystander was signalled");
+        assert_eq!(status::probe(bystander.pid()), Liveness::Alive);
+        assert_eq!(
+            status_of(tmp.path(), "demo", "agent-recycled"),
+            DispatchStatus::Running,
+            "a refused kill still marked the dispatch finished"
+        );
+        assert!(
+            lines[0].contains("left 1 in-flight agent(s) alone (pid guard refused)"),
+            "{lines:?}"
+        );
+        // The reason, in full: the operator now owns a process mana would not
+        // touch, and a count alone is not something anybody can act on.
+        assert!(lines[1].contains("agent-re"), "{lines:?}");
+        assert!(lines[1].contains("process group"), "{lines:?}");
+        let paths = resolve_project_paths(tmp.path(), "demo");
+        assert!(!notifications_path(&paths).exists());
+    }
+
+    /// Another mana, in another directory, has its own agents and its own
+    /// session. Quitting this one says nothing about them.
+    #[test]
+    fn agents_of_another_project_are_never_touched() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut mine = Sleeper::new(true);
+        let mut theirs = Sleeper::new(true);
+        seed(tmp.path(), "demo", "agent-mine", mine.pid());
+        seed(tmp.path(), "other", "agent-theirs", theirs.pid());
+
+        sweep_in_flight(tmp.path(), "demo", Utc::now());
+
+        assert!(mine.died());
+        assert!(theirs.still_running(), "another project's agent was killed");
+        assert_eq!(status::probe(theirs.pid()), Liveness::Alive);
+        assert_eq!(
+            status_of(tmp.path(), "other", "agent-theirs"),
+            DispatchStatus::Running
+        );
+    }
+
+    /// The ordinary case -- nothing was running when the user quit -- prints
+    /// nothing at all. A session that dispatched nothing should end in silence.
+    #[test]
+    fn a_session_with_nothing_in_flight_says_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(sweep_in_flight(tmp.path(), "demo", Utc::now()).is_empty());
+
+        // ...and neither does one whose dispatches have all finished: a
+        // `done` dispatch is not swept, and nothing is recorded twice.
+        let mut finished = Sleeper::new(true);
+        let pid = finished.pid();
+        let _ = finished.0.kill();
+        let _ = finished.0.wait();
+        seed(tmp.path(), "demo", "agent-gone", pid);
+        crate::log::append_log(
+            &resolve_project_paths(tmp.path(), "demo")
+                .logs
+                .join("agent-gone.jsonl"),
+            &crate::log::ExitEntry {
+                status: crate::log::Status::Done,
+                action: "exited".into(),
+                timestamp: now_iso8601(),
+                exit_code: Some(0),
+                duration_ms: Some(10),
+                input_tokens: None,
+                output_tokens: None,
+                failure_means: None,
+            },
+        )
+        .unwrap();
+        assert!(sweep_in_flight(tmp.path(), "demo", Utc::now()).is_empty());
     }
 }

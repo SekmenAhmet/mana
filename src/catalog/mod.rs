@@ -200,6 +200,7 @@ fn argv_templates(entry: &CliEntry) -> Vec<(String, &[String])> {
             format!("{id}: [pm].permission_args"),
             &entry.pm.permission_args,
         ),
+        (format!("{id}: [pm].resume_args"), &entry.pm.resume_args),
         (format!("{id}: [tools].mcp_args"), &entry.tools.mcp_args),
         (format!("{id}: [subagent].args"), &entry.subagent.args),
         (
@@ -329,6 +330,14 @@ url = "https://example.invalid/alpha"
             );
         }
         assert_eq!(claude.subagent.max_concurrent, 0);
+        // `mana launch claude --continue`, measured on this machine twice
+        // (see the entry's notes). One flag, appended to the argv above.
+        assert_eq!(claude.pm.resume_args, ["--continue"]);
+        // Project-local first, so the PM role stops appearing in the global
+        // skill list of every other project the user opens. A relative entry
+        // is resolved against the project root by `cli::launch_pm`.
+        assert_eq!(claude.skills.dirs[0], ".claude/skills");
+        assert!(claude.skills.dirs.iter().any(|dir| dir.starts_with('~')));
         assert_eq!(
             claude.pm.events.as_ref().unwrap().usage.as_deref(),
             Some("$.usage")

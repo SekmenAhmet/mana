@@ -24,6 +24,16 @@
 //! exit record and notification too. Two notifications for one dispatch, both
 //! true — "killed by `mana kill`" and then "killed by a signal in 12.3s" — is
 //! better than a kill that stayed invisible to the PM.
+//!
+//! ## Two callers, one kill
+//!
+//! `kill_dispatch` is the whole of the three sections above, and the command
+//! below is only the half that turns an id prefix into a record. The other
+//! caller is the end of a PM session (`cli::launch_pm`): quitting mana stops
+//! the sub-agents it had in flight, because nothing else ever would. They must
+//! not be two kills — a teardown that skipped the guard would signal recycled
+//! pids, and one that skipped the exit record would leave `mana ps` calling a
+//! dead agent `running` for ever.
 
 use crate::cli::ps::{Scope, resolve_project_name};
 use crate::log::{ExitEntry, LogEntry, Status, append_log, now_iso8601};
@@ -70,6 +80,58 @@ fn kill_at(
     };
     let dispatch = resolve(&dispatches, prefix, scope)?;
     let paths = resolve_project_paths(mana_home, &dispatch.project);
+    let report = kill_dispatch(&paths, dispatch, now)?;
+    // The command's one hard stop, and it is the *command's*: the shared
+    // function reports a refusal as an outcome because its other caller (the
+    // teardown sweep in `cli::launch_pm`) has several dispatches to get
+    // through and must not stop at the first pid it may not touch.
+    if let Verdict::Refused(reason) = report.verdict {
+        bail!("{reason}");
+    }
+    Ok(report.lines)
+}
+
+/// What one kill attempt did.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Verdict {
+    /// The process group was signalled and the completion recorded.
+    Signalled,
+    /// The pid was already gone. Not an error -- the requested end state is
+    /// the actual one -- and the completion is recorded all the same.
+    AlreadyGone,
+    /// The dispatch had already finished. Nothing signalled, nothing written.
+    AlreadyFinished,
+    /// `status::guard` says this pid is not the dispatch's process, so nothing
+    /// was signalled and nothing was recorded. Carries the whole sentence,
+    /// because both callers say the same thing about it.
+    Refused(String),
+}
+
+/// One kill attempt, told.
+#[derive(Debug)]
+pub struct KillReport {
+    pub verdict: Verdict,
+    /// What happened, in mana's voice, ready to print.
+    pub lines: Vec<String>,
+}
+
+/// Kills one recorded dispatch: guard, signal, record.
+///
+/// The single kill path in mana. `mana kill` reaches it after resolving an id
+/// prefix; the end of a PM session reaches it for every dispatch still running
+/// (`cli::launch_pm`), because quitting mana must not leave sub-agents behind
+/// with nobody left to watch or stop them. Both therefore get the same guard,
+/// the same signal, the same exit record and the same notification -- which is
+/// the property that would rot immediately if this were written twice.
+///
+/// `Err` only for a dispatch mana cannot act on at all (no pid was ever
+/// recorded) or a failure to write the completion records. A pid the guard
+/// refuses is a `Verdict`, not an error: see `Verdict::Refused`.
+pub fn kill_dispatch(
+    paths: &ProjectPaths,
+    dispatch: &Dispatch,
+    now: DateTime<Utc>,
+) -> Result<KillReport> {
     let agent = &dispatch.record.agent_id;
 
     match dispatch.status {
@@ -77,7 +139,10 @@ fn kill_at(
         // notification for something the PM was told about already.
         DispatchStatus::Done => {
             let when = dispatch.finished_at.as_deref().unwrap_or("an unknown time");
-            return Ok(vec![format!("{agent} finished at {when}; nothing to kill")]);
+            return Ok(KillReport {
+                verdict: Verdict::AlreadyFinished,
+                lines: vec![format!("{agent} finished at {when}; nothing to kill")],
+            });
         }
         // No pid means mana never learned which process this was. Killing by
         // guesswork is exactly what the guard exists to prevent.
@@ -100,13 +165,16 @@ fn kill_at(
     if dispatch.status == DispatchStatus::Stale {
         lines.push(format!("{agent}: pid {pid} is already gone"));
         record_completion(
-            &paths,
+            paths,
             dispatch,
             now,
             &format!("found already dead by `mana kill` (pid {pid})"),
         )?;
         lines.push(format!("{agent}: recorded as finished"));
-        return Ok(lines);
+        return Ok(KillReport {
+            verdict: Verdict::AlreadyGone,
+            lines,
+        });
     }
 
     match status::guard(pid, &dispatch.record.started_at, now) {
@@ -115,10 +183,15 @@ fn kill_at(
         // signalling it would kill a bystander; and it will not quietly mark
         // the dispatch finished either, because a `setsid`-ing CLI produces
         // the same evidence and may still be running.
-        Guard::NotOurs(reason) => bail!(
-            "refusing to kill {agent}: {reason}. Nothing was signalled and nothing was \
-             recorded. If you are certain, signal it yourself (`kill -9 {pid}`)."
-        ),
+        Guard::NotOurs(reason) => {
+            return Ok(KillReport {
+                verdict: Verdict::Refused(format!(
+                    "refusing to kill {agent}: {reason}. Nothing was signalled and nothing was \
+                     recorded. If you are certain, signal it yourself (`kill -9 {pid}`)."
+                )),
+                lines,
+            });
+        }
         Guard::Unverified(reason) => {
             lines.push(format!("warning: {reason}; killing anyway"));
         }
@@ -139,13 +212,16 @@ fn kill_at(
     });
 
     record_completion(
-        &paths,
+        paths,
         dispatch,
         now,
         &format!("killed by `mana kill` (pid {pid})"),
     )?;
     lines.push(format!("{agent}: recorded as finished"));
-    Ok(lines)
+    Ok(KillReport {
+        verdict: Verdict::Signalled,
+        lines,
+    })
 }
 
 /// Finds the one dispatch a prefix names, or refuses.

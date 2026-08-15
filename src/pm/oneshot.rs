@@ -59,7 +59,7 @@ use super::child::{
     DRAIN_GRACE, join_or_detach, kill_group, pump_stderr, read_lines, reap, set_process_group,
 };
 use super::events::EventMap;
-use super::{PmEvent, PmTransport};
+use super::{PmEvent, PmTransport, Resume};
 use crate::catalog::{CliEntry, PmDriver, PromptMode, substitute};
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::HashMap;
@@ -107,8 +107,12 @@ impl OneshotDriver {
     /// channel's already-substituted flags) after the catalogue's own.
     ///
     /// Nothing is spawned here: the first process carries the first turn.
-    pub fn start(entry: &CliEntry, extra_args: &[String]) -> Result<Self> {
-        Self::start_in(entry, extra_args, None)
+    pub fn start(
+        entry: &CliEntry,
+        extra_args: &[String],
+        resume: Option<Resume<'_>>,
+    ) -> Result<Self> {
+        Self::start_in(entry, extra_args, None, resume)
     }
 
     /// `start` with an explicit working directory.
@@ -116,7 +120,12 @@ impl OneshotDriver {
     /// It is not a convenience: the CLI's conversation store is keyed by
     /// directory (measured on agy), so the directory is what decides which
     /// session `[pm].continue_args` resumes.
-    pub fn start_in(entry: &CliEntry, extra_args: &[String], cwd: Option<&Path>) -> Result<Self> {
+    pub fn start_in(
+        entry: &CliEntry,
+        extra_args: &[String],
+        cwd: Option<&Path>,
+        resume: Option<Resume<'_>>,
+    ) -> Result<Self> {
         let id = &entry.cli.id;
         // An internal guard: the factory in `pm::start` dispatches on this
         // field, so reaching here with anything else is a code bug.
@@ -193,12 +202,22 @@ impl OneshotDriver {
             cwd_arg,
             map,
         };
+        // Resuming is not a flag on this driver, it is *where the session
+        // starts*: `continue_args` is already the template that picks the
+        // CLI's previous conversation up, so a resumed session simply has no
+        // first turn -- turn one continues, like every turn after it. That is
+        // also why `[pm].resume_args` is unread here (agy declares none).
+        let resumed = resume.is_some();
         let worker = std::thread::spawn({
             let sender = sender.clone();
             let in_flight = Arc::clone(&in_flight);
             let closed = Arc::clone(&closed);
             let exited = Arc::clone(&exited);
-            move || run_turns(spawner, inbox, &sender, &in_flight, &closed, &exited)
+            move || {
+                run_turns(
+                    spawner, inbox, &sender, &in_flight, &closed, &exited, resumed,
+                )
+            }
         });
 
         Ok(OneshotDriver {
@@ -421,6 +440,10 @@ impl TurnSpawner {
 }
 
 /// The worker: one turn at a time, forever, until the session ends.
+///
+/// `resumed` is the initial value of "a turn has already run": true when the
+/// session is picking up a conversation the CLI still holds, which makes the
+/// very first process a `continue_args` one.
 fn run_turns(
     spawner: TurnSpawner,
     inbox: Receiver<String>,
@@ -428,8 +451,9 @@ fn run_turns(
     in_flight: &InFlight,
     closed: &Arc<AtomicBool>,
     exited: &Arc<AtomicBool>,
+    resumed: bool,
 ) {
-    let mut started_any = false;
+    let mut started_any = resumed;
     while let Ok(text) = inbox.recv() {
         // Checked here rather than only at `send_user`: `shutdown` can land
         // while this turn was queued, and a killed session must not spawn one
@@ -522,7 +546,7 @@ pub(super) mod tests {
     /// `unwrap_err` would need `Debug` on a live session, which is not worth
     /// requiring of a type nobody prints.
     fn start_err(entry: &CliEntry) -> String {
-        match OneshotDriver::start(entry, &[]) {
+        match OneshotDriver::start(entry, &[], None) {
             Ok(_) => panic!("the driver started a session it should have refused"),
             Err(err) => format!("{err:#}"),
         }
@@ -610,7 +634,7 @@ mod process_tests {
     }
 
     fn driver(bin: &str, first: &[&str], continued: &[&str]) -> OneshotDriver {
-        OneshotDriver::start(&entry(bin, first, continued, "argv"), &[]).unwrap()
+        OneshotDriver::start(&entry(bin, first, continued, "argv"), &[], None).unwrap()
     }
 
     fn next(driver: &OneshotDriver) -> PmEvent {
@@ -691,6 +715,42 @@ mod process_tests {
         // Between turns there is no process at all -- that is what makes this
         // driver a session on disk rather than a session in mana.
         wait_until_idle(&driver);
+        driver.shutdown().unwrap();
+    }
+
+    /// Resuming on this driver: there is no first turn, because the
+    /// conversation the CLI still holds *is* the first turns. So turn one is
+    /// already a `continue_args` process, and no `[pm].resume_args` is
+    /// involved -- the template that continues is the one the entry declares
+    /// for every later turn anyway.
+    #[test]
+    fn a_resumed_session_continues_from_its_very_first_turn() {
+        let tmp = tempfile::tempdir().unwrap();
+        let argv = tmp.path().join("argv.txt");
+        let bin = script(
+            tmp.path(),
+            &format!(
+                "printf '%s\\n' \"$*\" >> '{}'\necho '{{\"text\":\"ack\"}}'",
+                argv.display()
+            ),
+        );
+        let entry = entry(
+            &bin,
+            &["--print", "{prompt}"],
+            &["--continue", "{prompt}"],
+            "argv",
+        );
+        let mut driver = OneshotDriver::start(&entry, &[], Some(Resume::default())).unwrap();
+
+        driver.send_user("first turn").unwrap();
+        assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        driver.send_user("second turn").unwrap();
+        assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+
+        assert_eq!(
+            wait_for_lines(&argv, 2),
+            ["--continue first turn", "--continue second turn"]
+        );
         driver.shutdown().unwrap();
     }
 
@@ -818,7 +878,7 @@ mod process_tests {
             ),
         );
         let entry = fixture::parse(&source(&bin, &["--print"], &["--continue"], "stdin"));
-        let mut driver = OneshotDriver::start(&entry, &[]).unwrap();
+        let mut driver = OneshotDriver::start(&entry, &[], None).unwrap();
 
         driver.send_user("a turn on stdin").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
@@ -837,7 +897,7 @@ mod process_tests {
         let bin = script(tmp.path(), "echo \"argv: $*\" >&2");
         let entry = entry(&bin, &["--print", "{prompt}"], &["--continue"], "argv");
         let extra = ["--mcp-config".to_string(), "/tmp/mana-mcp.json".to_string()];
-        let mut driver = OneshotDriver::start(&entry, &extra).unwrap();
+        let mut driver = OneshotDriver::start(&entry, &extra, None).unwrap();
 
         driver.send_user("hi").unwrap();
         assert_eq!(

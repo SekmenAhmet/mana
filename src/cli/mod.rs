@@ -32,8 +32,14 @@ pub enum Command {
     // comment is not a doc comment so the rationale stays out of `--help`.
     /// Launch a CLI agent in PM mode
     Launch {
-        /// CLI agent to launch in PM mode (e.g. claude)
-        agent: String,
+        /// CLI agent to launch in PM mode (e.g. claude). Optional only with
+        /// --continue, which falls back to the last CLI launched in this
+        /// project.
+        agent: Option<String>,
+        /// Resume this project's previous PM conversation instead of starting
+        /// a fresh one
+        #[arg(long = "continue", short = 'c')]
+        resume: bool,
     },
     /// List the sub-agents mana has dispatched
     Ps {
@@ -113,6 +119,34 @@ pub fn normalize_help_invocation(args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn launch(args: &[&str]) -> (Option<String>, bool) {
+        match Cli::parse_from(args).command {
+            Command::Launch { agent, resume } => (agent, resume),
+            _ => panic!("not a launch"),
+        }
+    }
+
+    /// The four shapes of `mana launch`, pinned: the CLI is optional *only*
+    /// because `-c` can supply it from this project's state, and both spellings
+    /// of the flag mean the same thing.
+    #[test]
+    fn launch_takes_an_optional_cli_and_a_continue_flag() {
+        assert_eq!(
+            launch(&["mana", "launch", "claude"]),
+            (Some("claude".into()), false)
+        );
+        assert_eq!(
+            launch(&["mana", "launch", "claude", "-c"]),
+            (Some("claude".into()), true)
+        );
+        assert_eq!(
+            launch(&["mana", "launch", "--continue", "claude"]),
+            (Some("claude".into()), true)
+        );
+        assert_eq!(launch(&["mana", "launch", "-c"]), (None, true));
+        assert_eq!(launch(&["mana", "launch"]), (None, false));
+    }
 
     #[test]
     fn normalize_help_invocation_rewrites_trailing_help() {

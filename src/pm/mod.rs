@@ -132,19 +132,55 @@ pub trait PmTransport: Send {
         bail!("this PM transport never asks for permission, so there is nothing to answer ({id})")
     }
 
+    /// The id this conversation can be reopened by, when the transport's
+    /// protocol has one.
+    ///
+    /// `None` on the two drivers whose CLI keys its conversation store by
+    /// working directory (`stream`, `oneshot-continue`): there is no
+    /// identifier to store, and inventing one would be a promise mana cannot
+    /// keep. Only ACP hands out a session id, and only ACP takes one back
+    /// (`session/load`), so the launch flow stores whatever this returns and
+    /// hands it to `Resume` next time.
+    fn session_id(&self) -> Option<&str> {
+        None
+    }
+
     /// Ends the session and guarantees `Exited` is queued before returning.
     fn shutdown(&mut self) -> Result<()>;
 }
 
+/// "Pick the conversation back up" -- what `mana launch --continue` asks the
+/// driver for.
+///
+/// One type rather than a bare `bool` because the three drivers need different
+/// amounts of it, and the difference is not the caller's business: `stream`
+/// appends `[pm].resume_args`, `oneshot-continue` starts its first turn from
+/// `[pm].continue_args`, and `acp` replays a session id mana recorded when the
+/// last one ended -- which is the only fact that has to travel, so it is the
+/// only field. A driver whose CLI cannot resume refuses the launch instead of
+/// quietly opening a fresh session.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Resume<'a> {
+    /// The session the last ACP run ended with, when mana stored one. `None`
+    /// on the other drivers, which resume from the CLI's own store keyed by
+    /// the working directory, and on an ACP project mana has never recorded.
+    pub session_id: Option<&'a str>,
+}
+
 /// Starts the PM session `entry` describes, appending `extra_args` (the tool
 /// channel's already-substituted flags) after the catalogue's own.
+/// `resume` is `None` for a fresh conversation.
 ///
 /// The one place in mana that knows more than one driver exists.
-pub fn start(entry: &CliEntry, extra_args: &[String]) -> Result<Box<dyn PmTransport>> {
+pub fn start(
+    entry: &CliEntry,
+    extra_args: &[String],
+    resume: Option<Resume<'_>>,
+) -> Result<Box<dyn PmTransport>> {
     match entry.pm.driver {
-        PmDriver::Acp => Ok(Box::new(AcpDriver::start(entry, extra_args)?)),
-        PmDriver::Stream => Ok(Box::new(StreamDriver::start(entry, extra_args)?)),
-        PmDriver::OneshotContinue => Ok(Box::new(OneshotDriver::start(entry, extra_args)?)),
+        PmDriver::Acp => Ok(Box::new(AcpDriver::start(entry, extra_args, resume)?)),
+        PmDriver::Stream => Ok(Box::new(StreamDriver::start(entry, extra_args, resume)?)),
+        PmDriver::OneshotContinue => Ok(Box::new(OneshotDriver::start(entry, extra_args, resume)?)),
     }
 }
 
@@ -179,7 +215,7 @@ mod tests {
     /// `unwrap_err` would need `Debug` on a boxed live session, which is not
     /// worth requiring of every driver for the sake of a test message.
     fn start_err(entry: &CliEntry) -> String {
-        match start(entry, &[]) {
+        match start(entry, &[], None) {
             Ok(_) => panic!("a session started that should have been refused"),
             Err(err) => format!("{err:#}"),
         }

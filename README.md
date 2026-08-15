@@ -20,6 +20,8 @@ via `~/.mana/catalog.local.toml`.
     mana install                 # register the catalogued CLIs found on this machine
     mana doctor                  # check the catalogue, this project and the config
     mana launch claude           # run Claude Code as the PM, in mana's TUI
+    mana launch claude -c        # ...picking the previous conversation back up
+    mana launch -c               # ...on whichever CLI this project used last
     mana ps                      # what has been dispatched, and what became of it
     mana kill <agent-id>         # stop a sub-agent the PM cannot stop itself
 
@@ -36,6 +38,60 @@ worktree and observe the run.
 In the TUI: type to talk to the PM, `Enter` to send, `Ctrl+G` for the graph
 pane, `Ctrl+C` to quit. `Esc` does nothing — it is the interrupt key of the
 agent CLIs themselves, and quitting on it was a v1 mistake.
+
+### Quitting
+
+`Ctrl+C` (and a PM that dies on its own) ends the session **and stops the
+sub-agents it had in flight**, through the same machinery as `mana kill`: guard
+first, then the process group, then the exit record and the notification. mana
+was the only thing watching those runs, so leaving them alive would mean
+processes writing into logs nobody reads, holding quota and worktrees, that
+`mana ps` calls `running` for ever. What it did is printed after the terminal is
+restored:
+
+    mana: killed 2 in-flight agent(s): d4ce69c8, ab1e17d8
+
+A pid the guard refuses is left alone and named, with the reason, because you
+now own a process mana would not touch. Only this project is swept: another mana
+in another directory has its own agents.
+
+### `mana launch --continue`
+
+    mana launch claude --continue    # or -c
+    mana launch -c                   # the CLI this project used last
+
+Resumes the PM conversation instead of starting a fresh one. How that happens is
+per CLI and lives in the catalogue: claude appends `--continue` to its argv
+(`[pm].resume_args`), agy starts its first turn from `[pm].continue_args`, and
+an ACP CLI is asked for `session/load` with the session id mana stored — but
+only if its handshake advertises `loadSession`. A CLI that cannot resume
+**refuses the launch** and says why, rather than opening a fresh conversation
+under a flag that promised the old one.
+
+On resume mana does not re-send the activation: a continued conversation has
+already had it, and replaying it (with the whole role text, on the CLIs that
+inline it) would cost a large turn to teach a PM what it already knows. It gets
+one line instead — *"[mana] session resumed …"* — while the skill file on disk
+is still rewritten, because that file is generated output and this binary may be
+newer than the one that wrote it.
+
+The last CLI launched, and the ACP session id to resume by, live in
+`~/.mana/projects/<project>/state.toml`. It is a cache: delete it and `-c` just
+asks you to name the CLI once more.
+
+### Where the PM skill is installed
+
+mana writes `assets/roles/pm/SKILL.md` to the first directory in the CLI's
+`[skills].dirs` on every launch. For claude that is now **`.claude/skills/` in
+the project**, not `~/.claude/skills`: the role only means anything inside a
+mana session, and a global install put it in the skill list of every project you
+open (where, by that CLI's own precedence rules, it would also shadow the
+project copy). Every *other* directory in that CLI's list has its `mana-pm/`
+removed on launch — that is mana cleaning up after its own earlier versions,
+and it says so in the chat pane. Nothing but `mana-pm/` is ever touched.
+
+The project-local directory carries a `.gitignore` of its own containing `*`, so
+it stays out of `git status` without mana editing the `.gitignore` you wrote.
 
 ### `mana ps`
 
