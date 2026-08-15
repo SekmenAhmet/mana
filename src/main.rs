@@ -10,8 +10,10 @@ mod project;
 mod prompts;
 mod pty;
 mod review;
+mod spawn;
 mod subprocess;
 mod task;
+mod worktree;
 mod tui;
 
 use clap::Parser;
