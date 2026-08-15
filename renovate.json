@@ -3,6 +3,7 @@
   "extends": ["config:recommended", ":semanticCommits"],
   "baseBranches": ["develop"],
   "lockFileMaintenance": { "enabled": true },
+  "ignoreDeps": ["self_update"],
   "packageRules": [
     {
       "description": "One grouped PR for routine bumps; majors stay individual for real review",
