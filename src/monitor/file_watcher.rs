@@ -135,13 +135,21 @@ mod tests {
             }
             if log_path.exists() {
                 let contents = std::fs::read_to_string(&log_path).unwrap();
-                // Built with the platform separator: Windows logs `src\main.rs`,
-                // and a hardcoded forward slash made this time out there.
+                // Parse the JSONL instead of substring-matching the raw file:
+                // on Windows the separator is `\`, which JSON serializes as
+                // `\\` — a raw `contains("src\main.rs")` can never match its
+                // own serialized form. (That, not the watcher, was the CI
+                // failure; the diagnostic dump showed perfect entries.)
                 let expected = format!(
                     "file:modified:{}",
                     Path::new("src").join("main.rs").display()
                 );
-                if contents.contains(&expected) {
+                let found = contents.lines().any(|l| {
+                    serde_json::from_str::<LogEntry>(l)
+                        .map(|e| e.action == expected)
+                        .unwrap_or(false)
+                });
+                if found {
                     break;
                 }
             }
