@@ -9,10 +9,14 @@ use std::time::{Duration, Instant};
 pub const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawns `path --version`, waits up to `timeout` for it to exit, and
-/// returns its trimmed stdout. Shared by `doctor` (checking a registered
-/// agent's current version) and `install` (resolving a newly selected
-/// agent's version) — both need the same "don't hang forever on an
-/// unresponsive CLI" behavior, so it lives in one place instead of two.
+/// returns the first line of its stdout, trimmed. Shared by `doctor`
+/// (checking a registered agent's current version) and `install`
+/// (resolving a newly selected agent's version) — both need the same
+/// "don't hang forever on an unresponsive CLI" behavior, so it lives in one
+/// place instead of two. First-line-only because some CLIs (e.g. GitHub
+/// Copilot CLI) print an extra nag line after the version
+/// ("Run 'copilot update' to check for updates.") that would otherwise get
+/// stored verbatim as part of the "version".
 pub fn capture_version_output(path: &Path, timeout: Duration) -> anyhow::Result<String> {
     let mut child = std::process::Command::new(path)
         .arg("--version")
@@ -29,7 +33,8 @@ pub fn capture_version_output(path: &Path, timeout: Duration) -> anyhow::Result<
                 if let Some(mut stdout) = child.stdout.take() {
                     stdout.read_to_string(&mut output)?;
                 }
-                return Ok(output.trim().to_string());
+                let first_line = output.lines().next().unwrap_or("").trim().to_string();
+                return Ok(first_line);
             }
             None => {
                 if start.elapsed() > timeout {
@@ -79,6 +84,28 @@ mod tests {
         assert_eq!(
             capture_version_output(&script, VERSION_CHECK_TIMEOUT).unwrap(),
             "3.1.4"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn capture_version_output_drops_extra_lines_after_the_version() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let script = tmp.path().join("copilot-like.sh");
+        std::fs::write(
+            &script,
+            "#!/bin/sh\necho 'GitHub Copilot CLI 1.0.80.'\necho \"Run 'copilot update' to check for updates.\"\n",
+        )
+        .unwrap();
+        let mut perms = std::fs::metadata(&script).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&script, perms).unwrap();
+
+        assert_eq!(
+            capture_version_output(&script, VERSION_CHECK_TIMEOUT).unwrap(),
+            "GitHub Copilot CLI 1.0.80."
         );
     }
 
