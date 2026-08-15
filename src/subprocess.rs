@@ -26,11 +26,51 @@ pub fn capture_version_output(
     version_args: &[String],
     timeout: Duration,
 ) -> anyhow::Result<String> {
+    let output = capture_output(path, version_args, timeout, Capture::Stdout)?;
+    Ok(output.lines().next().unwrap_or("").trim().to_string())
+}
+
+/// Which of a probe's streams to keep.
+///
+/// `Both` is not a convenience: two of the four shipped CLIs print their model
+/// list on **stderr** (`agy models` sends everything there; `opencode models`
+/// splits the list across both), so a discovery that read stdout alone would
+/// report "no models" for one and half a list for the other. Which stream a
+/// CLI answers on is per-CLI knowledge that the catalogue schema has no field
+/// for, and reading both needs no such field: it is stream-agnostic, not a
+/// branch on a CLI's name.
+pub enum Capture {
+    Stdout,
+    Both,
+}
+
+/// The same spawn-and-wait, keeping every line instead of the first.
+///
+/// Additive helper (task 4.3): `mana doctor` runs a catalogue entry's
+/// `[models].discovery_args` and reads a *list* of model ids off the output,
+/// which is the same "run a CLI briefly, do not hang on it" problem
+/// `capture_version_output` already solved -- so that function now delegates
+/// here rather than the two keeping separate copies of the timeout loop.
+///
+/// Both streams are drained only after the process has exited, which is the
+/// shape this function already had: a child that writes more than a pipe
+/// buffer (64 KiB) without exiting blocks, and is then killed by the timeout
+/// below. That is a loud failure and not a hang, which is all a probe needs --
+/// the streaming case belongs to `crate::spawn`, which has the reader threads.
+pub fn capture_output(
+    path: &Path,
+    args: &[String],
+    timeout: Duration,
+    capture: Capture,
+) -> anyhow::Result<String> {
     let mut child = std::process::Command::new(path)
-        .args(version_args)
+        .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(match capture {
+            Capture::Stdout => Stdio::null(),
+            Capture::Both => Stdio::piped(),
+        })
         .spawn()?;
 
     let start = Instant::now();
@@ -41,8 +81,10 @@ pub fn capture_version_output(
                 if let Some(mut stdout) = child.stdout.take() {
                     stdout.read_to_string(&mut output)?;
                 }
-                let first_line = output.lines().next().unwrap_or("").trim().to_string();
-                return Ok(first_line);
+                if let Some(mut stderr) = child.stderr.take() {
+                    stderr.read_to_string(&mut output)?;
+                }
+                return Ok(output);
             }
             None => {
                 if start.elapsed() > timeout {

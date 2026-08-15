@@ -27,7 +27,13 @@
 //! `~/.mana/projects/<project>/` fresh -- registry, logs, reviews, runs -- so
 //! this server can be restarted mid-session and the PM cannot tell.
 
-mod routing;
+// `pub(crate)` for the same reason `runs` is, one consumer later: `mana doctor`
+// (task 4.3) reports which (CLI x model) pairs are resting on a quota cooldown
+// right now, and that state is computed here, from the logs, by
+// `Observations::gather`. Recomputing it in the doctor would be a second
+// implementation of the cooldown rules, free to disagree with the one the
+// router actually routes on. Visibility only -- nothing in this module changed.
+pub(crate) mod routing;
 // `pub(crate)` for the consumer named in its own module doc: the PM driver
 // (`cli::launch_pm`) tails `notifications.jsonl` and injects each line into the
 // PM session. It reads that file back through `runs::Notification`, so the

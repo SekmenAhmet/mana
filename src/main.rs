@@ -10,6 +10,7 @@ mod project;
 mod review;
 mod sentinel;
 mod spawn;
+mod status;
 mod subprocess;
 mod task;
 mod tui;
@@ -25,7 +26,13 @@ fn main() -> anyhow::Result<()> {
         Command::Install => cli::install::run()?,
         Command::Uninstall { cli } => cli::uninstall::run(&cli)?,
         Command::Launch { agent } => cli::launch_pm::run(&agent)?,
-        Command::Doctor => cli::doctor::run()?,
+        Command::Ps { all, project } => cli::ps::run(all, project.as_deref())?,
+        Command::Kill {
+            agent_id,
+            all,
+            project,
+        } => cli::kill::run(&agent_id, all, project.as_deref())?,
+        Command::Doctor { project, prune } => cli::doctor::run(project.as_deref(), prune)?,
         Command::Upgrade => cli::upgrade::run()?,
         Command::Dev { command } => cli::dev::run(&command)?,
         Command::McpServer { project_root } => mcp::serve(&project_root)?,

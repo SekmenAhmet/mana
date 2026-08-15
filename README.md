@@ -18,8 +18,10 @@ via `~/.mana/catalog.local.toml`.
 ## Usage
 
     mana install                 # register the catalogued CLIs found on this machine
-    mana doctor                  # check the configuration
+    mana doctor                  # check the catalogue, this project and the config
     mana launch claude           # run Claude Code as the PM, in mana's TUI
+    mana ps                      # what has been dispatched, and what became of it
+    mana kill <agent-id>         # stop a sub-agent the PM cannot stop itself
 
 `mana install` offers exactly the CLIs the catalogue knows — a CLI with no
 entry has no spawn flags, no failure signatures and no PM driver, so
@@ -34,6 +36,69 @@ worktree and observe the run.
 In the TUI: type to talk to the PM, `Enter` to send, `Ctrl+G` for the graph
 pane, `Ctrl+C` to quit. `Esc` does nothing — it is the interrupt key of the
 agent CLIs themselves, and quitting on it was a v1 mistake.
+
+### `mana ps`
+
+    mana ps                      # this project (the working directory's name)
+    mana ps --all                # every project under ~/.mana/projects
+    mana ps --project ../my-api  # some other project
+
+    AGENT     ROLE      CLI/MODEL     TASK      PID    AGE  STATUS
+    d4ce69c8  executor  claude/haiku  m1-hello  71086  12m  running
+    ab1e17d8  reviewer  claude/haiku  m1-hello  75666  5h   done
+    daad9367  executor  agy/gemini-3  9d4e4a7b  75899  2d   stale
+
+The status is derived, never stored: `done` means the agent's log carries an
+`exited` record, `running` means its pid still answers, and **`stale` means
+neither** — a dispatch whose process is gone and which never wrote an exit
+record, so nothing will ever finish it and the PM is still waiting on it.
+`unknown` appears when there is no pid to ask about (a note under the table
+says which case it is). Always exits 0: a listing that fails is one no script
+can pipe.
+
+### `mana kill`
+
+    mana kill d4ce69c8           # an unambiguous prefix is enough
+    mana kill d4ce --all         # search every project
+
+Kills the whole process group, the way `mana` created it, so a CLI that
+backgrounded a helper dies with it. Then it appends the same two records a
+normal completion appends — an `exited` line in the agent's log and a line in
+`notifications.jsonl` — so `ps` stops calling it running and the PM is told.
+
+Before signalling anything, mana checks that the pid is still plausibly the
+dispatch's: a mana sub-agent always leads its own process group, and its
+process cannot be younger than its record. A pid that fails either check has
+been recycled onto somebody else's process, and the kill is **refused** rather
+than downgraded to a warning. That guard is a strong likelihood, not a proof —
+a pid recycled onto another group leader within two minutes of the dispatch's
+own age would pass it. Killing a pid that is already gone is a clean no-op that
+still records the completion, which is how a `stale` row gets cleared.
+
+### `mana doctor`
+
+    mana doctor                  # catalogue, this project, config
+    mana doctor --project ../my-api
+    mana doctor --prune          # remove worktrees no running dispatch is using
+
+Catalogue-first, because the catalogue is what mana acts on. Per CLI: whether
+the binary is on `PATH`, its version, its PM driver and tool channel, its
+models (static, or actually discovered by running the CLI's own command), its
+quota pools and failure signatures, which pairs are resting on a cooldown right
+now, every capability it *lacks* (no auto-approve flag, no permission flags, a
+concurrency cap, a cwd it ignores), and the first line of its catalogue notes.
+Then the project's counters and verdict tallies, the dispatches still in flight
+or stale, leftover worktrees, and the config file.
+
+**Exit codes.** `0` unless something is broken-broken, and exactly three things
+count: a *registered* CLI whose binary has vanished, a stale dispatch, or a
+config file mana cannot read (including v1's leftover `config.yaml`). A
+catalogued CLI you never installed, a failed model discovery, an active
+cooldown and a leftover worktree are all reported and all still exit 0. Output
+is plain aligned text with no colour, so `mana doctor | grep BROKEN` works.
+
+`--prune` removes worktrees under `~/.mana/worktrees/<project>/` that no
+running dispatch is using, and refuses to touch the ones that are.
 
 ## Manual QA checklist (v2, requires a real `claude` install)
 

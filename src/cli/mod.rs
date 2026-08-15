@@ -4,7 +4,9 @@ use std::path::PathBuf;
 pub mod dev;
 pub mod doctor;
 pub mod install;
+pub mod kill;
 pub mod launch_pm;
+pub mod ps;
 pub mod uninstall;
 pub mod upgrade;
 
@@ -33,8 +35,35 @@ pub enum Command {
         /// CLI agent to launch in PM mode (e.g. claude)
         agent: String,
     },
-    /// Diagnose the configuration
-    Doctor,
+    /// List the sub-agents mana has dispatched
+    Ps {
+        /// Report on every project under ~/.mana/projects, not just this one
+        #[arg(long)]
+        all: bool,
+        /// Project directory to report on (default: the working directory)
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
+    /// Kill a running sub-agent, by its agent id or an unambiguous prefix
+    Kill {
+        /// Agent id from `mana ps`, or any unambiguous prefix of one
+        agent_id: String,
+        /// Search every project under ~/.mana/projects, not just this one
+        #[arg(long)]
+        all: bool,
+        /// Project directory to search (default: the working directory)
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
+    /// Diagnose the catalogue, this project and the configuration
+    Doctor {
+        /// Project directory to report on (default: the working directory)
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+        /// Remove worktrees left behind by dispatches that are no longer running
+        #[arg(long)]
+        prune: bool,
+    },
     /// Update mana
     Upgrade,
     /// Developer scaffolding for the v2 pipeline. Hidden because its surface

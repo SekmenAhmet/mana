@@ -63,10 +63,12 @@ impl Registry {
         }
     }
 
-    /// Not called from a live command yet — `mana ps`/`kill` (task 4.2) and
-    /// the MCP `list_agents` tool are the intended consumers. Proven by
-    /// this file's own round-trip test in the meantime; see `task.rs` for
-    /// the same "tested ahead of its consumer" pattern.
+    /// Still not called from a live command. `mana ps`/`kill` (task 4.2) were
+    /// the expected consumers and turned out not to be: `ps` walks every
+    /// record in append order, and `kill` resolves an *unambiguous prefix*
+    /// rather than an exact id, so neither wants a point lookup. Kept for the
+    /// exact-id readers that remain plausible (the MCP tool surface), and
+    /// proven meanwhile by this file's round-trip test and by `dispatch`'s.
     #[allow(dead_code)]
     pub fn get(&self, agent_id: &str) -> Option<&SubagentRecord> {
         self.by_agent_id.get(agent_id)
