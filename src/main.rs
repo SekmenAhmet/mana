@@ -14,10 +14,11 @@ mod task;
 mod tui;
 
 use clap::Parser;
-use cli::{Cli, Command};
+use cli::{Cli, Command, normalize_help_invocation};
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let args = normalize_help_invocation(std::env::args().collect());
+    let cli = Cli::parse_from(args);
     match cli.command {
         Command::Install => cli::install::run()?,
         Command::Uninstall { cli } => cli::uninstall::run(&cli)?,
