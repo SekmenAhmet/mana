@@ -3,6 +3,7 @@ use crate::config::{ensure_agent_registered, load_config};
 use crate::dependencies::unmet_dependencies;
 use crate::lock::{LockEntry, append_entry, load_lock};
 use crate::log::{LogEntry, Status, append_log, now_iso8601};
+use crate::monitor::file_watcher::{spawn_logger as spawn_file_logger, watch as watch_files};
 use crate::monitor::process_watcher::watch_and_log;
 use crate::monitor::pty_listener::spawn_listener;
 use crate::project::{
@@ -125,6 +126,12 @@ pub(crate) fn run_at(
     let review_path = paths.reviews.join(format!("{task_uuid}.md"));
     let prompt = build_prompt(&role, &task, &task_path, &review_path);
 
+    // Watch the actual project source tree (not `.mana/`) so file changes
+    // the agent makes get logged even though the agent itself never
+    // reports them — see monitor::file_watcher::spawn_logger.
+    let (fs_watcher, fs_events) = watch_files(&cwd)?;
+    let fs_logger_handle = spawn_file_logger(fs_events, cwd.clone(), log_path.clone());
+
     let args = build_agent_args(flag, extra_params);
     let mut session = spawner.spawn(agent_cli, &args)?;
     session.writer.write_all(prompt.as_bytes())?;
@@ -135,6 +142,9 @@ pub(crate) fn run_at(
 
     let _ = listener_handle.join();
     watch_and_log(session.child, &log_path)?;
+
+    drop(fs_watcher);
+    let _ = fs_logger_handle.join();
 
     println!("sous-agent {agent_uuid} ({role_str}) termine pour la tache {task_uuid}");
     Ok(())
