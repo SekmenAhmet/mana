@@ -1,11 +1,7 @@
-pub const KNOWN_CLIS: &[&str] = &[
-    "claude",
-    "codex",
-    "gemini",
-    "antigravity",
-    "copilot",
-    "opencode",
-];
+/// The actual CLI binary names `mana install` looks up on `$PATH`.
+/// "Antigravity" is the product name, but its CLI binary is `agy` -- see
+/// `Managent/config.yaml.md`'s example, which registers it under `agy`.
+pub const KNOWN_CLIS: &[&str] = &["claude", "codex", "gemini", "agy", "copilot", "opencode"];
 
 /// The flag that makes a given agent CLI skip interactive permission
 /// prompts, required for sub-agents (executor/reviewer) which run
