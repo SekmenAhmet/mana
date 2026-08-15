@@ -16,11 +16,11 @@ continuity held across turns, clean exit.
 The static models are the CLI's own aliases (--model "Provide an alias for the
 latest model"), so they track vendor releases without catalogue edits.
 
-Unverified: the [pm].permission_args allowlist has never been run against a real
-session -- it is the mana v2 plan's stated strategy (task 2.3), and its first
-real check is the manual QA in the README. If the flag or its syntax turns out
-to be wrong, the PM starts with its default tool set: no worse than having no
-field at all, and visible immediately (the PM would be able to edit files).
+Verified live (2026-08-15, headless probe with this exact argv): the mana MCP
+server connects and its four tools are callable under the mcp__mana__ prefix
+without a permission prompt, while a Write attempt is refused with "requested
+permissions ... but you haven't granted it" and no file appears. The PM is
+mechanically read-only, as [pm].permission_args intends.
 '''
 
 [cli]
