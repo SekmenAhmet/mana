@@ -1,7 +1,7 @@
 # Real Terminal Emulation for the PM Chat Pane — Design
 
 **Date:** 2026-08-15
-**Status:** Approved
+**Status:** ~~Approved~~ **Superseded** by `2026-08-15-mana-v2-design.md` — faithful terminal mirroring is the opposite of the actual goal (show only the important messages); replaced by structured event streams (ACP / stream-json).
 
 ## Purpose
 
