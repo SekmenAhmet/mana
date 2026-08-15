@@ -14,6 +14,8 @@ pub fn run() -> anyhow::Result<()> {
         .bin_name("mana")
         .target(self_update::get_target())
         .show_download_progress(true)
+        .show_output(false)
+        .no_confirm(true)
         .current_version(env!("CARGO_PKG_VERSION"))
         .build()?
         .update()?;
