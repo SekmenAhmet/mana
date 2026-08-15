@@ -67,6 +67,22 @@ mod tests {
     use crate::log::read_last_status;
     use std::time::Duration;
 
+    /// Canonical tempdir root in the same shape notify reports events with.
+    /// macOS needs canonicalize (`/var` symlinks to `/private/var`); Windows'
+    /// canonicalize returns a verbatim `\\?\C:\...` path while notify emits
+    /// plain `C:\...`, so the prefix must go or strip_prefix never matches.
+    fn watchable_root(tmp: &Path) -> PathBuf {
+        let canon = tmp.canonicalize().unwrap();
+        #[cfg(windows)]
+        {
+            let s = canon.display().to_string();
+            if let Some(stripped) = s.strip_prefix(r"\\?\") {
+                return PathBuf::from(stripped);
+            }
+        }
+        canon
+    }
+
     #[test]
     fn is_noise_path_flags_git_target_and_node_modules() {
         assert!(is_noise_path(Path::new("/proj/.git/HEAD")));
@@ -86,7 +102,7 @@ mod tests {
         // to `/private/var/...`, and notify/FSEvents reports paths already
         // resolved through it — stripping the unresolved prefix would fail
         // and silently fall back to the absolute path.
-        let root = tmp.path().canonicalize().unwrap();
+        let root = watchable_root(tmp.path());
         // Create the subdirectory BEFORE watching: on Linux (inotify),
         // recursive watching is emulated by notify adding a watch per
         // subdirectory, and a directory created after the watch started
@@ -129,7 +145,7 @@ mod tests {
     #[test]
     fn spawn_logger_ignores_git_and_target_changes() {
         let tmp = tempfile::tempdir().unwrap();
-        let root = tmp.path().canonicalize().unwrap();
+        let root = watchable_root(tmp.path());
         let (_watcher, rx) = watch(&root).unwrap();
         // Log file lives in a sibling tempdir, outside what's being
         // watched, so its own creation/write never shows up as noise.
