@@ -1,4 +1,3 @@
-#[allow(dead_code)]
 pub(crate) fn describe_update_result(status: &self_update::Status) -> String {
     match status {
         self_update::Status::UpToDate(version) => format!("mana est deja a jour ({version})"),
@@ -9,7 +8,17 @@ pub(crate) fn describe_update_result(status: &self_update::Status) -> String {
 }
 
 pub fn run() -> anyhow::Result<()> {
-    todo!()
+    let status = self_update::backends::github::Update::configure()
+        .repo_owner("SekmenAhmet")
+        .repo_name("mana")
+        .bin_name("mana")
+        .target(self_update::get_target())
+        .show_download_progress(true)
+        .current_version(env!("CARGO_PKG_VERSION"))
+        .build()?
+        .update()?;
+    println!("{}", describe_update_result(&status));
+    Ok(())
 }
 
 #[cfg(test)]
