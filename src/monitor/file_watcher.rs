@@ -123,7 +123,15 @@ mod tests {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
             if std::time::Instant::now() > deadline {
-                panic!("timeout waiting for file:modified log entry");
+                // Diagnostic panic: two blind CI round-trips already went into
+                // guessing what Windows' notify backend emits — dump what the
+                // logger actually wrote (or that it wrote nothing) instead.
+                let seen = std::fs::read_to_string(&log_path)
+                    .unwrap_or_else(|_| "<log file never created>".to_string());
+                panic!(
+                    "timeout waiting for file:modified entry\nroot: {}\nlog contents:\n{seen}",
+                    root.display()
+                );
             }
             if log_path.exists() {
                 let contents = std::fs::read_to_string(&log_path).unwrap();
