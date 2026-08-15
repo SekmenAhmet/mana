@@ -56,7 +56,7 @@ pub fn capture_version_output(path: &Path, timeout: Duration) -> anyhow::Result<
 /// `printed_version` and exits. Test-only fixture shared by every module
 /// that needs a fake "CLI" binary to check version-reporting behavior
 /// against, without depending on a specific real binary being installed.
-#[cfg(test)]
+#[cfg(all(test, unix))] // uses unix permission bits; every caller is unix-gated
 pub(crate) fn write_version_script(
     dir: &Path,
     name: &str,

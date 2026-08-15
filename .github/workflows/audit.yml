@@ -1,0 +1,17 @@
+# Weekly dependency audit — deny otherwise only runs on push, so a CVE
+# published while the repo is quiet would stay invisible until the next
+# commit. Same dead-man's-switch principle as the CI gate: silence must not
+# look like health.
+name: Audit
+
+on:
+  schedule:
+    - cron: "0 7 * * 1" # Mondays 07:00 UTC
+  workflow_dispatch:
+
+jobs:
+  deny:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
