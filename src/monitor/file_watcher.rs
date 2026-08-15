@@ -87,6 +87,13 @@ mod tests {
         // resolved through it — stripping the unresolved prefix would fail
         // and silently fall back to the absolute path.
         let root = tmp.path().canonicalize().unwrap();
+        // Create the subdirectory BEFORE watching: on Linux (inotify),
+        // recursive watching is emulated by notify adding a watch per
+        // subdirectory, and a directory created after the watch started
+        // races that registration — a file written into it immediately
+        // can be missed entirely. macOS's FSEvents backend has no such
+        // race, which is why this only ever failed in CI on ubuntu-latest.
+        std::fs::create_dir_all(root.join("src")).unwrap();
         let (_watcher, rx) = watch(&root).unwrap();
         // Log file lives in a sibling tempdir, outside what's being
         // watched, so its own creation/write never shows up as noise.
@@ -95,7 +102,6 @@ mod tests {
         let _handle = spawn_logger(rx, root.clone(), log_path.clone());
 
         std::thread::sleep(Duration::from_millis(200));
-        std::fs::create_dir_all(root.join("src")).unwrap();
         std::fs::write(root.join("src/main.rs"), "fn main() {}").unwrap();
 
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
