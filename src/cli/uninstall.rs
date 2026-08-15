@@ -1,4 +1,4 @@
-use crate::config::{Config, load_config, save_config};
+use crate::config::{Config, config_path, load_config, save_config};
 use crate::project::mana_home;
 
 pub fn remove_agent(config: &mut Config, name: &str) -> bool {
@@ -7,7 +7,7 @@ pub fn remove_agent(config: &mut Config, name: &str) -> bool {
 
 pub fn run(name: &str) -> anyhow::Result<()> {
     let home = mana_home()?;
-    run_at(&home.join("config.yaml"), name)
+    run_at(&config_path(&home), name)
 }
 
 fn run_at(config_path: &std::path::Path, name: &str) -> anyhow::Result<()> {
@@ -50,7 +50,7 @@ mod tests {
     #[test]
     fn run_at_removes_existing_agent_and_persists() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
         let mut config = Config::default();
         config.models.insert(
             "claude".to_string(),
@@ -71,7 +71,7 @@ mod tests {
     #[test]
     fn run_at_on_unknown_agent_leaves_config_untouched() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
         save_config(&config_path, &Config::default()).unwrap();
 
         run_at(&config_path, "claude").unwrap();

@@ -1,4 +1,4 @@
-use crate::config::{ensure_agent_registered, load_config};
+use crate::config::{config_path, ensure_agent_registered, load_config};
 use crate::lock::load_registry;
 use crate::monitor::file_watcher::{FsEvent, watch};
 use crate::monitor::pty_listener::{extract_commands, strip_ansi};
@@ -217,7 +217,7 @@ fn prepare_session(
     let paths = resolve_project_paths(home, &project_name);
     ensure_project_structure(&paths)?;
 
-    let config = load_config(&home.join("config.yaml"))?;
+    let config = load_config(&config_path(home))?;
     ensure_agent_registered(&config, agent_cli)?;
 
     let mut session = spawner.spawn(agent_cli, &[])?;
@@ -466,8 +466,11 @@ mod tests {
     fn prepare_session_errors_when_agent_not_registered() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path();
-        crate::config::save_config(&home.join("config.yaml"), &crate::config::Config::default())
-            .unwrap();
+        crate::config::save_config(
+            &crate::config::config_path(home),
+            &crate::config::Config::default(),
+        )
+        .unwrap();
 
         let spawner = crate::pty::test_support::FakeSpawner::new(vec![]);
         assert!(prepare_session(home, &spawner, "claude").is_err());
@@ -481,7 +484,7 @@ mod tests {
         config
             .models
             .insert("claude".to_string(), agent_config("/usr/local/bin/claude"));
-        crate::config::save_config(&home.join("config.yaml"), &config).unwrap();
+        crate::config::save_config(&crate::config::config_path(home), &config).unwrap();
 
         let spawner = crate::pty::test_support::FakeSpawner::new(vec![]);
         let (_session, paths, project_name) = prepare_session(home, &spawner, "claude").unwrap();

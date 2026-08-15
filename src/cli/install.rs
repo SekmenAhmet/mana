@@ -1,5 +1,5 @@
 use crate::agents::KNOWN_CLIS;
-use crate::config::{AgentConfig, Config, load_config, save_config};
+use crate::config::{AgentConfig, Config, config_path, load_config, save_config};
 use crate::project::mana_home;
 use crate::subprocess::{VERSION_CHECK_TIMEOUT, capture_version_output};
 use dialoguer::MultiSelect;
@@ -31,7 +31,7 @@ pub fn resolve_agent(name: &str) -> anyhow::Result<AgentConfig> {
 
 pub fn run() -> anyhow::Result<()> {
     let home = mana_home()?;
-    let config_path = home.join("config.yaml");
+    let config_path = config_path(&home);
     let config = load_config(&config_path)?;
     let defaults = default_selections(&config);
 
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn install_selected_persists_resolved_agent() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
 
         install_selected(&["cat"], &config_path).unwrap();
 
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     fn install_selected_skips_unresolvable_names_but_still_saves() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
 
         install_selected(&["this-binary-does-not-exist-anywhere"], &config_path).unwrap();
 

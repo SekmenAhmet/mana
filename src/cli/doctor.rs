@@ -1,4 +1,4 @@
-use crate::config::{AgentConfig, Config, load_config, save_config};
+use crate::config::{AgentConfig, Config, config_path, load_config, save_config};
 use crate::project::mana_home;
 use crate::subprocess::{VERSION_CHECK_TIMEOUT, capture_version_output};
 
@@ -73,7 +73,7 @@ fn repair_suggestion(issue: &DoctorIssue) -> Option<String> {
 
 pub fn run() -> anyhow::Result<()> {
     let home = mana_home()?;
-    run_at(&home.join("config.yaml"))
+    run_at(&config_path(&home))
 }
 
 fn run_at(config_path: &std::path::Path) -> anyhow::Result<()> {
@@ -253,7 +253,7 @@ mod tests {
     #[test]
     fn run_at_reports_ok_for_empty_config() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
         crate::config::save_config(&config_path, &Config::default()).unwrap();
         assert!(run_at(&config_path).is_ok());
     }
@@ -261,7 +261,7 @@ mod tests {
     #[test]
     fn run_at_reports_issues_for_missing_binary() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
         let mut config = Config::default();
         config.models.insert(
             "claude".to_string(),
@@ -285,7 +285,7 @@ mod tests {
             .to_string_lossy()
             .to_string();
 
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
         let mut config = Config::default();
         config.models.insert(
             "claude".to_string(),
@@ -306,7 +306,7 @@ mod tests {
     #[test]
     fn run_at_leaves_config_untouched_when_only_missing_binaries_are_found() {
         let tmp = tempfile::tempdir().unwrap();
-        let config_path = tmp.path().join("config.yaml");
+        let config_path = config_path(tmp.path());
         let mut config = Config::default();
         config.models.insert(
             "claude".to_string(),

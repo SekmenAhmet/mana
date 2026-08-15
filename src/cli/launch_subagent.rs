@@ -1,5 +1,5 @@
 use crate::agents::autonomous_flag;
-use crate::config::{ensure_agent_registered, load_config};
+use crate::config::{config_path, ensure_agent_registered, load_config};
 use crate::dependencies::unmet_dependencies;
 use crate::lock::{SubagentRecord, append_record, load_registry};
 use crate::log::{LogEntry, Status, append_log, now_iso8601};
@@ -94,7 +94,7 @@ pub(crate) fn run_at(
         anyhow::bail!("unmet dependencies for {task_uuid}: {}", unmet.join(", "));
     }
 
-    let config = load_config(&home.join("config.yaml"))?;
+    let config = load_config(&config_path(home))?;
     ensure_agent_registered(&config, agent_cli)?;
 
     let flag = autonomous_flag(agent_cli)?;
@@ -205,7 +205,7 @@ mod tests {
                 path: "/usr/local/bin/claude".into(),
             },
         );
-        save_config(&home.join("config.yaml"), &config).unwrap();
+        save_config(&config_path(&home), &config).unwrap();
 
         (tmp, home)
     }
@@ -294,7 +294,7 @@ mod tests {
         let task = sample_task(Role::Executor, vec![]);
         let (_tmp, home) = fake_home_with_task(&task);
         // Overwrite with an empty config so "claude" isn't registered.
-        save_config(&home.join("config.yaml"), &Config::default()).unwrap();
+        save_config(&config_path(&home), &Config::default()).unwrap();
 
         let result = run_at(
             &home,
