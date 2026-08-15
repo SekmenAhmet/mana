@@ -30,10 +30,12 @@ role is trusted on this CLI:
 Known gaps in the data rather than in the CLI:
 - The quota pool has no observed period, so it is recorded as "unknown"
   alongside kind = "unknown".
-- The failure signature below (exit 1 + empty stderr + "402" in stdout) was
-  measured on a different CLI and carried over here by the v2 design; nothing
-  quota-shaped has been observed from agy itself. Re-measure before relying on
-  the cooldown it triggers -- which is also why no cooldown_minutes is set.
+- No failure signature is declared at all: nothing quota-shaped has ever been
+  observed from agy (the daily-note matrix records its quota signal as
+  literally "nothing"). An earlier draft carried over a signature measured on
+  copilot (exit 1 + empty stderr + "402"), which would have produced false
+  cooldowns here -- removed 2026-08-15. Until a real agy quota failure is
+  captured, exhaustion surfaces as a generic failure the PM escalates.
 - No agy-specific skills directory was found, so only the vendor-neutral
   ~/.agents/skills is listed.
 '''
@@ -75,11 +77,9 @@ kind       = "unknown"             # requests | tokens | credits | unknown
 period     = "unknown"
 pool_scope = "per-model"           # global | per-model
 
-[[failure]]                        # ordered; first match wins
-means        = "quota_exhausted"   # quota_exhausted | rate_limited | auth_expired
-exit_codes   = [1]
-stderr_regex = "^$"
-stdout_regex = "402"
+# No [[failure]] entries on purpose: no quota failure has ever been observed
+# from this CLI, and a signature borrowed from another one would trigger false
+# cooldowns -- see notes.
 
 [skills]
 dirs = ["~/.agents/skills"]

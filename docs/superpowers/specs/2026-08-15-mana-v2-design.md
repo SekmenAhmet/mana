@@ -167,6 +167,10 @@ comments; the `toml` crate is maintained while serde_yaml is archived
 ```toml
 schema = 1
 
+# Top-level, so it must precede the first [table] header — written after one,
+# TOML would silently attach it to that table.
+notes = "Maintainer notes in English. Never injected into the PM."
+
 [cli]
 id           = "claude"
 name         = "Claude Code"
@@ -220,8 +224,6 @@ dirs = ["~/.claude/skills", "~/.agents/skills"]
 
 [install]
 url = "https://claude.com/claude-code"
-
-notes = "Maintainer notes in English. Never injected into the PM."
 ```
 
 ### agy — the deltas (every hard-won managent lesson becomes a field)
@@ -236,9 +238,20 @@ notes = "Maintainer notes in English. Never injected into the PM."
 [models]    discovery_args = ["models"]
             line_regex = '^(\S+)\t'
 [[quota.pools]] id = "default", kind = "unknown", pool_scope = "per-model"
-[[failure]] means = "quota_exhausted"
-            exit_codes = [1], stderr_regex = "^$", stdout_regex = "402"
+# no [[failure]] entry: agy has never shown an observable quota signal. The
+# (exit 1, empty stderr, "402") signature belongs to copilot's future entry —
+# an earlier draft wrongly carried it over here (caught at implementation).
 ```
+
+**Corrections found while implementing 0.1** (kept here so the schema stays
+honest): top-level `notes` must precede the first table header (TOML scoping);
+the local override file carries **one** entry in the same format as an embedded
+file (overriding several CLIs at once would need a `catalog.local.d/`
+directory — deferred); argv templates have **no escape for literal `{`**, which
+blocks inline-JSON args (copilot's `--additional-mcp-config`) until an escape
+is added with that entry; a `[[quota.pools]]` `limit` field is deferred until a
+CLI with a known hard limit (copilot, 200/mo) gets its entry; enum casing is
+intentionally as-shipped (kebab-case drivers/scopes, snake_case failure means).
 
 **Deliberately absent from the catalogue:** "what it's good at" prose, model
 rankings, $ prices, task categories, observed counters. The first three rot on

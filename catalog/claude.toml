@@ -13,8 +13,8 @@ and zeroes cache reads, which turned a $0.11-0.53 PM turn into $1.57 on
 The `stream` driver was verified multi-turn on 2026-08-15: one process, session
 continuity held across turns, clean exit.
 
-Only one model is listed statically. Routing wants the full cheap/mid/expensive
-spread, so this list grows as each id is confirmed against a real account.
+The static models are the CLI's own aliases (--model "Provide an alias for the
+latest model"), so they track vendor releases without catalogue edits.
 '''
 
 [cli]
@@ -50,8 +50,18 @@ discovery_args = []                # empty = static list only
 # line_regex   = '^(\S+)\t'        # capture group = model id
 
 [[models.static]]
+id         = "haiku"
+cost_class = "cheap"               # cheap | mid | expensive -- ordinal ONLY
+pool       = "plan"
+
+[[models.static]]
+id         = "sonnet"
+cost_class = "mid"
+pool       = "plan"
+
+[[models.static]]
 id         = "opus"
-cost_class = "expensive"           # cheap | mid | expensive -- ordinal ONLY
+cost_class = "expensive"
 pool       = "plan"
 
 [[quota.pools]]
