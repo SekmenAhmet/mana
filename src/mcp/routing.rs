@@ -561,25 +561,10 @@ fn render_discovery_note(entries: &[CliEntry]) -> String {
     }
 }
 
-/// The last `exited` record in an agent's log.
-///
-/// A near-copy of `log::read_last_exit`, which is private to that module and
-/// answers a different question (counters need the record, this needs its
-/// timestamp). Scans backwards for the same reason it does: the file watcher
-/// runs on its own thread and can append after the exit record.
+/// The last `exited` record in an agent's log — `log`'s own reader, exposed
+/// pub(crate) so this module stops carrying a near-copy of it.
 fn last_exit(path: &Path) -> Result<Option<ExitEntry>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = std::fs::read_to_string(path)?;
-    for line in contents.lines().rev() {
-        if let Ok(entry) = serde_json::from_str::<ExitEntry>(line.trim())
-            && entry.action == "exited"
-        {
-            return Ok(Some(entry));
-        }
-    }
-    Ok(None)
+    crate::log::read_last_exit(path)
 }
 
 #[cfg(test)]

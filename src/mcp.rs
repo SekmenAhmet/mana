@@ -47,8 +47,9 @@ use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router}
 use routing::{Observations, Request, Stats};
 use runs::{Notification, RunRecord};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// The user's catalogue escape valve (design §7). Read from the same place
 /// every other command reads it; a missing file is normal.
@@ -109,12 +110,18 @@ pub fn serve(project_root: &Path) -> Result<()> {
 }
 
 /// The server. Cheap to clone (the catalogue is a handful of parsed structs),
-/// which is what the SDK asks for, and carries no session state on purpose.
+/// which is what the SDK asks for. `in_flight` is the one piece of in-process
+/// state, and it is legitimately irrecoverable-from-disk: it exists to honour
+/// `[subagent].max_concurrent` (the PM skill promises "mana enforces per-CLI
+/// concurrency limits"), and the registry row that would prove a dispatch is
+/// live is written only *after* the spawn — by which time a second dispatch
+/// against a `max_concurrent = 1` CLI has already killed both (agy, 8s).
 #[derive(Clone)]
 pub struct ManaTools {
     project_root: PathBuf,
     mana_home: PathBuf,
     catalog: Catalog,
+    in_flight: Arc<Mutex<HashMap<String, u32>>>,
     tool_router: ToolRouter<Self>,
 }
 
@@ -124,7 +131,27 @@ impl ManaTools {
             project_root,
             mana_home,
             catalog,
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
             tool_router: Self::tool_router(),
+        }
+    }
+}
+
+/// Decrements the per-CLI in-flight count when a background dispatch ends,
+/// however it ends — a panic in the dispatch path must not permanently eat a
+/// concurrency slot, hence a drop guard rather than a call at the end of
+/// `run()`.
+struct InFlightSlot {
+    counts: Arc<Mutex<HashMap<String, u32>>>,
+    cli: String,
+}
+
+impl Drop for InFlightSlot {
+    fn drop(&mut self) {
+        if let Ok(mut counts) = self.counts.lock()
+            && let Some(count) = counts.get_mut(&self.cli)
+        {
+            *count = count.saturating_sub(1);
         }
     }
 }
@@ -292,6 +319,30 @@ impl ManaTools {
         // joined by (task_id, role), and this is the one that appears in
         // `notifications.jsonl` so the PM sees the id it was given.
         let agent_id = uuid::Uuid::new_v4().to_string();
+
+        // Reserve the concurrency slot before spawning the thread: checking
+        // after would leave a window where two calls both pass the limit.
+        let slot = {
+            let mut counts = self
+                .in_flight
+                .lock()
+                .map_err(|_| internal_msg("concurrency state poisoned"))?;
+            let count = counts.entry(entry.cli.id.clone()).or_insert(0);
+            let max = entry.subagent.max_concurrent;
+            if max != 0 && *count >= max {
+                return Err(invalid(format!(
+                    "{} is at its concurrency limit ({max} in flight). Wait for a \
+                     [mana] completion notification, then dispatch again.",
+                    entry.cli.id
+                )));
+            }
+            *count += 1;
+            InFlightSlot {
+                counts: Arc::clone(&self.in_flight),
+                cli: entry.cli.id.clone(),
+            }
+        };
+
         let background = BackgroundDispatch {
             agent_id: agent_id.clone(),
             entry,
@@ -301,7 +352,10 @@ impl ManaTools {
             project_root: self.project_root.clone(),
             mana_home: self.mana_home.clone(),
         };
-        std::thread::spawn(move || background.run());
+        std::thread::spawn(move || {
+            let _slot = slot; // held for the whole dispatch, released on drop
+            background.run()
+        });
 
         Ok(LaunchSubagentOut {
             agent_id,
@@ -558,6 +612,10 @@ fn invalid(message: String) -> ErrorData {
 /// A failure the PM can do nothing about -- mana could not read or write its
 /// own state. Worded so the user, who sees it in the transcript, knows it is
 /// not their prompt that was wrong.
+fn internal_msg(message: &str) -> ErrorData {
+    ErrorData::internal_error(message.to_string(), None)
+}
+
 fn internal(error: &anyhow::Error, doing: &str) -> ErrorData {
     ErrorData::internal_error(format!("mana failed while {doing}: {error:#}"), None)
 }
@@ -1292,7 +1350,15 @@ mod dispatch_tests {
     /// rather than a hand-built `Catalog` keeps the test on the same code the
     /// escape valve uses (design §7).
     fn install_override(repo: &Repo, bin: &str) -> Catalog {
-        let source = format!(
+        let source = install_override_source(repo, bin);
+        let path = repo.mana_home.join(CATALOG_OVERRIDE);
+        std::fs::create_dir_all(&repo.mana_home).unwrap();
+        std::fs::write(&path, source).unwrap();
+        Catalog::load(Some(&path)).unwrap()
+    }
+
+    fn install_override_source(_repo: &Repo, bin: &str) -> String {
+        format!(
             r#"
 schema = 1
 notes = "mcp dispatch fixture"
@@ -1340,11 +1406,7 @@ dirs = []
 [install]
 url = "https://example.invalid/fixture"
 "#
-        );
-        let path = repo.mana_home.join(CATALOG_OVERRIDE);
-        std::fs::create_dir_all(&repo.mana_home).unwrap();
-        std::fs::write(&path, source).unwrap();
-        Catalog::load(Some(&path)).unwrap()
+        )
     }
 
     fn tools_for(repo: &Repo, bin: &str) -> ManaTools {
@@ -1376,6 +1438,66 @@ url = "https://example.invalid/fixture"
             );
             std::thread::sleep(Duration::from_millis(20));
         }
+    }
+
+    #[test]
+    fn max_concurrent_is_enforced_and_the_slot_frees_on_completion() {
+        let repo = Repo::new();
+        // A deliberately slow executor so the first dispatch is still running
+        // when the second one asks for the only slot.
+        let slow = repo.script("slow-cli", "#!/bin/sh\nsleep 2\nexit 0\n");
+        let catalog = {
+            let source = install_override_source(&repo, &slow)
+                .replace("max_concurrent = 0", "max_concurrent = 1");
+            let path = repo.mana_home.join(CATALOG_OVERRIDE);
+            std::fs::create_dir_all(&repo.mana_home).unwrap();
+            std::fs::write(&path, source).unwrap();
+            Catalog::load(Some(&path)).unwrap()
+        };
+        let tools = ManaTools::new(repo.project.clone(), repo.mana_home.clone(), catalog);
+        let paths = repo.paths();
+
+        let first = tools
+            .create_task_impl(CreateTaskParams {
+                title: "one".to_string(),
+                prompt: "# a\n".to_string(),
+                depends_on: None,
+            })
+            .unwrap()
+            .task_id;
+        let second = tools
+            .create_task_impl(CreateTaskParams {
+                title: "two".to_string(),
+                prompt: "# b\n".to_string(),
+                depends_on: None,
+            })
+            .unwrap()
+            .task_id;
+
+        let launch = |task_id: &str| {
+            tools.launch_subagent_impl(LaunchSubagentParams {
+                task_id: task_id.to_string(),
+                role: RoleParam::Executor,
+                cli: Some("fixture".to_string()),
+                model: None,
+                cost_class: None,
+            })
+        };
+
+        launch(&first).unwrap();
+        let refused = launch(&second).unwrap_err();
+        assert!(
+            refused.message.contains("concurrency limit"),
+            "{}",
+            refused.message
+        );
+        assert!(refused.message.contains("fixture"), "{}", refused.message);
+
+        // Once the slow dispatch reports in, its drop guard has freed the
+        // slot and the same launch goes through.
+        wait_for_notifications(&paths, 1);
+        launch(&second).unwrap();
+        wait_for_notifications(&paths, 2);
     }
 
     #[test]
