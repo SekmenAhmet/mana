@@ -21,9 +21,21 @@ uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 strip-ansi-escapes = "0.2"
 anyhow = "1"
+# The catalogue's failure signatures are regexes written by hand (in the
+# shipped files and in the user's local override), and matching them against a
+# sub-agent's output is what turns "the CLI exited 1" into "the quota pool is
+# exhausted". Already in the tree transitively, so it adds nothing to audit.
+regex = "1"
 dirs = "5"
 which = "6"
 dialoguer = "0.11"
+
+# Only for `killpg`: a sub-agent that times out must die together with anything
+# it spawned, and std can only signal the direct child (`Child::kill`). No
+# std API reaches a process group, so the spawner calls libc directly. Already
+# in the tree transitively, so this adds no new dependency to audit.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"

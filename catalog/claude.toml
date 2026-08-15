@@ -38,7 +38,9 @@ channel  = "mcp"                   # mcp | sentinel
 mcp_args = ["--mcp-config", "{config_path}"]
 
 [subagent]
-args                  = ["-p", "--output-format", "stream-json"]
+args                  = ["-p", "--verbose", "--output-format", "stream-json"]
+# --verbose is mandatory with -p + stream-json (the CLI refuses otherwise;
+# caught by the first real M1 dispatch on 2026-08-15).
 auto_approve_args     = ["--dangerously-skip-permissions"]
 model_args            = ["--model", "{model}"]
 prompt                = "argv"

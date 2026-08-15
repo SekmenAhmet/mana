@@ -1,5 +1,6 @@
 use clap::{Args, Parser, Subcommand};
 
+pub mod dev;
 pub mod doctor;
 pub mod install;
 pub mod launch_pm;
@@ -26,6 +27,14 @@ pub enum Command {
     Doctor,
     /// Update mana
     Upgrade,
+    /// Developer scaffolding for the v2 pipeline. Hidden because its surface
+    /// is unstable and it exists to drive by hand what the PM will drive over
+    /// MCP once phase 2 lands -- not something to document to users.
+    #[command(hide = true)]
+    Dev {
+        #[command(subcommand)]
+        command: dev::DevCommand,
+    },
 }
 
 #[derive(Args)]

@@ -3,6 +3,7 @@ mod catalog;
 mod cli;
 mod config;
 mod dependencies;
+mod dispatch;
 mod lock;
 mod log;
 mod monitor;
@@ -46,6 +47,7 @@ fn main() -> anyhow::Result<()> {
         }
         Command::Doctor => cli::doctor::run()?,
         Command::Upgrade => cli::upgrade::run()?,
+        Command::Dev { command } => cli::dev::run(&command)?,
     }
     Ok(())
 }
