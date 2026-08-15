@@ -41,7 +41,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Command::Doctor => cli::doctor::run()?,
-        Command::Upgrade => cli::upgrade::run(),
+        Command::Upgrade => cli::upgrade::run()?,
     }
     Ok(())
 }
