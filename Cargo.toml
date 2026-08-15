@@ -35,7 +35,7 @@ serde_json_path = "0.7"
 # frontmatter (`+++` fences). Its predecessor `serde_yaml` is archived
 # upstream, which is half the reason; the other half is that one format means
 # one set of surprises.
-toml = "0.8"
+toml = "1.0"
 # `mana upgrade` and the soft version check at launch. Every feature here is a
 # decision, so each gets a line:
 #
@@ -70,7 +70,7 @@ anyhow = "1"
 # exhausted". Already in the tree transitively, so it adds nothing to audit.
 regex = "1"
 dirs = "6"
-which = "6"
+which = "8"
 dialoguer = "0.11"
 # The MCP server the PM talks to (`mana mcp-server`, design §5). `rmcp` is the
 # official SDK under the modelcontextprotocol org; the alternative
