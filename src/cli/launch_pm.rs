@@ -1,6 +1,7 @@
 use crate::config::{ensure_agent_registered, load_config};
 use crate::lock::load_lock;
 use crate::monitor::file_watcher::{FsEvent, watch};
+use crate::monitor::pty_listener::{extract_commands, strip_ansi};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
@@ -18,9 +19,116 @@ use ratatui::backend::{Backend, CrosstermBackend};
 use ratatui::layout::{Constraint, Direction, Layout};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use std::io::{Read, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, channel};
 use std::time::Duration;
+
+/// A `mana launch --subagent ...` invocation parsed out of the PM's own PTY
+/// output. The PM (running as a real coding-agent CLI) triggers sub-agents
+/// by literally running this as a shell command — `mana` intercepts it so
+/// the orchestration stays invisible to the user (see `intercept_subagent_launches`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SubagentRequest {
+    pub cli: String,
+    pub role: String,
+    pub assign: String,
+    pub params: Vec<String>,
+}
+
+/// Parses a single shell command string (already extracted from `Bash(...)`)
+/// into a `SubagentRequest`, if it's a `mana launch --subagent` invocation.
+/// Tokens are split on whitespace — task/agent identifiers never contain
+/// spaces, so this is simpler than pulling in a shell-quoting crate.
+fn parse_subagent_invocation(cmd: &str) -> Option<SubagentRequest> {
+    let tokens: Vec<&str> = cmd.split_whitespace().collect();
+    if tokens.first() != Some(&"mana") || tokens.get(1) != Some(&"launch") {
+        return None;
+    }
+
+    let mut cli = None;
+    let mut role = None;
+    let mut assign = None;
+    let mut params = Vec::new();
+    let mut i = 2;
+    while i < tokens.len() {
+        match tokens[i] {
+            "--subagent" => {
+                cli = tokens.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--role" => {
+                role = tokens.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            "--assign" => {
+                assign = tokens.get(i + 1).map(|s| s.to_string());
+                i += 2;
+            }
+            other => {
+                params.push(other.to_string());
+                i += 1;
+            }
+        }
+    }
+
+    Some(SubagentRequest {
+        cli: cli?,
+        role: role?,
+        assign: assign?,
+        params,
+    })
+}
+
+/// Scans already-ANSI-stripped PM output for `mana launch --subagent ...`
+/// invocations. Returns the text with those invocations removed (so they
+/// never reach the chat pane — per the design, sub-agent orchestration is
+/// invisible to the user) plus the list of parsed requests to act on.
+fn intercept_subagent_launches(text: &str) -> (String, Vec<SubagentRequest>) {
+    let mut display = text.to_string();
+    let mut requests = Vec::new();
+    for cmd in extract_commands(text) {
+        if let Some(req) = parse_subagent_invocation(&cmd) {
+            display = display.replace(&format!("Bash({cmd})"), "");
+            requests.push(req);
+        }
+    }
+    (display, requests)
+}
+
+/// Launches a sub-agent request produced by `intercept_subagent_launches`.
+/// `launch_pm::run_event_loop` depends on this instead of calling
+/// `launch_subagent::run_at` directly, so the interception logic is
+/// testable against a fake that just records what it was asked to launch.
+pub trait SubagentLauncher {
+    fn launch(&self, req: SubagentRequest);
+}
+
+/// Runs the sub-agent on a background OS thread inside this same `mana`
+/// process — not a new subprocess — so the PM's render loop never blocks
+/// waiting for it. Errors are logged to stderr; there's no channel back to
+/// the PM for launch failures in v1 (the graph pane simply never gets a
+/// node for that agent-uuid).
+pub struct RealSubagentLauncher {
+    pub home: PathBuf,
+}
+
+impl SubagentLauncher for RealSubagentLauncher {
+    fn launch(&self, req: SubagentRequest) {
+        let home = self.home.clone();
+        std::thread::spawn(move || {
+            if let Err(err) = super::launch_subagent::run_at(
+                &home,
+                &RealSpawner,
+                &req.cli,
+                &req.role,
+                &req.assign,
+                &req.params,
+            ) {
+                eprintln!("[mana] echec du lancement du sous-agent: {err}");
+            }
+        });
+    }
+}
 
 /// Given a changed-path event from the file watcher, decides whether the PM
 /// should be notified, and builds the exact message to inject into its PTY
@@ -75,15 +183,15 @@ pub fn run(agent_cli: &str) -> anyhow::Result<()> {
 
     let mut app = App::new();
     let mut events = CrosstermEventSource;
-    let result = run_event_loop(
-        &mut terminal,
-        &mut app,
-        &mut session.writer,
-        &pty_output,
-        &fs_events,
-        &paths,
-        &mut events,
-    );
+    let launcher = RealSubagentLauncher { home: home.clone() };
+    let mut ctx = EventLoopContext {
+        pty_output: &pty_output,
+        fs_events: &fs_events,
+        paths: &paths,
+        events: &mut events,
+        launcher: &launcher,
+    };
+    let result = run_event_loop(&mut terminal, &mut app, &mut session.writer, &mut ctx);
 
     disable_raw_mode()?;
     execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
@@ -119,33 +227,48 @@ fn prepare_session(
     Ok((session, paths, project_name))
 }
 
+/// Everything the render loop needs beyond the terminal/app/writer: the
+/// channels it polls, where the project's files live, its source of key
+/// events, and where to send intercepted sub-agent requests. Bundled into
+/// one struct so `run_event_loop` stays under clippy's argument-count limit
+/// as the loop grows new event sources.
+struct EventLoopContext<'a> {
+    pty_output: &'a Receiver<Vec<u8>>,
+    fs_events: &'a Receiver<FsEvent>,
+    paths: &'a ProjectPaths,
+    events: &'a mut dyn EventSource,
+    launcher: &'a dyn SubagentLauncher,
+}
+
 fn run_event_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     app: &mut App,
     writer: &mut dyn Write,
-    pty_output: &Receiver<Vec<u8>>,
-    fs_events: &Receiver<FsEvent>,
-    paths: &ProjectPaths,
-    events: &mut dyn EventSource,
+    ctx: &mut EventLoopContext,
 ) -> anyhow::Result<()> {
     loop {
-        while let Ok(chunk) = pty_output.try_recv() {
-            app.push_output(&chunk);
+        while let Ok(chunk) = ctx.pty_output.try_recv() {
+            let text = strip_ansi(&chunk);
+            let (display, requests) = intercept_subagent_launches(&text);
+            app.push_lines(&display);
+            for req in requests {
+                ctx.launcher.launch(req);
+            }
         }
 
-        while let Ok(FsEvent::Changed(path)) = fs_events.try_recv() {
-            if let Some(message) = build_notification(&path, &paths.reviews) {
+        while let Ok(FsEvent::Changed(path)) = ctx.fs_events.try_recv() {
+            if let Some(message) = build_notification(&path, &ctx.paths.reviews) {
                 writer.write_all(message.as_bytes())?;
                 writer.write_all(b"\n")?;
             }
         }
 
-        let lock = load_lock(&paths.lock_file).unwrap_or_default();
-        let nodes = build_nodes(&lock, &paths.logs).unwrap_or_default();
+        let lock = load_lock(&ctx.paths.lock_file).unwrap_or_default();
+        let nodes = build_nodes(&lock, &ctx.paths.logs).unwrap_or_default();
 
         terminal.draw(|frame| draw(frame, app, &nodes))?;
 
-        if let Some(key) = events.poll_key(Duration::from_millis(50))?
+        if let Some(key) = ctx.events.poll_key(Duration::from_millis(50))?
             && let Some(app_event) = map_key_event(key.code, key.modifiers)
             && !apply_app_event(app_event, app, writer)?
         {
@@ -238,6 +361,74 @@ fn draw(frame: &mut ratatui::Frame, app: &App, nodes: &[GraphNode]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    /// Records every request handed to it instead of actually spawning a
+    /// sub-agent, so `run_event_loop` tests can assert on interception
+    /// without touching a real PTY/process.
+    #[derive(Default)]
+    struct FakeSubagentLauncher {
+        calls: Mutex<Vec<SubagentRequest>>,
+    }
+
+    impl SubagentLauncher for FakeSubagentLauncher {
+        fn launch(&self, req: SubagentRequest) {
+            self.calls.lock().unwrap().push(req);
+        }
+    }
+
+    #[test]
+    fn parse_subagent_invocation_extracts_required_fields() {
+        let req = parse_subagent_invocation(
+            "mana launch --subagent claude --role executor --assign task-1",
+        )
+        .unwrap();
+        assert_eq!(req.cli, "claude");
+        assert_eq!(req.role, "executor");
+        assert_eq!(req.assign, "task-1");
+        assert!(req.params.is_empty());
+    }
+
+    #[test]
+    fn parse_subagent_invocation_collects_trailing_params() {
+        let req = parse_subagent_invocation(
+            "mana launch --subagent claude --role reviewer --assign task-2 --model pro",
+        )
+        .unwrap();
+        assert_eq!(req.params, vec!["--model".to_string(), "pro".to_string()]);
+    }
+
+    #[test]
+    fn parse_subagent_invocation_rejects_unrelated_commands() {
+        assert!(parse_subagent_invocation("cargo test").is_none());
+        assert!(parse_subagent_invocation("mana doctor").is_none());
+    }
+
+    #[test]
+    fn parse_subagent_invocation_rejects_missing_required_flag() {
+        assert!(
+            parse_subagent_invocation("mana launch --subagent claude --role executor").is_none()
+        );
+    }
+
+    #[test]
+    fn intercept_subagent_launches_strips_invocation_from_display_text() {
+        let text =
+            "avant Bash(mana launch --subagent claude --role executor --assign task-1) apres";
+        let (display, requests) = intercept_subagent_launches(text);
+        assert_eq!(requests.len(), 1);
+        assert!(!display.contains("mana launch --subagent"));
+        assert!(display.contains("avant"));
+        assert!(display.contains("apres"));
+    }
+
+    #[test]
+    fn intercept_subagent_launches_leaves_unrelated_bash_commands_visible() {
+        let text = "Bash(cargo test)";
+        let (display, requests) = intercept_subagent_launches(text);
+        assert!(requests.is_empty());
+        assert_eq!(display, text);
+    }
 
     #[test]
     fn build_notification_fires_for_review_file() {
@@ -322,19 +513,62 @@ mod tests {
         pty_tx.send(b"hello from pm".to_vec()).unwrap();
         let (_fs_tx, fs_rx) = channel();
         let mut events = FakeEventSource::new([KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)]);
+        let launcher = FakeSubagentLauncher::default();
+        let mut ctx = EventLoopContext {
+            pty_output: &pty_rx,
+            fs_events: &fs_rx,
+            paths: &paths,
+            events: &mut events,
+            launcher: &launcher,
+        };
 
-        run_event_loop(
-            &mut terminal,
-            &mut app,
-            &mut writer,
-            &pty_rx,
-            &fs_rx,
-            &paths,
-            &mut events,
-        )
-        .unwrap();
+        run_event_loop(&mut terminal, &mut app, &mut writer, &mut ctx).unwrap();
 
         assert_eq!(app.chat_lines, vec!["hello from pm".to_string()]);
+    }
+
+    #[test]
+    fn run_event_loop_intercepts_subagent_launch_and_hides_it_from_chat() {
+        use crate::tui::event::test_support::FakeEventSource;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = fake_paths(tmp.path());
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut app = App::new();
+        let mut writer: Vec<u8> = Vec::new();
+
+        let (pty_tx, pty_rx) = channel();
+        pty_tx
+            .send(
+                b"before Bash(mana launch --subagent claude --role executor --assign task-1) after"
+                    .to_vec(),
+            )
+            .unwrap();
+        let (_fs_tx, fs_rx) = channel();
+        let mut events = FakeEventSource::new([KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)]);
+        let launcher = FakeSubagentLauncher::default();
+        let mut ctx = EventLoopContext {
+            pty_output: &pty_rx,
+            fs_events: &fs_rx,
+            paths: &paths,
+            events: &mut events,
+            launcher: &launcher,
+        };
+
+        run_event_loop(&mut terminal, &mut app, &mut writer, &mut ctx).unwrap();
+
+        let calls = launcher.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].cli, "claude");
+        assert_eq!(calls[0].role, "executor");
+        assert_eq!(calls[0].assign, "task-1");
+
+        assert_eq!(app.chat_lines.len(), 1);
+        assert!(!app.chat_lines[0].contains("mana launch --subagent"));
+        assert!(app.chat_lines[0].contains("before"));
+        assert!(app.chat_lines[0].contains("after"));
     }
 
     #[test]
@@ -355,17 +589,16 @@ mod tests {
             .send(FsEvent::Changed(paths.reviews.join("task-1.md")))
             .unwrap();
         let mut events = FakeEventSource::new([KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)]);
+        let launcher = FakeSubagentLauncher::default();
+        let mut ctx = EventLoopContext {
+            pty_output: &pty_rx,
+            fs_events: &fs_rx,
+            paths: &paths,
+            events: &mut events,
+            launcher: &launcher,
+        };
 
-        run_event_loop(
-            &mut terminal,
-            &mut app,
-            &mut writer,
-            &pty_rx,
-            &fs_rx,
-            &paths,
-            &mut events,
-        )
-        .unwrap();
+        run_event_loop(&mut terminal, &mut app, &mut writer, &mut ctx).unwrap();
 
         let sent = String::from_utf8_lossy(&writer);
         assert!(sent.contains("task-1"));
@@ -392,17 +625,16 @@ mod tests {
             KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE),
             KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
         ]);
+        let launcher = FakeSubagentLauncher::default();
+        let mut ctx = EventLoopContext {
+            pty_output: &pty_rx,
+            fs_events: &fs_rx,
+            paths: &paths,
+            events: &mut events,
+            launcher: &launcher,
+        };
 
-        run_event_loop(
-            &mut terminal,
-            &mut app,
-            &mut writer,
-            &pty_rx,
-            &fs_rx,
-            &paths,
-            &mut events,
-        )
-        .unwrap();
+        run_event_loop(&mut terminal, &mut app, &mut writer, &mut ctx).unwrap();
 
         assert_eq!(writer, b"hi\n");
     }
@@ -482,7 +714,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.push_output(b"salut");
+        app.push_lines("salut");
 
         terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
 

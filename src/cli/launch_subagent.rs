@@ -67,7 +67,7 @@ pub fn run(
 /// end to end (task/lock/log files really get written, to a tempdir; the
 /// "sub-agent" is a `pty::test_support::FakeSpawner`) without needing an
 /// installed agent CLI.
-fn run_at(
+pub(crate) fn run_at(
     home: &Path,
     spawner: &dyn Spawner,
     agent_cli: &str,

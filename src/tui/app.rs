@@ -1,5 +1,3 @@
-use crate::monitor::pty_listener::strip_ansi;
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Chat,
@@ -21,11 +19,12 @@ impl App {
         }
     }
 
-    /// Appends raw PTY output (ANSI stripped) as chat lines, one entry per
+    /// Appends already-decoded text as chat lines, one entry per
     /// `\n`-terminated line. A trailing partial line (no newline yet) is
     /// pushed as its own entry too — v1 doesn't merge it with later output.
-    pub fn push_output(&mut self, raw: &[u8]) {
-        let text = strip_ansi(raw);
+    /// Callers (the PM's render loop) are expected to have already
+    /// ANSI-stripped and subagent-launch-filtered the raw PTY bytes.
+    pub fn push_lines(&mut self, text: &str) {
         let mut parts = text.split('\n').peekable();
         while let Some(part) = parts.next() {
             let is_last = parts.peek().is_none();
@@ -55,20 +54,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn push_output_splits_into_lines() {
+    fn push_lines_splits_into_lines() {
         let mut app = App::new();
-        app.push_output(b"line one\nline two\n");
+        app.push_lines("line one\nline two\n");
         assert_eq!(
             app.chat_lines,
             vec!["line one".to_string(), "line two".to_string()]
         );
-    }
-
-    #[test]
-    fn push_output_strips_ansi_codes() {
-        let mut app = App::new();
-        app.push_output(b"\x1b[31mred text\x1b[0m\n");
-        assert_eq!(app.chat_lines, vec!["red text".to_string()]);
     }
 
     #[test]
@@ -82,17 +74,17 @@ mod tests {
     }
 
     #[test]
-    fn push_output_keeps_trailing_partial_line_without_newline() {
+    fn push_lines_keeps_trailing_partial_line_without_newline() {
         let mut app = App::new();
-        app.push_output(b"partial");
+        app.push_lines("partial");
         assert_eq!(app.chat_lines, vec!["partial".to_string()]);
     }
 
     #[test]
-    fn push_output_across_multiple_calls_appends_new_entries() {
+    fn push_lines_across_multiple_calls_appends_new_entries() {
         let mut app = App::new();
-        app.push_output(b"first");
-        app.push_output(b"second");
+        app.push_lines("first");
+        app.push_lines("second");
         assert_eq!(
             app.chat_lines,
             vec!["first".to_string(), "second".to_string()]
@@ -100,9 +92,9 @@ mod tests {
     }
 
     #[test]
-    fn push_output_ignores_empty_input() {
+    fn push_lines_ignores_empty_input() {
         let mut app = App::new();
-        app.push_output(b"");
+        app.push_lines("");
         assert!(app.chat_lines.is_empty());
     }
 
