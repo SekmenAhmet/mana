@@ -14,9 +14,9 @@ fn run_at(config_path: &std::path::Path, name: &str) -> anyhow::Result<()> {
     let mut config = load_config(config_path)?;
     if remove_agent(&mut config, name) {
         save_config(config_path, &config)?;
-        println!("{name}: retire de la configuration mana");
+        println!("{name}: removed from mana's configuration");
     } else {
-        println!("{name}: n'etait pas enregistre");
+        println!("{name}: was not registered");
     }
     Ok(())
 }

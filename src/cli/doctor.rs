@@ -65,7 +65,7 @@ fn apply_fix(config: &mut Config, issue: &DoctorIssue) -> bool {
 fn repair_suggestion(issue: &DoctorIssue) -> Option<String> {
     match issue {
         DoctorIssue::MissingBinary { agent, .. } => Some(format!(
-            "lancez 'mana install' pour re-enregistrer '{agent}', ou 'mana uninstall {agent}' pour le retirer de la configuration"
+            "run 'mana install' to re-register '{agent}', or 'mana uninstall {agent}' to remove it from the configuration"
         )),
         DoctorIssue::OutdatedVersion { .. } => None,
     }
@@ -81,7 +81,7 @@ fn run_at(config_path: &std::path::Path) -> anyhow::Result<()> {
     let issues = diagnose(&config);
     if issues.is_empty() {
         println!(
-            "mana doctor: tout est en ordre ({} agent(s) enregistre(s))",
+            "mana doctor: everything is in order ({} agent(s) registered)",
             config.models.len()
         );
         return Ok(());
@@ -97,10 +97,10 @@ fn run_at(config_path: &std::path::Path) -> anyhow::Result<()> {
             } => {
                 apply_fix(&mut config, issue);
                 config_changed = true;
-                println!("[{agent}] version mise a jour: {registered} -> {current}");
+                println!("[{agent}] version updated: {registered} -> {current}");
             }
             DoctorIssue::MissingBinary { agent, path } => {
-                println!("[{agent}] binaire introuvable: {path}");
+                println!("[{agent}] binary not found: {path}");
                 if let Some(suggestion) = repair_suggestion(issue) {
                     println!("  -> {suggestion}");
                 }

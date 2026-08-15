@@ -1,8 +1,8 @@
 pub(crate) fn describe_update_result(status: &self_update::Status) -> String {
     match status {
-        self_update::Status::UpToDate(version) => format!("mana est deja a jour ({version})"),
+        self_update::Status::UpToDate(version) => format!("mana is already up to date ({version})"),
         self_update::Status::Updated(version) => {
-            format!("mana mis a jour vers la version {version}")
+            format!("mana updated to version {version}")
         }
     }
 }
@@ -33,7 +33,7 @@ mod tests {
         let status = Status::UpToDate("0.1.0".to_string());
         assert_eq!(
             describe_update_result(&status),
-            "mana est deja a jour (0.1.0)"
+            "mana is already up to date (0.1.0)"
         );
     }
 
@@ -42,7 +42,7 @@ mod tests {
         let status = Status::Updated("0.2.0".to_string());
         assert_eq!(
             describe_update_result(&status),
-            "mana mis a jour vers la version 0.2.0"
+            "mana updated to version 0.2.0"
         );
     }
 }

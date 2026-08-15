@@ -27,11 +27,11 @@ fn main() -> anyhow::Result<()> {
                 let role = args
                     .role
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--role est requis avec --subagent"))?;
+                    .ok_or_else(|| anyhow::anyhow!("--role is required with --subagent"))?;
                 let assign = args
                     .assign
                     .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--assign est requis avec --subagent"))?;
+                    .ok_or_else(|| anyhow::anyhow!("--assign is required with --subagent"))?;
                 cli::launch_subagent::run(subagent_cli, role, assign, &args.params)?;
             } else if let Some(agent) = &args.agent {
                 cli::launch_pm::run(agent)?;

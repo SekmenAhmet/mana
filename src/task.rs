@@ -65,15 +65,15 @@ mod tests {
 
     const EXAMPLE: &str = r#"---
 id: f9e8d7c6-b5a4-3210-fedc-ba9876543210
-title: Implementer le endpoint d'authentification
+title: Implement the authentication endpoint
 role: executor
 depends-on:
   - a1b2c3d4-e5f6-7890-abcd-ef1234567890
 ---
 
-# Implementer le endpoint POST /auth/login
+# Implement the POST /auth/login endpoint
 
-Contenu du prompt.
+Prompt content.
 "#;
 
     #[test]
@@ -85,7 +85,7 @@ Contenu du prompt.
             task.frontmatter.depends_on,
             vec!["a1b2c3d4-e5f6-7890-abcd-ef1234567890"]
         );
-        assert!(task.body.starts_with("# Implementer"));
+        assert!(task.body.starts_with("# Implement"));
     }
 
     #[test]
@@ -107,11 +107,11 @@ Contenu du prompt.
         let task = Task {
             frontmatter: TaskFrontmatter {
                 id: "uuid-1".to_string(),
-                title: "Titre".to_string(),
+                title: "Title".to_string(),
                 role: Role::Executor,
                 depends_on: vec!["uuid-0".to_string()],
             },
-            body: "# Corps\n\nDetail.\n".to_string(),
+            body: "# Body\n\nDetail.\n".to_string(),
         };
         let rendered = render_task_file(&task);
         let parsed = parse_task_file(&rendered).unwrap();
@@ -125,7 +125,7 @@ Contenu du prompt.
         let task = Task {
             frontmatter: TaskFrontmatter {
                 id: "uuid-1".to_string(),
-                title: "Titre".to_string(),
+                title: "Title".to_string(),
                 role: Role::Reviewer,
                 depends_on: vec![],
             },

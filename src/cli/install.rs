@@ -19,8 +19,8 @@ fn default_selections(config: &Config) -> Vec<bool> {
 /// the interactive selector below so it's testable against a real,
 /// always-present binary.
 pub fn resolve_agent(name: &str) -> anyhow::Result<AgentConfig> {
-    let path = which::which(name)
-        .map_err(|_| anyhow::anyhow!("binaire '{name}' introuvable dans le PATH"))?;
+    let path =
+        which::which(name).map_err(|_| anyhow::anyhow!("binary '{name}' not found in PATH"))?;
     let version = capture_version_output(&path, VERSION_CHECK_TIMEOUT)?;
     Ok(AgentConfig {
         name: name.to_string(),

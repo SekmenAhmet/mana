@@ -39,9 +39,7 @@ pub fn ensure_agent_registered(config: &Config, agent_cli: &str) -> anyhow::Resu
     if config.models.contains_key(agent_cli) {
         Ok(())
     } else {
-        anyhow::bail!(
-            "agent '{agent_cli}' non enregistre. Lancez 'mana install' pour l'enregistrer."
-        )
+        anyhow::bail!("agent '{agent_cli}' not registered. Run 'mana install' to register it.")
     }
 }
 

@@ -8,7 +8,7 @@ pub mod uninstall;
 pub mod upgrade;
 
 #[derive(Parser)]
-#[command(name = "mana", about = "Orchestrateur d'agents IA de coding", version)]
+#[command(name = "mana", about = "AI coding-agent orchestrator", version)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Command,
@@ -16,21 +16,21 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Enregistrer un agent CLI
+    /// Register a CLI agent
     Install,
-    /// Retirer un agent CLI
+    /// Remove a CLI agent
     Uninstall { cli: String },
-    /// Lancer un agent en mode PM, ou un sous-agent avec --subagent
+    /// Launch an agent in PM mode, or a sub-agent with --subagent
     Launch(LaunchArgs),
-    /// Diagnostiquer la configuration
+    /// Diagnose the configuration
     Doctor,
-    /// Mettre a jour mana
+    /// Update mana
     Upgrade,
 }
 
 #[derive(Args)]
 pub struct LaunchArgs {
-    /// CLI agent a lancer en mode PM (ex: claude). Absent si --subagent est utilise.
+    /// CLI agent to launch in PM mode (e.g. claude). Absent if --subagent is used.
     pub agent: Option<String>,
 
     #[arg(long)]

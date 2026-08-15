@@ -22,7 +22,7 @@ impl FromStr for Role {
         match s {
             "executor" => Ok(Role::Executor),
             "reviewer" => Ok(Role::Reviewer),
-            other => anyhow::bail!("role inconnu: '{other}' (attendu: executor | reviewer)"),
+            other => anyhow::bail!("unknown role: '{other}' (expected: executor | reviewer)"),
         }
     }
 }
@@ -84,17 +84,14 @@ pub(crate) fn run_at(
 
     let task_path = paths.tasks.join(format!("{task_uuid}.md"));
     if !task_path.exists() {
-        anyhow::bail!("tache introuvable: {}", task_path.display());
+        anyhow::bail!("task not found: {}", task_path.display());
     }
     let task = read_task(&task_path)?;
 
     let lock = load_lock(&paths.lock_file)?;
     let unmet = unmet_dependencies(&lock, &paths.logs, &task.frontmatter.depends_on)?;
     if !unmet.is_empty() {
-        anyhow::bail!(
-            "dependances non satisfaites pour {task_uuid}: {}",
-            unmet.join(", ")
-        );
+        anyhow::bail!("unmet dependencies for {task_uuid}: {}", unmet.join(", "));
     }
 
     let config = load_config(&home.join("config.yaml"))?;
@@ -146,7 +143,7 @@ pub(crate) fn run_at(
     drop(fs_watcher);
     let _ = fs_logger_handle.join();
 
-    println!("sous-agent {agent_uuid} ({role_str}) termine pour la tache {task_uuid}");
+    println!("sub-agent {agent_uuid} ({role_str}) finished for task {task_uuid}");
     Ok(())
 }
 
@@ -163,11 +160,11 @@ mod tests {
         Task {
             frontmatter: TaskFrontmatter {
                 id: "task-1".to_string(),
-                title: "Titre de test".to_string(),
+                title: "Test title".to_string(),
                 role,
                 depends_on,
             },
-            body: "# Consigne\n\nFais le taf.\n".to_string(),
+            body: "# Instructions\n\nDo the work.\n".to_string(),
         }
     }
 
@@ -244,7 +241,7 @@ mod tests {
             Path::new("/tmp/reviews/task-1.md"),
         );
         assert!(prompt.contains("executor"));
-        assert!(prompt.contains("Fais le taf."));
+        assert!(prompt.contains("Do the work."));
     }
 
     #[test]
@@ -271,7 +268,7 @@ mod tests {
             "does-not-exist",
             &[],
         );
-        assert!(result.unwrap_err().to_string().contains("introuvable"));
+        assert!(result.unwrap_err().to_string().contains("not found"));
     }
 
     #[test]
@@ -306,7 +303,7 @@ mod tests {
             &[],
         );
         let message = result.unwrap_err().to_string();
-        assert!(message.contains("dependances non satisfaites"));
+        assert!(message.contains("unmet dependencies"));
         assert!(message.contains("missing-dep"));
     }
 
@@ -335,7 +332,7 @@ mod tests {
 
         let written = spawner.written.lock().unwrap();
         let sent = String::from_utf8_lossy(&written);
-        assert!(sent.contains("Fais le taf."));
+        assert!(sent.contains("Do the work."));
     }
 
     #[test]

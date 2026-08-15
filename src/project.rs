@@ -46,21 +46,21 @@ mod tests {
 
     #[test]
     fn project_name_from_dir_takes_basename() {
-        let dir = Path::new("/Users/ahmet/projects/mon-api");
-        assert_eq!(project_name_from_dir(dir), "mon-api");
+        let dir = Path::new("/Users/user/projects/my-api");
+        assert_eq!(project_name_from_dir(dir), "my-api");
     }
 
     #[test]
     fn resolve_project_paths_builds_expected_layout() {
         let home = PathBuf::from("/tmp/fake-mana-home");
-        let paths = resolve_project_paths(&home, "mon-api");
-        assert_eq!(paths.root, home.join("projects/mon-api"));
-        assert_eq!(paths.tasks, home.join("projects/mon-api/tasks"));
-        assert_eq!(paths.logs, home.join("projects/mon-api/logs"));
-        assert_eq!(paths.reviews, home.join("projects/mon-api/reviews"));
+        let paths = resolve_project_paths(&home, "my-api");
+        assert_eq!(paths.root, home.join("projects/my-api"));
+        assert_eq!(paths.tasks, home.join("projects/my-api/tasks"));
+        assert_eq!(paths.logs, home.join("projects/my-api/logs"));
+        assert_eq!(paths.reviews, home.join("projects/my-api/reviews"));
         assert_eq!(
             paths.lock_file,
-            home.join("projects/mon-api/subagent-lock.yaml")
+            home.join("projects/my-api/subagent-lock.yaml")
         );
     }
 

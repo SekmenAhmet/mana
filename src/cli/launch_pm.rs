@@ -126,7 +126,7 @@ impl SubagentLauncher for RealSubagentLauncher {
                 &req.assign,
                 &req.params,
             ) {
-                eprintln!("[mana] echec du lancement du sous-agent: {err}");
+                eprintln!("[mana] failed to launch sub-agent: {err}");
             }
         });
     }
@@ -143,7 +143,7 @@ pub fn build_notification(event_path: &Path, reviews_dir: &Path) -> Option<Strin
     }
     let task_uuid = event_path.file_stem()?.to_string_lossy().to_string();
     Some(format!(
-        "[mana] Review disponible pour {task_uuid} : {}",
+        "[mana] Review available for {task_uuid}: {}",
         event_path.display()
     ))
 }
@@ -295,7 +295,7 @@ fn apply_app_event(event: AppEvent, app: &mut App, writer: &mut dyn Write) -> an
         AppEvent::Enter => {
             let message = std::mem::take(&mut app.input);
             if message.trim() == "/graph" {
-                // Local UI command, per TUI.md ("/graph ou Ctrl+G") — toggled
+                // Local UI command, per TUI.md ("/graph or Ctrl+G") — toggled
                 // here instead of being sent to the PM, which would just see
                 // an unexplained "/graph" chat message.
                 app.toggle_graph();
@@ -422,12 +422,12 @@ mod tests {
     #[test]
     fn intercept_subagent_launches_strips_invocation_from_display_text() {
         let text =
-            "avant Bash(mana launch --subagent claude --role executor --assign task-1) apres";
+            "before Bash(mana launch --subagent claude --role executor --assign task-1) after";
         let (display, requests) = intercept_subagent_launches(text);
         assert_eq!(requests.len(), 1);
         assert!(!display.contains("mana launch --subagent"));
-        assert!(display.contains("avant"));
-        assert!(display.contains("apres"));
+        assert!(display.contains("before"));
+        assert!(display.contains("after"));
     }
 
     #[test]
@@ -444,7 +444,7 @@ mod tests {
         let event_path = reviews_dir.join("task-1.md");
         let message = build_notification(&event_path, reviews_dir).unwrap();
         assert!(message.contains("task-1"));
-        assert!(message.contains("Review disponible"));
+        assert!(message.contains("Review available"));
     }
 
     #[test]
@@ -610,7 +610,7 @@ mod tests {
 
         let sent = String::from_utf8_lossy(&writer);
         assert!(sent.contains("task-1"));
-        assert!(sent.contains("Review disponible"));
+        assert!(sent.contains("Review available"));
     }
 
     #[test]
@@ -752,7 +752,7 @@ mod tests {
         let backend = TestBackend::new(40, 10);
         let mut terminal = Terminal::new(backend).unwrap();
         let mut app = App::new();
-        app.push_lines("salut");
+        app.push_lines("hello");
 
         terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
 
@@ -768,7 +768,7 @@ mod tests {
                 });
         assert!(content.contains("Chat"));
         assert!(content.contains("Input"));
-        assert!(content.contains("salut"));
+        assert!(content.contains("hello"));
     }
 
     #[test]

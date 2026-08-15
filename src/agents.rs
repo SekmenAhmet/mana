@@ -15,7 +15,7 @@ pub fn autonomous_flag(cli_name: &str) -> anyhow::Result<&'static str> {
     match cli_name {
         "claude" => Ok("--dangerously-skip-permissions"),
         other => anyhow::bail!(
-            "role sous-agent non supporte pour '{other}' pour l'instant (seul 'claude' est supporte en v1)"
+            "sub-agent role not supported for '{other}' yet (only 'claude' is supported in v1)"
         ),
     }
 }
@@ -36,6 +36,6 @@ mod tests {
     fn unknown_cli_errors_clearly() {
         let err = autonomous_flag("codex").unwrap_err();
         assert!(err.to_string().contains("codex"));
-        assert!(err.to_string().contains("non supporte"));
+        assert!(err.to_string().contains("not supported"));
     }
 }
