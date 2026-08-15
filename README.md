@@ -30,11 +30,12 @@ branch.
 - [Trust model](#trust-model)
 - [Status and roadmap](#status-and-roadmap)
 
-<!-- screen: chat-pane -->
+![The chat pane mid-session](docs/assets/chat-pane.png)
 
-*The chat pane mid-session: the PM's plan, what you typed, and mana's own
-dispatch notices. Everything else — reasoning, tool activity, a CLI's stderr —
-is collapsed to one dim counted line instead of cluttering the conversation.*
+*A real session, uncut: the user asks for a file, the PM creates the task and
+dispatches a claude/haiku executor, the reviewer validates — and everything
+else the session produced (reasoning, tool activity, a CLI's stderr) is
+collapsed into one dim counted line instead of cluttering the conversation.*
 
 ## How it works
 
@@ -203,11 +204,12 @@ Type and press `Enter` to talk to the PM. In the TUI:
 themselves, and forwarding it was a v1 mistake that killed the whole PM
 session when a user only meant to interrupt one runaway answer.
 
-<!-- screen: graph-pane -->
+![The graph pane](docs/assets/graph-pane.png)
 
 *The graph pane (Ctrl+G): one node per dispatched sub-agent, labeled with its
-role, CLI/model and task, showing whether it is still running or finished —
-and, once reviewed, whether it was validated or rejected.*
+role, CLI/model and task — and, once reviewed, its verdict. This session was
+resumed with `mana launch opencode -c`: the conversation and the graph both
+came back.*
 
 The chat pane shows only what the PM said, what you typed, and mana's own
 notices. Everything else a session produces — reasoning, tool activity, a

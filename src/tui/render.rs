@@ -26,6 +26,7 @@
 use super::app::{App, AppMode, ChatLine, PendingPermission, Source};
 use super::graph::{BLINK_INTERVAL, GraphNode, is_blink_visible, node_body, verdict_symbol};
 use super::theme;
+use crate::review::Decision;
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::Style;
@@ -259,14 +260,19 @@ fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
     } else {
         nodes
             .iter()
-            // Two spans, because the verdict is the one glyph in mana that
-            // must not be themed: ✅ and ❌ answer "did it work?" without a
-            // legend, and a violet tick would make that answer a brand
-            // decision.
+            // Two spans, because the verdict wears the one pair of semantic
+            // colours in the interface: green for pass, rose for fail,
+            // readable without a legend -- and never violet, so "did it
+            // work?" is not answered by the brand.
             .map(|node| {
+                let verdict_style = match node.verdict {
+                    Some(Decision::Validated) => theme::VERDICT_OK,
+                    Some(Decision::Rejected) => theme::VERDICT_FAIL,
+                    None => theme::GRAPH_NODE,
+                };
                 Line::from(vec![
                     Span::styled(node_body(node, blink), theme::GRAPH_NODE),
-                    Span::styled(verdict_symbol(&node.verdict), theme::VERDICT),
+                    Span::styled(verdict_symbol(&node.verdict), verdict_style),
                 ])
             })
             .collect()
@@ -695,7 +701,7 @@ mod tests {
         let rendered = dump(&screen(&app, &nodes, 100, 12));
         assert!(rendered.contains("Graph"), "{rendered}");
         assert!(
-            rendered.contains("[EXE] claude/haiku 3f2a1b6c ✅"),
+            rendered.contains("[EXE] claude/haiku 3f2a1b6c ✓"),
             "{rendered}"
         );
         assert!(
@@ -789,15 +795,23 @@ mod tests {
     /// ❌ mean pass and fail without a legend, and a branded tick would turn
     /// the answer into a decoration.
     #[test]
-    fn the_graph_is_themed_but_its_verdict_glyphs_are_left_alone() {
+    fn the_graph_is_themed_but_its_verdicts_wear_semantic_colours() {
         let mut app = App::new("Claude Code");
         app.toggle_graph();
-        let nodes = [node(
-            Role::Executor,
-            "3f2a1b6c",
-            Some(Status::Done),
-            Some(Decision::Validated),
-        )];
+        let nodes = [
+            node(
+                Role::Executor,
+                "3f2a1b6c",
+                Some(Status::Done),
+                Some(Decision::Validated),
+            ),
+            node(
+                Role::Reviewer,
+                "9c0d1e2f",
+                Some(Status::Done),
+                Some(Decision::Rejected),
+            ),
+        ];
         let (width, height) = (100, 12);
         let buffer = buffer(&app, &nodes, width, height);
 
@@ -810,8 +824,12 @@ mod tests {
             Some(theme::GRAPH_NODE.fg.unwrap())
         );
         assert_eq!(
-            style_of(&buffer, width, height, "✅").fg,
-            Some(theme::TERMINAL_DEFAULT)
+            style_of(&buffer, width, height, "✓").fg,
+            theme::VERDICT_OK.fg
+        );
+        assert_eq!(
+            style_of(&buffer, width, height, "✗").fg,
+            theme::VERDICT_FAIL.fg
         );
     }
 

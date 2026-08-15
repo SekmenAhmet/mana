@@ -163,12 +163,13 @@ pub const GRAPH_NODE: Style = Style::new().fg(LAVENDER);
 /// A graph pane with nothing in it yet.
 pub const GRAPH_EMPTY: Style = Style::new().fg(PLUM);
 
-/// The ✅/❌ a reviewer's verdict puts on a node: left unstyled on purpose.
-/// They are the only semantic colour in the interface -- pass and fail, green
-/// and red, understood without a legend -- and they are emoji, which carry
-/// their own colour. Tinting them violet would make the answer to "did it
-/// work?" a matter of brand.
-pub const VERDICT: Style = Style::new().fg(TERMINAL_DEFAULT);
+/// The ✓/✗ a reviewer's verdict puts on a node: the only semantic colours in
+/// the interface -- pass and fail, green and red, understood without a
+/// legend. Pastel like everything else (108 is the green sibling of the
+/// violet family, 174 the rose one), but never violet: the answer to "did it
+/// work?" must not be a matter of brand.
+pub const VERDICT_OK: Style = Style::new().fg(Color::Indexed(108));
+pub const VERDICT_FAIL: Style = Style::new().fg(Color::Indexed(174));
 
 #[cfg(test)]
 mod tests {
@@ -207,8 +208,20 @@ mod tests {
     fn the_text_the_user_reads_and_writes_keeps_the_terminals_own_foreground() {
         assert_eq!(PM_TEXT.fg, Some(TERMINAL_DEFAULT));
         assert_eq!(INPUT_TEXT.fg, Some(TERMINAL_DEFAULT));
-        assert_eq!(VERDICT.fg, Some(TERMINAL_DEFAULT));
         assert!(!matches!(TERMINAL_DEFAULT, Color::Indexed(_)));
+    }
+
+    /// Pass and fail are the interface's only semantic colours: green and
+    /// rose, pastel like the family, and never violet -- if either drifted
+    /// into the brand's colour, "did it work?" would lose its answer.
+    #[test]
+    fn the_verdict_colours_are_semantic_not_brand() {
+        assert_eq!(VERDICT_OK.fg, Some(Color::Indexed(108)));
+        assert_eq!(VERDICT_FAIL.fg, Some(Color::Indexed(174)));
+        for violet in [MANA, GLOW, LAVENDER, PLUM, MIST, SHADOW, DUSK] {
+            assert_ne!(VERDICT_OK.fg, Some(violet));
+            assert_ne!(VERDICT_FAIL.fg, Some(violet));
+        }
     }
 
     /// The warning colour has to survive a redesign of the violet family: if

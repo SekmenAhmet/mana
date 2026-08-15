@@ -126,9 +126,9 @@ pub fn build_nodes(registry: &Registry, logs_dir: &Path, reviews_dir: &Path) -> 
 /// it ran, which task.
 ///
 /// The verdict is formatted separately ([`verdict_symbol`]) because the two
-/// halves are coloured apart: the body is mana's own lavender, while the ✅/❌
-/// keep the only semantic colour in the interface and reach the terminal
-/// untouched (`theme::VERDICT`).
+/// halves are coloured apart: the body is mana's own lavender, while the ✓/✗
+/// wear the interface's only semantic colours (`theme::VERDICT_OK` /
+/// `theme::VERDICT_FAIL`).
 pub fn node_body(node: &GraphNode, blink_visible: bool) -> String {
     format!(
         "{} [{}] {}/{} {}",
@@ -161,9 +161,13 @@ pub fn status_symbol(status: &Option<Status>, blink_visible: bool) -> &'static s
 /// Nothing at all until a reviewer has spoken: an empty column is honest,
 /// whereas a placeholder glyph reads as a verdict of its own.
 pub fn verdict_symbol(verdict: &Option<Decision>) -> &'static str {
+    // Text-presentation glyphs, not the ✅/❌ emoji: emoji are double-width
+    // (a latent column-math hazard in any TUI) and missing from plenty of
+    // monospace fonts -- the README screenshots rendered them as tofu. The
+    // pass/fail colour they used to carry moved into the theme instead.
     match verdict {
-        Some(Decision::Validated) => " \u{2705}", // ✅
-        Some(Decision::Rejected) => " \u{274c}",  // ❌
+        Some(Decision::Validated) => " \u{2713}", // ✓
+        Some(Decision::Rejected) => " \u{2717}",  // ✗
         None => "",
     }
 }
@@ -282,8 +286,8 @@ mod tests {
         let node = &build_nodes(&registry, &paths.logs, &paths.reviews)[0];
         assert_eq!(node.verdict, Some(Decision::Rejected));
         // Formatted apart from the body, and rendered as its own span, so the
-        // cross keeps its own colour instead of taking the pane's.
-        assert_eq!(verdict_symbol(&node.verdict), " \u{274c}");
+        // cross wears its own semantic colour instead of the pane's.
+        assert_eq!(verdict_symbol(&node.verdict), " \u{2717}");
     }
 
     #[test]
