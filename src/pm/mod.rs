@@ -3,7 +3,8 @@
 //!
 //! Three transports are in the design (§4) -- `stream`, `acp`,
 //! `oneshot-continue` -- and the catalogue's `[pm].driver` field says which one
-//! a CLI needs. `stream` and `acp` exist; `oneshot-continue` lands with 3.2.
+//! a CLI needs. All three exist; between them they cover every agent CLI the
+//! catalogue has met, which is what makes a new CLI a data change.
 //!
 //! The shape here is a trait plus one factory, rather than an enum the callers
 //! match on. Both dispatch fine; the difference is where the knowledge sits. An
@@ -36,9 +37,11 @@
 mod acp;
 mod child;
 mod events;
+mod oneshot;
 mod stream;
 
 pub use acp::AcpDriver;
+pub use oneshot::OneshotDriver;
 pub use stream::StreamDriver;
 
 use crate::catalog::{CliEntry, PmDriver};
@@ -141,12 +144,7 @@ pub fn start(entry: &CliEntry, extra_args: &[String]) -> Result<Box<dyn PmTransp
     match entry.pm.driver {
         PmDriver::Acp => Ok(Box::new(AcpDriver::start(entry, extra_args)?)),
         PmDriver::Stream => Ok(Box::new(StreamDriver::start(entry, extra_args)?)),
-        // Not a gap in the catalogue but a transport mana cannot speak yet.
-        // Naming the task keeps the message useful to whoever hits it.
-        PmDriver::OneshotContinue => bail!(
-            "{}: [pm].driver is 'oneshot-continue', which mana cannot speak yet (mana v2, task 3.2)",
-            entry.cli.id
-        ),
+        PmDriver::OneshotContinue => Ok(Box::new(OneshotDriver::start(entry, extra_args)?)),
     }
 }
 
@@ -187,18 +185,17 @@ mod tests {
         }
     }
 
+    /// The factory reaches every driver in the set, and each one then fails on
+    /// its own terms (there is no such binary) rather than on the driver being
+    /// unknown. With 3.2 the set is closed: no `[pm].driver` value the
+    /// catalogue accepts is left without a transport.
     #[test]
-    fn an_unimplemented_driver_says_so_and_names_the_task() {
-        let rendered = start_err(&entry_with("oneshot-continue"));
-        assert!(rendered.contains("oneshot-continue"), "{rendered}");
-        assert!(rendered.contains("3.2"), "{rendered}");
-    }
-
-    /// The factory reaches each implemented driver, which then fails on its own
-    /// terms (there is no such binary) rather than on the driver being unknown.
-    #[test]
-    fn an_implemented_driver_is_reached_and_fails_on_its_own_terms() {
-        for entry in [entry_with("stream"), acp_entry()] {
+    fn every_driver_is_reached_and_fails_on_its_own_terms() {
+        for entry in [
+            entry_with("stream"),
+            entry_with("oneshot-continue"),
+            acp_entry(),
+        ] {
             let rendered = start_err(&entry);
             assert!(rendered.contains("no-such-binary"), "{rendered}");
         }

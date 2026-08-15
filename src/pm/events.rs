@@ -329,6 +329,20 @@ mod golden {
     /// "reply with exactly: GOLDEN".
     const SINGLE_TURN: &str = include_str!("../../catalog/goldens/claude/single-turn.jsonl");
 
+    /// Four turns of a real `mana launch agy` session (2026-08-15,
+    /// gemini-3.7-flash-low, the oneshot-continue driver): the PM called
+    /// `list_agents`, then `create_task`, both over the sentinel channel, and
+    /// mana wrote the task file the last turn names. Four processes, one
+    /// conversation -- which is why there are four `init` frames.
+    const AGY_SESSION: &str = include_str!("../../catalog/goldens/agy/sentinel-turn.jsonl");
+
+    /// The same session shape, from the run *before* the role text was
+    /// inlined: the PM guessed the format (a bare `list_agents` in the fence),
+    /// mana answered with one corrective message, and the next turn was
+    /// well-formed -- pretty-printed across five lines, which is the shape the
+    /// scanner has to survive.
+    const AGY_MALFORMED: &str = include_str!("../../catalog/goldens/agy/malformed-block.jsonl");
+
     fn replay(cli: &str, transcript: &str) -> Vec<Vec<PmEvent>> {
         let catalog = Catalog::embedded().unwrap();
         let map = EventMap::for_entry(catalog.get(cli).expect("catalogue entry")).unwrap();
@@ -377,5 +391,112 @@ mod golden {
                 index + 1
             );
         }
+    }
+
+    /// agy's shipped paths against agy's real stream. Both were wrong until
+    /// this transcript was recorded (they had been copied from claude's entry
+    /// and matched nothing), which is exactly what a golden is for.
+    #[test]
+    fn agy_replays_to_one_whole_answer_and_one_usage_per_turn() {
+        let events = replay("agy", AGY_SESSION);
+        let texts: Vec<&PmEvent> = events
+            .iter()
+            .flatten()
+            .filter(|event| matches!(event, PmEvent::Text(_)))
+            .collect();
+        // Four turns, four processes, four answers -- and each arrives whole,
+        // once, rather than as the dozens of `text_delta` chunks the same
+        // stream also carries.
+        assert_eq!(texts.len(), 4, "{texts:?}");
+        let PmEvent::Text(first) = texts[0] else {
+            unreachable!("filtered above")
+        };
+        assert!(
+            first.starts_with("```mana\n{\"tool\": \"list_agents\""),
+            "{first}"
+        );
+
+        let usage: Vec<&PmEvent> = events
+            .iter()
+            .flatten()
+            .filter(|event| matches!(event, PmEvent::Usage(_)))
+            .collect();
+        assert_eq!(usage.len(), 4);
+        let PmEvent::Usage(last) = usage[3] else {
+            unreachable!("filtered above")
+        };
+        // Cumulative over the conversation, not per turn: agy reports the
+        // session total on every result frame (turn 1 alone was 18,245).
+        assert_eq!(last["total_tokens"], 34765);
+
+        // Everything else is framing -- init banners and step updates -- and
+        // shows as raw lines rather than disappearing.
+        let raw = events
+            .iter()
+            .flatten()
+            .filter(|event| matches!(event, PmEvent::Raw(_)))
+            .count();
+        assert_eq!(
+            raw + texts.len() + usage.len(),
+            events.iter().flatten().count()
+        );
+        assert_eq!(raw, AGY_SESSION.lines().count() - 4);
+    }
+
+    /// The whole channel, replayed: a recorded agy line, through the shipped
+    /// event map, into the sentinel, out as an executed tool call. Nothing in
+    /// this path is a test double except the project directory.
+    #[test]
+    fn a_recorded_agy_turn_executes_its_block_through_the_sentinel() {
+        use crate::sentinel::Sentinel;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let sentinel = Sentinel::new(
+            tmp.path(),
+            tmp.path(),
+            Catalog::embedded().expect("the shipped catalogue must parse"),
+        );
+        let answers = |transcript| {
+            replay("agy", transcript)
+                .into_iter()
+                .flatten()
+                .filter_map(|event| match event {
+                    PmEvent::Text(text) => Some(text),
+                    _ => None,
+                })
+                .collect::<Vec<String>>()
+        };
+
+        // The first turn of the working run: a call, and a sentence of prose
+        // that the operator sees without the block in the middle of it.
+        let outcome = sentinel.handle(&answers(AGY_SESSION)[0]);
+        assert_eq!(outcome.log, ["[mana] tool: list_agents -> ok"]);
+        assert!(
+            outcome
+                .prose
+                .starts_with("I am ready to act as your mana PM")
+        );
+        assert!(
+            outcome
+                .reply
+                .unwrap()
+                .contains("1. list_agents ok: {\"agents\":[")
+        );
+
+        // The run before the role text was inlined: the PM guessed, and got
+        // one corrective message naming what was wrong...
+        let guessed = answers(AGY_MALFORMED);
+        let corrected = sentinel.handle(&guessed[1]).reply.unwrap();
+        assert!(corrected.contains("not valid JSON"), "{corrected}");
+        assert!(
+            corrected.contains("One call per ```mana block"),
+            "{corrected}"
+        );
+
+        // ...after which the very next turn was well-formed, across five
+        // lines, and ran.
+        let outcome = sentinel.handle(&guessed[2]);
+        assert_eq!(outcome.log, ["[mana] tool: list_agents -> ok"]);
+        assert_eq!(outcome.prose, "");
     }
 }

@@ -9,15 +9,18 @@
 //!    so the role text can never drift from the code that serves its tools
 //!    (design §6). SKILL.md is the one role format ~40 tools already read;
 //!    `--append-system-prompt` exists on one CLI in five.
-//! 3. **Write the MCP config.** mana registers itself by `current_exe()`, so
-//!    `mana` does not have to be on `$PATH` -- one of v1's three launch
-//!    blockers. The flag that points the CLI at the file is an argv template
-//!    in the catalogue, not a branch here.
+//! 3. **Wire the tool channel.** For `mcp`, write the config and pass the
+//!    catalogue's flag: mana registers itself by `current_exe()`, so `mana`
+//!    does not have to be on `$PATH` -- one of v1's three launch blockers. For
+//!    `sentinel`, there is nothing to attach and mana instead reads the PM's
+//!    own fenced blocks out of the event stream (`crate::sentinel`).
 //! 4. **Start the driver and send one activation line.** The skill does the
-//!    teaching; the launch message only says which skill to load.
-//! 5. **Run the loop.** PM events in, chat pane out; `notifications.jsonl`
-//!    tailed and each finished dispatch injected as a user turn, which is how
-//!    the PM learns an executor finished without polling for it.
+//!    teaching; the launch message says where that skill is, and adds only
+//!    what the CLI cannot find out for itself.
+//! 5. **Run the loop.** PM events in, chat pane out; every message the PM
+//!    sends passes the tool channel first; `notifications.jsonl` tailed and
+//!    each finished dispatch injected as a user turn, which is how the PM
+//!    learns an executor finished without polling for it.
 //! 6. **Shut down.** Ctrl+C or a dead PM both end the session and reap the
 //!    process -- v1 could do neither.
 //!
@@ -32,6 +35,7 @@ use crate::pm::{self, PmEvent, PmTransport};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
+use crate::sentinel::Sentinel;
 use crate::task::Role;
 use crate::tui::app::{App, Source};
 use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, map_key_event};
@@ -56,7 +60,27 @@ const PM_SKILL: &str = include_str!("../../assets/roles/pm/SKILL.md");
 /// The whole of what mana says at launch. Everything else the PM needs to
 /// know is in the skill and in the tool schemas -- a long activation message
 /// would be a second copy of both, free to disagree with them.
-const ACTIVATION: &str = "You are the mana PM for this session. Load and follow the mana-pm skill.";
+///
+/// It ends with the skill's absolute path, and that is not decoration.
+/// Measured on agy (2026-08-15): told only to "load the mana-pm skill", the PM
+/// spent its whole first turn hunting for it -- a `grep_search` under the CLI's
+/// own config directory (refused by that CLI's protection rules) and a `find ~`
+/// (refused by its permission policy) -- and then answered nothing at all.
+/// Design §6 has mana write that file; withholding where it wrote it made role
+/// injection depend on each CLI's skill discovery, which is exactly the kind of
+/// per-CLI behaviour the catalogue is supposed to absorb.
+const ACTIVATION: &str = "You are the mana PM for this session. Load and follow the mana-pm skill";
+
+/// The one thing a sentinel PM cannot work out for itself.
+///
+/// An MCP PM discovers its tools from the protocol; on a CLI with no MCP
+/// surface there is no list to inspect, so the alternative has to be stated.
+/// Left out of the skill's own wording because the skill ships to every CLI
+/// and only some of them are on this channel -- and a PM that read "use fenced
+/// blocks" while holding real tools would call everything twice.
+const SENTINEL_ACTIVATION: &str = " This CLI cannot host mana's tools, so call \
+    them the other way the skill describes: one fenced ```mana block per call. \
+    mana executes those blocks and sends you the results.";
 
 /// Directory name the skill is installed under, inside the CLI's skills dir.
 const SKILL_NAME: &str = "mana-pm";
@@ -152,6 +176,10 @@ struct Session {
     /// "mana rewrote a file in your config directory" should not be silent.
     skill_path: PathBuf,
     notifications: NotificationTail,
+    /// `Some` only for `[tools].channel = "sentinel"`. An MCP CLI reaches the
+    /// same four tools over its own protocol, and scanning its prose for
+    /// fenced blocks would be a second way in that nothing asked for.
+    sentinel: Option<Sentinel>,
 }
 
 impl Session {
@@ -185,9 +213,50 @@ impl Session {
         Ok(sent)
     }
 
+    /// The tool channel's half of one PM message.
+    ///
+    /// Nothing at all on an MCP CLI, where tool calls never travel through
+    /// prose. On a sentinel CLI: execute every fenced block the message
+    /// carried and inject the results as the next user turn, which is how the
+    /// PM learns what its own call returned.
+    fn apply_tools(&mut self, text: &str) -> ToolPass {
+        // The borrow of `sentinel` ends with this match, which is what leaves
+        // `self.pm` free to take the reply turn below.
+        let outcome = match &self.sentinel {
+            Some(sentinel) => sentinel.handle(text),
+            None => return ToolPass::default(),
+        };
+        let mut log = outcome.log;
+        if let Some(reply) = outcome.reply
+            && let Err(error) = self.pm.send_user(&reply)
+        {
+            // Almost always a PM that just died. Reported where the operator
+            // is looking rather than propagated: the `Exited` event ends the
+            // session a tick later with a better message than this one.
+            log.push(format!(
+                "[mana] the tool results never reached the PM: {error:#}"
+            ));
+        }
+        ToolPass {
+            prose: Some(outcome.prose),
+            log,
+        }
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         self.pm.shutdown()
     }
+}
+
+/// What the tool channel made of one PM message.
+#[derive(Default)]
+struct ToolPass {
+    /// What the chat pane should show instead of the raw message: the PM's
+    /// words with the machinery taken out. `None` when this CLI has no
+    /// sentinel channel and the message is the PM's words already.
+    prose: Option<String>,
+    /// One compact line per tool call, in mana's voice.
+    log: Vec<String>,
 }
 
 /// Resolves the CLI, installs the skill, wires the tool channel and starts the
@@ -206,9 +275,16 @@ fn prepare_session(home: &Path, project_root: &Path, agent_cli: &str) -> Result<
 
     let skill_path = install_pm_skill(entry, dirs::home_dir().as_deref())?;
     let extra_args = tool_channel_args(entry, &paths, project_root)?;
+    // Built before the CLI starts, so a PM that emits a block in its very
+    // first answer finds mana already listening.
+    let sentinel = match entry.tools.channel {
+        ToolChannel::Mcp => None,
+        ToolChannel::Sentinel => Some(Sentinel::new(project_root, home, catalog.clone())),
+    };
 
+    let activation = activation(entry, &skill_path);
     let mut pm = pm::start(entry, &extra_args)?;
-    pm.send_user(ACTIVATION)
+    pm.send_user(&activation)
         .context("sending the activation message to the PM")?;
 
     Ok(Session {
@@ -216,8 +292,27 @@ fn prepare_session(home: &Path, project_root: &Path, agent_cli: &str) -> Result<
         cli_name: entry.cli.name.clone(),
         skill_path,
         notifications: NotificationTail::new(notifications_path(&paths)),
+        sentinel,
         paths,
     })
+}
+
+/// The one turn mana writes itself: who the PM is, where its role text is, and
+/// -- where the CLI cannot host mana's tools -- how to call them anyway.
+fn activation(entry: &CliEntry, skill_path: &Path) -> String {
+    let mut message = format!("{ACTIVATION}, installed at {}.", skill_path.display());
+    if entry.tools.channel == ToolChannel::Sentinel {
+        message.push_str(SENTINEL_ACTIVATION);
+    }
+    // The last resort, for a CLI that can neither discover the file nor be
+    // allowed to read it (`[skills].inline_in_activation`, agy). Appended
+    // rather than replacing the path so the two never disagree about which
+    // text is the role.
+    if entry.skills.inline_in_activation {
+        message.push_str("\n\nThat file is not readable from this CLI, so here it is in full:\n\n");
+        message.push_str(PM_SKILL);
+    }
+    message
 }
 
 /// Writes the PM skill where this CLI will read it, and returns the path.
@@ -275,9 +370,8 @@ fn tool_channel_args(
             );
         }
         // Nothing to attach: the PM emits fenced blocks and mana parses them
-        // out of the same event stream. No shipped entry reaches this arm --
-        // agy's driver is refused earlier -- and the parser that executes
-        // those blocks lands with it (mana v2, task 3.2).
+        // out of the same event stream (`crate::sentinel`), so there is no
+        // server to register and no flag to pass.
         ToolChannel::Sentinel => {}
     }
     // Empty for a CLI with no equivalent flag, which is why this is data:
@@ -436,7 +530,26 @@ fn run_loop<B: Backend>(
     loop {
         let now = Instant::now();
         let mut ended = None;
+        let mut tools_ran = false;
         for event in session.drain() {
+            // Everything the PM says passes the tool channel first: on a
+            // sentinel CLI its fenced blocks are calls to execute, and what
+            // remains is the half worth rendering as conversation.
+            if let PmEvent::Text(text) = &event {
+                let pass = session.apply_tools(text);
+                tools_ran |= !pass.log.is_empty();
+                match pass.prose {
+                    Some(prose) if prose.trim().is_empty() => {}
+                    // A message that was nothing but blocks renders as its
+                    // tool lines alone, rather than as an empty PM turn.
+                    Some(prose) => app.apply(&PmEvent::Text(prose)),
+                    None => app.apply(&event),
+                }
+                for line in pass.log {
+                    app.push(Source::Mana, &line);
+                }
+                continue;
+            }
             app.apply(&event);
             if let PmEvent::Exited { code } = event {
                 ended = Some(code);
@@ -460,7 +573,9 @@ fn run_loop<B: Backend>(
                 Vec::new()
             }
         };
-        let changed = !finished.is_empty();
+        // A tool call is the other thing that certainly changed the graph: a
+        // sentinel `create_task` wrote a task file this very tick.
+        let changed = !finished.is_empty() || tools_ran;
         for message in finished {
             app.push(Source::Mana, &message);
         }
@@ -671,6 +786,41 @@ url = "https://example.invalid/fixture"
         let rendered = format!("{error:#}");
         assert!(rendered.contains("[skills].dirs"), "{rendered}");
         assert!(rendered.contains("fixture"), "{rendered}");
+    }
+
+    /// The activation is where a CLI learns everything mana will not repeat:
+    /// where the role is, and -- for the CLIs that need it -- what it says.
+    #[test]
+    fn the_activation_names_the_skill_and_inlines_it_only_when_asked_to() {
+        let skill = Path::new("/home/x/.agents/skills/mana-pm/SKILL.md");
+        let mut entry = entry(&["~/.agents/skills"]);
+
+        let plain = activation(&entry, skill);
+        assert!(plain.starts_with(ACTIVATION), "{plain}");
+        assert!(plain.contains(skill.to_str().unwrap()), "{plain}");
+        assert!(
+            !plain.contains(PM_SKILL),
+            "the role text was sent uninvited"
+        );
+        // An MCP CLI discovers its tools from the protocol and is told nothing
+        // about fenced blocks -- it holds real ones.
+        assert!(!plain.contains("```mana"), "{plain}");
+
+        // A CLI that cannot read the file gets the text itself, once, at the
+        // start of the session.
+        entry.skills.inline_in_activation = true;
+        let inlined = activation(&entry, skill);
+        assert!(inlined.contains(PM_SKILL), "the role text never arrived");
+        assert!(inlined.contains(skill.to_str().unwrap()), "{inlined}");
+    }
+
+    #[test]
+    fn a_sentinel_cli_is_told_how_to_call_the_tools_it_cannot_host() {
+        let mut entry =
+            parse_entry(&entry_source("fixture-cli", &["/nowhere"], "", "sentinel")).unwrap();
+        entry.skills.inline_in_activation = false;
+        let message = activation(&entry, Path::new("/tmp/SKILL.md"));
+        assert!(message.contains("fenced ```mana block"), "{message}");
     }
 
     #[test]
@@ -1020,11 +1170,15 @@ mod smoke {
         /// building a `Catalog` by hand, so the test exercises the code a user
         /// with a broken CLI would.
         fn write_override(&self, bin: &str) {
+            self.write_override_on(bin, "mcp");
+        }
+
+        fn write_override_on(&self, bin: &str, channel: &str) {
             let source = super::tests::entry_source(
                 bin,
                 &[self.skills.to_str().unwrap()],
                 r#"permission_args = ["--allowedTools", "mcp__mana__*"]"#,
-                "mcp",
+                channel,
             );
             std::fs::write(self.home.join(CATALOG_OVERRIDE), source).unwrap();
         }
@@ -1092,7 +1246,12 @@ mod smoke {
         let frame: serde_json::Value =
             serde_json::from_str(received.lines().next().unwrap()).unwrap();
         assert_eq!(frame["type"], "user");
-        assert_eq!(frame["message"]["content"], ACTIVATION);
+        // The path is the operative half: a CLI that does not discover skills
+        // on its own can still read the file mana just wrote.
+        assert_eq!(
+            frame["message"]["content"],
+            format!("{ACTIVATION}, installed at {}.", skill.display())
+        );
 
         // ...and the PM's answer came back as chat text, not as raw noise.
         let mut app = App::new(&session.cli_name);
@@ -1129,6 +1288,91 @@ mod smoke {
                 .any(|event| matches!(event, PmEvent::Exited { .. })),
             "{events:?}"
         );
+    }
+
+    /// The sentinel channel is wired from catalogue data and nowhere else: an
+    /// MCP CLI reaches the same tools over its own protocol, and scanning its
+    /// prose as well would be a second, unasked-for way in.
+    #[test]
+    fn only_a_sentinel_channel_gets_a_block_scanner() {
+        let fixture = Fixture::new();
+        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        assert!(session.sentinel.is_none());
+        // ...and a fenced block from an MCP PM is just text it wrote.
+        let pass = session.apply_tools("```mana\n{\"tool\": \"list_agents\"}\n```");
+        assert!(pass.prose.is_none());
+        assert!(pass.log.is_empty());
+        session.shutdown().unwrap();
+    }
+
+    /// The round trip the whole channel exists for: the PM writes a block,
+    /// mana executes it, and the result reaches the PM as its next turn --
+    /// with the operator seeing one compact line instead of the JSON.
+    #[test]
+    fn a_sentinel_pm_gets_its_tool_result_injected_as_the_next_turn() {
+        let fixture = Fixture::new();
+        let pm = fixture.home.join("sentinel-pm");
+        // Answers the first turn with a block, and every later one with an
+        // acknowledgement -- otherwise the injected result would be answered
+        // with another block, for ever.
+        std::fs::write(
+            &pm,
+            format!(
+                "#!/bin/sh\n\
+                 turns=0\n\
+                 while IFS= read -r line; do\n\
+                 \x20 printf '%s\\n' \"$line\" >> '{received}'\n\
+                 \x20 turns=$((turns+1))\n\
+                 \x20 if [ \"$turns\" = 1 ]; then\n\
+                 \x20   printf '%s\\n' '{{\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"Checking what is installed.\\n```mana\\n{{\\\"tool\\\": \\\"list_agents\\\"}}\\n```\"}}]}}}}'\n\
+                 \x20 else\n\
+                 \x20   printf '%s\\n' '{{\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ack\"}}]}}}}'\n\
+                 \x20 fi\n\
+                 done\n",
+                received = fixture.received.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&pm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.write_override_on(&pm.to_string_lossy(), "sentinel");
+
+        let mut session = prepare_session(&fixture.home, &fixture.project, "fixture").unwrap();
+        assert!(session.sentinel.is_some());
+
+        // A sentinel PM has no tool list to discover the channel from, so the
+        // activation turn says which way to call.
+        let activation = fixture.wait_for(&fixture.received, ACTIVATION);
+        assert!(activation.contains("fenced ```mana block"), "{activation}");
+
+        // Wait for the PM's answer, then run it through the tool channel.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut said = None;
+        while said.is_none() && Instant::now() < deadline {
+            for event in session.drain() {
+                if let PmEvent::Text(text) = event {
+                    said = Some(text);
+                }
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let pass = session.apply_tools(&said.expect("the PM never answered"));
+
+        // The operator sees the sentence and one line of tool activity, not
+        // the block and not the JSON that came back.
+        assert_eq!(pass.prose.as_deref(), Some("Checking what is installed."));
+        assert_eq!(pass.log, ["[mana] tool: list_agents -> ok"]);
+
+        // ...and the PM was handed the result as a turn of its own.
+        let received = fixture.wait_for(&fixture.received, "tool results");
+        let last: serde_json::Value =
+            serde_json::from_str(received.lines().next_back().unwrap()).unwrap();
+        let injected = last["message"]["content"].as_str().unwrap();
+        assert!(
+            injected.contains("1. list_agents ok: {\"agents\":["),
+            "{injected}"
+        );
+        assert!(injected.contains("fixture"), "{injected}");
+        session.shutdown().unwrap();
     }
 
     #[test]
@@ -1342,7 +1586,12 @@ mod smoke {
             .lines()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect();
-        assert_eq!(sent[0]["message"]["content"], ACTIVATION);
+        assert!(
+            sent[0]["message"]["content"]
+                .as_str()
+                .unwrap()
+                .starts_with(ACTIVATION)
+        );
         assert_eq!(sent[1]["message"]["content"], "ho");
 
         // The keys after Enter went where they should: Escape did nothing at

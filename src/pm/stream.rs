@@ -294,8 +294,9 @@ struct UserMessage<'a> {
 ///
 /// This shape belongs to `prompt = "stdin-jsonl"`, not to any CLI. A vendor
 /// framing turns differently gets a new value for that field, never a branch
-/// here.
-fn user_frame(text: &str) -> String {
+/// here. Shared with the oneshot driver for exactly that reason: the frame
+/// belongs to the prompt mode, and two copies of it would be free to drift.
+pub(super) fn user_frame(text: &str) -> String {
     let frame = UserFrame {
         kind: "user",
         message: UserMessage {

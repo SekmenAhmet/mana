@@ -6,28 +6,89 @@ schema = 1
 # Top-level key, so it has to precede the first [table] header -- see the same
 # note in claude.toml for why the bottom of the file would not work.
 notes = '''
-Measured on 2026-08-15 (this machine): headless `-p`/`--print`; output formats
-text/json/stream-json; auto-approve `--dangerously-skip-permissions` and
-`--sandbox`; `agy models` returns 14 models across three vendors as TSV; quota
-is per-model. No ACP surface and no MCP surface at all -- hence the
-oneshot-continue driver and the sentinel tool channel.
+Measured on 2026-08-15 (this machine, agy 1.1.13): headless `-p`/`--print`;
+output formats text/json/stream-json; auto-approve
+`--dangerously-skip-permissions` and `--sandbox`; `agy models` returns 14 models
+across three vendors as TSV; quota is per-model. No ACP surface and no MCP
+surface at all -- hence the oneshot-continue driver and the sentinel tool
+channel.
 
-Two parallel dispatches died within 8 seconds, so max_concurrent is 1. A brief
-without an absolute cwd wasted 306k tokens because this CLI ignores its working
-directory unless the brief spells it out, hence cwd_required_in_brief.
+`--print` takes the prompt as its *value*, not as a positional argument (the
+`--prompt` alias in `--help` is the giveaway; it is a Go `flag` string). An
+earlier draft of this entry wrote `["--print", "--output-format", "stream-json",
+"{prompt}"]` and agy dutifully answered a question about the string
+"--output-format", in plain text, on the default model -- one wasted request
+that looked like a working call. So `{prompt}` sits directly after `--print`,
+and everything else comes first. Trailing flags after the value still parse,
+which is what makes the driver's `extra_args` safe to append (nothing appends
+any today: the sentinel channel needs no flags). The same correction applies to
+[subagent].args, which had the same shape and would have sent every sub-agent
+a brief the CLI never read.
+
+[pm.events] paths are measured against a real `--output-format stream-json`
+turn, not copied from another entry (they were, and matched nothing):
+
+  {"event":"init","conversation_id":...,"init":{"model":...,"cwd":...,"tools":[...]}}
+  {"event":"step_update","step_update":{"step_type":"agent_response",
+     "state":"ACTIVE","text_delta":"noted."}}
+  {"event":"result","result":{"status":"SUCCESS","response":"noted.\n",
+     "usage":{"input_tokens":15008,...}}}
+
+`text` reads `$.result.response` -- the whole answer, once, at the end of the
+turn -- rather than `$.step_update.text_delta`. The deltas are real streaming
+(one event per chunk, and the chunking varies: two events for a six-character
+answer on one turn, one for the next), but each would become its own chat line,
+and the sentinel channel needs whole fenced blocks rather than halves of one.
+The cost is honest and worth writing down: nothing of a turn is rendered until
+it ends. The `init` frame matches neither path and so shows as one ~1.3 kB raw
+line per turn, which is the price of a process per turn.
+
+`--continue` **preserves context across print calls** (the design's open item,
+answered 2026-08-15): turn 1 was asked to remember PLATYPUS-7734, turn 2 -- a
+separate process with `--continue` -- answered with the token, and both frames
+carried the same conversation_id. It is scoped to the **working directory**:
+the same `--continue` from another directory opened a fresh conversation that
+knew nothing. So a mana session is pinned to a project by the directory it
+launches the turn in, and two mana sessions in the *same* directory would fight
+over one conversation.
+
+Cost and timing of a PM turn (gemini-3.7-flash-low, trivial prompts): 5.5 s
+wall for the first turn, 18.2 s for the second, of which ~3.5 s is process
+startup before the model is reached -- a per-turn process is not free. Token
+input is 15.0k on turn 1 and 30.3k on turn 2 for a two-word answer: agy sends a
+large system prompt every turn and replays the conversation, and no cache read
+was reported on either. A whole `mana launch agy` session -- activation,
+list_agents, create_task, and the PM reading each result back -- was 4 turns and
+34,765 tokens end to end, about 10 s a turn.
+
+`$.result.usage` is **cumulative over the conversation**, not per turn: the four
+result frames of that session reported 18,245 / 23,296 / 28,835 / 34,765. That
+is the right number for a "session so far" readout and the wrong one to add up.
+
+Print mode denies tool permission requests instead of prompting -- there is no
+human to ask, so `run_command` and `view_file` both came back "User denied
+permission" (and a read under the CLI's own config directory was refused by a
+hardcoded protection rule before the policy was even consulted). That is what
+mechanically keeps this PM from writing code, and it is also why the role text
+has to be inlined -- see [skills] below.
+
+Two parallel dispatches died within 8 seconds, so max_concurrent is 1. The same
+limit is a hazard the PM role cannot see: while agy is the PM, a turn of its own
+and an agy sub-agent dispatch are two agy processes at once. Prefer routing
+sub-agents to a different CLI while agy is the PM; mana builds no avoidance
+machinery for this today, it is recorded so the operator can route around it.
+
+A brief without an absolute cwd wasted 306k tokens because this CLI ignores its
+working directory unless the brief spells it out, hence cwd_required_in_brief.
+(The process does receive a cwd -- the init frame echoes it, and `--continue`
+keys off it. It is the *model* that will not use it to resolve relative paths.)
 
 `--version` prints more than one line here; callers must keep only the first.
 
-Unverified, and each is a candidate for a golden-transcript check before the PM
-role is trusted on this CLI:
-- [pm.events] paths are copied from the reference entry's stream-json shape and
-  have never been replayed against a real agy stream. A mismatch degrades to
-  raw text lines by design, so this is visible rather than silent.
-- model_args uses the near-universal `--model` convention; the real flag was
-  never confirmed.
-- Whether `--continue` actually preserves context across `--print` calls.
-
-Known gaps in the data rather than in the CLI:
+Still unverified:
+- Whether every one of agy's ~30 tools is denied the same way, or only the ones
+  observed (`grep_search`, `run_command`, `view_file`). The PM's no-code rule
+  therefore still rests on the skill text as well, which design §6 accepts.
 - The quota pool has no observed period, so it is recorded as "unknown"
   alongside kind = "unknown".
 - No failure signature is declared at all: nothing quota-shaped has ever been
@@ -48,8 +109,10 @@ version_args = ["--version"]
 
 [pm]
 driver        = "oneshot-continue" # acp | stream | oneshot-continue
-first_args    = ["--print", "--output-format", "stream-json", "{prompt}"]
-continue_args = ["--print", "--continue", "--output-format", "stream-json", "{prompt}"]
+# `--print` takes the prompt as its value, so `{prompt}` follows it directly and
+# every other flag comes before it -- see notes for the request this cost.
+first_args    = ["--output-format", "stream-json", "--print", "{prompt}"]
+continue_args = ["--output-format", "stream-json", "--continue", "--print", "{prompt}"]
 prompt        = "argv"             # argv | stdin | stdin-jsonl
 
 # No permission_args on purpose: nothing equivalent to an allowlist was measured
@@ -60,14 +123,19 @@ prompt        = "argv"             # argv | stdin | stdin-jsonl
 # unrecognised argument is how a launch fails at startup for no reason.
 
 [pm.events]                        # non-ACP drivers only; 2 fields MAX (design §4)
-text  = "$.message.content[?@.type=='text'].text"
-usage = "$.usage"
+text  = "$.result.response"        # the whole turn, once, when it ends
+usage = "$.result.usage"
 
 [tools]
 channel = "sentinel"               # no MCP surface found
 
 [subagent]
-args                  = ["--print", "--output-format", "stream-json"]
+# `{prompt}` is placed rather than appended, for the same reason as [pm]: the
+# brief is the value of `--print`, not a trailing positional. Verified that the
+# auto-approve and model flags still parse *after* it (the init frame echoed
+# back the model asked for), which is what makes this ordering safe with the
+# flags mana appends.
+args                  = ["--output-format", "stream-json", "--print", "{prompt}"]
 auto_approve_args     = ["--dangerously-skip-permissions"]
 model_args            = ["--model", "{model}"]
 prompt                = "argv"
@@ -90,6 +158,15 @@ pool_scope = "per-model"           # global | per-model
 
 [skills]
 dirs = ["~/.agents/skills"]
+# Measured 2026-08-15, twice: the PM never gets to read this file. Told only to
+# "load the mana-pm skill" it went hunting (grep_search under the CLI's own
+# config dir -- refused by that CLI's protection rules; `find ~` -- refused by
+# its permission policy) and answered nothing. Told the absolute path, it called
+# view_file on exactly that path and got "User denied permission for
+# read_file(...)": print mode auto-denies every tool permission request, reads
+# included, and there is no human to ask. So on this CLI the role text has to
+# arrive in the activation turn or it does not arrive at all.
+inline_in_activation = true
 
 [install]
 url = "https://antigravity.google"
