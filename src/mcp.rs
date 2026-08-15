@@ -290,6 +290,16 @@ impl ManaTools {
             ))
         })?;
 
+        // Checked here and not on the dispatch thread: "the executor has not
+        // finished" is the PM's mistake to fix, and it has to come back as a
+        // failed tool call rather than as a notification minutes later. It is
+        // also checked before CLI resolution on purpose -- a broken request
+        // deserves the answer about the request, not about the machine.
+        let worktree = match role {
+            Role::Executor => None,
+            Role::Reviewer => Some(self.reviewable_worktree(&paths, task_id)?),
+        };
+
         let entries = self.catalog.entries();
         let observations = Observations::gather(&paths, entries, chrono::Utc::now())
             .map_err(|error| internal(&error, "reading this project's dispatch history"))?;
@@ -309,14 +319,6 @@ impl ManaTools {
             .find(|entry| entry.cli.id == resolved.cli)
             .expect("the resolver only ever returns a catalogued id")
             .clone();
-
-        // Checked here and not on the dispatch thread: "the executor has not
-        // finished" is the PM's mistake to fix, and it has to come back as a
-        // failed tool call rather than as a notification minutes later.
-        let worktree = match role {
-            Role::Executor => None,
-            Role::Reviewer => Some(self.reviewable_worktree(&paths, task_id)?),
-        };
 
         // The id the PM is handed is minted here because the dispatcher's own
         // id does not exist until the process is spawned -- which is after this
