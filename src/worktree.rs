@@ -368,6 +368,14 @@ mod tests {
                 &fixture.project.clone(),
                 &["-c", "init.defaultBranch=main", "init"],
             );
+            // Windows git defaults to core.autocrlf=true, which renormalizes
+            // the LF fixtures on checkout; a later `add -A` in the worktree
+            // then stages a phantom README change and the base..HEAD diff
+            // grows an entry no test wrote. Pin it off for determinism.
+            fixture.git_ok(
+                &fixture.project.clone(),
+                &["config", "core.autocrlf", "false"],
+            );
             fixture
         }
 
