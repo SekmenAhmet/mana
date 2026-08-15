@@ -1,7 +1,7 @@
 use crate::agents::autonomous_flag;
 use crate::config::{ensure_agent_registered, load_config};
 use crate::dependencies::unmet_dependencies;
-use crate::lock::{LockEntry, append_entry, load_lock};
+use crate::lock::{SubagentRecord, append_record, load_registry};
 use crate::log::{LogEntry, Status, append_log, now_iso8601};
 use crate::monitor::file_watcher::{spawn_logger as spawn_file_logger, watch as watch_files};
 use crate::monitor::process_watcher::watch_and_log;
@@ -88,8 +88,8 @@ pub(crate) fn run_at(
     }
     let task = read_task(&task_path)?;
 
-    let lock = load_lock(&paths.lock_file)?;
-    let unmet = unmet_dependencies(&lock, &paths.logs, &task.frontmatter.depends_on)?;
+    let registry = load_registry(&paths.subagents_file)?;
+    let unmet = unmet_dependencies(&registry, &paths.logs, &task.frontmatter.depends_on)?;
     if !unmet.is_empty() {
         anyhow::bail!("unmet dependencies for {task_uuid}: {}", unmet.join(", "));
     }
@@ -100,26 +100,7 @@ pub(crate) fn run_at(
     let flag = autonomous_flag(agent_cli)?;
 
     let agent_uuid = uuid::Uuid::new_v4().to_string();
-    append_entry(
-        &paths.lock_file,
-        &agent_uuid,
-        LockEntry {
-            model: agent_cli.to_string(),
-            role: role.clone(),
-            task_uuid: task_uuid.to_string(),
-        },
-    )?;
-
     let log_path = paths.logs.join(format!("{agent_uuid}.jsonl"));
-    append_log(
-        &log_path,
-        &LogEntry {
-            status: Status::Running,
-            action: "started".to_string(),
-            timestamp: now_iso8601(),
-        },
-    )?;
-
     let review_path = paths.reviews.join(format!("{task_uuid}.md"));
     let prompt = build_prompt(&role, &task, &task_path, &review_path);
 
@@ -131,6 +112,42 @@ pub(crate) fn run_at(
 
     let args = build_agent_args(flag, extra_params);
     let mut session = spawner.spawn(agent_cli, &args)?;
+
+    // The registry record is written only now, after the spawn actually
+    // succeeded — not before, as v1's lock entry was. Two reasons: `pid`
+    // only exists once there's a real child, and an append-only record
+    // can't be revised later to fill it in; and a spawn failure now leaves
+    // no orphaned "dispatched" trace instead of a lock/log entry stuck
+    // `running` forever with nothing to mark it done.
+    let pid = session.child.process_id();
+    append_record(
+        &paths.subagents_file,
+        &SubagentRecord {
+            agent_id: agent_uuid.clone(),
+            cli: agent_cli.to_string(),
+            // `model` duplicates `cli` for now: this command line has no
+            // `--model` input yet (that arrives with the MCP
+            // `launch_subagent` tool in task 2.1, resolving a concrete
+            // model from a `cost_class`). Carrying both fields already
+            // gives `counters` the right (cli, model) shape for when a
+            // real value lands here.
+            model: agent_cli.to_string(),
+            role: role.clone(),
+            task_id: task_uuid.to_string(),
+            pid,
+            started_at: now_iso8601(),
+        },
+    )?;
+
+    append_log(
+        &log_path,
+        &LogEntry {
+            status: Status::Running,
+            action: "started".to_string(),
+            timestamp: now_iso8601(),
+        },
+    )?;
+
     session.writer.write_all(prompt.as_bytes())?;
     session.writer.write_all(b"\n")?;
 
@@ -151,7 +168,7 @@ pub(crate) fn run_at(
 mod tests {
     use super::*;
     use crate::config::{AgentConfig, Config, save_config};
-    use crate::lock::Lock;
+    use crate::lock::Registry;
     use crate::pty::test_support::FakeSpawner;
     use crate::task::{Task, TaskFrontmatter, write_task};
     use std::path::PathBuf;
@@ -206,9 +223,10 @@ mod tests {
         // in Task 8); this test documents that launch_subagent must call it
         // before doing anything else. See run()'s early bail on non-empty
         // `unmet`.
-        let lock = Lock::new();
+        let registry = Registry::default();
         let tmp = tempfile::tempdir().unwrap();
-        let unmet = unmet_dependencies(&lock, tmp.path(), &["missing-dep".to_string()]).unwrap();
+        let unmet =
+            unmet_dependencies(&registry, tmp.path(), &["missing-dep".to_string()]).unwrap();
         assert_eq!(unmet, vec!["missing-dep".to_string()]);
     }
 
@@ -308,7 +326,7 @@ mod tests {
     }
 
     #[test]
-    fn run_at_happy_path_writes_lock_and_log_and_sends_prompt() {
+    fn run_at_happy_path_writes_registry_and_log_and_sends_prompt() {
         let task = sample_task(Role::Executor, vec![]);
         let (_tmp, home) = fake_home_with_task(&task);
         let spawner = FakeSpawner::new(vec![]);
@@ -318,14 +336,22 @@ mod tests {
         let project_name = project_name_from_dir(&std::env::current_dir().unwrap());
         let paths = resolve_project_paths(&home, &project_name);
 
-        let lock = load_lock(&paths.lock_file).unwrap();
-        assert_eq!(lock.len(), 1);
-        let entry = lock.values().next().unwrap();
-        assert_eq!(entry.model, "claude");
-        assert_eq!(entry.task_uuid, "task-1");
+        let registry = load_registry(&paths.subagents_file).unwrap();
+        assert_eq!(registry.records.len(), 1);
+        let record = &registry.records[0];
+        assert_eq!(record.cli, "claude");
+        assert_eq!(record.model, "claude");
+        assert_eq!(record.task_id, "task-1");
+        assert_eq!(record.role, Role::Executor);
+        // FakeSpawner's FakeChild always reports no pid (see
+        // pty::test_support) — a real spawn (task 1.1's plain-process
+        // spawner, or the PTY path today) is what actually exercises a
+        // populated pid; that's covered at the registry-schema level by
+        // lock.rs's own round-trip test instead.
+        assert_eq!(record.pid, None);
 
-        let agent_uuid = lock.keys().next().unwrap();
-        let log_path = paths.logs.join(format!("{agent_uuid}.jsonl"));
+        let agent_id = &record.agent_id;
+        let log_path = paths.logs.join(format!("{agent_id}.jsonl"));
         let log_contents = std::fs::read_to_string(&log_path).unwrap();
         assert!(log_contents.contains("\"status\":\"running\""));
         assert!(log_contents.contains("\"status\":\"done\""));
