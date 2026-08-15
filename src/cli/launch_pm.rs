@@ -9,7 +9,9 @@ use crate::prompts::pm_prompt;
 use crate::pty::{PtySession, RealSpawner, Spawner};
 use crate::tui::app::{App, AppMode};
 use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, map_key_event};
-use crate::tui::graph::{GraphNode, build_nodes, role_label, status_symbol};
+use crate::tui::graph::{
+    BLINK_INTERVAL, GraphNode, build_nodes, is_blink_visible, role_label, status_symbol,
+};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -344,13 +346,14 @@ fn draw(frame: &mut ratatui::Frame, app: &App, nodes: &[GraphNode]) {
     );
 
     if let Some(graph_area) = graph_area {
+        let blink_visible = is_blink_visible(app.started_at.elapsed(), BLINK_INTERVAL);
         let graph_items: Vec<ListItem> = nodes
             .iter()
             .map(|n| {
                 ListItem::new(format!(
                     "[{}] {} {} — {}",
                     role_label(&n.role),
-                    status_symbol(&n.status),
+                    status_symbol(&n.status, blink_visible),
                     n.model,
                     n.task_uuid
                 ))

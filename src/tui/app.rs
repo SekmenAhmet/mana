@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AppMode {
     Chat,
@@ -8,6 +10,10 @@ pub struct App {
     pub chat_lines: Vec<String>,
     pub input: String,
     pub mode: AppMode,
+    /// When this session started — used to drive the graph pane's
+    /// running-status blink without needing a real render-loop clock in
+    /// tests (see `tui::graph::is_blink_visible`).
+    pub started_at: Instant,
 }
 
 impl App {
@@ -16,6 +22,7 @@ impl App {
             chat_lines: Vec::new(),
             input: String::new(),
             mode: AppMode::Chat,
+            started_at: Instant::now(),
         }
     }
 
