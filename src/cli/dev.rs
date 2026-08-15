@@ -185,6 +185,20 @@ fn render_summary(driven: &Driven, project_root: &Path) -> String {
         }
     } else {
         out.push_str("reviewer  not run -- the executor did not finish cleanly\n");
+        // The first real M1 dispatch failed in 2.5s on a CLI flag error that
+        // was invisible here — the exit entry carries no output. Surface the
+        // head of stderr so a bad invocation diagnoses itself.
+        let err_head: String = driven
+            .executor
+            .outcome
+            .stderr
+            .lines()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("\n          ");
+        if !err_head.is_empty() {
+            out.push_str(&format!("          stderr: {err_head}\n"));
+        }
     }
 
     match (&driven.verdict, &driven.verdict_error) {
