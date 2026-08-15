@@ -111,7 +111,13 @@ mod tests {
             }
             if log_path.exists() {
                 let contents = std::fs::read_to_string(&log_path).unwrap();
-                if contents.contains("file:modified:src/main.rs") {
+                // Built with the platform separator: Windows logs `src\main.rs`,
+                // and a hardcoded forward slash made this time out there.
+                let expected = format!(
+                    "file:modified:{}",
+                    Path::new("src").join("main.rs").display()
+                );
+                if contents.contains(&expected) {
                     break;
                 }
             }
