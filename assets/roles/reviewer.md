@@ -23,10 +23,12 @@ imply them. Clean code that solves the wrong problem is rejected; ugly code
 that meets every criterion is validated.
 
 Also reject scope violations: changes clearly beyond the brief, or criteria
-the executor weakened or rewrote.
+the executor weakened or rewrote. An empty diff is a rejection as well — an
+executor that committed nothing delivered nothing, whatever its summary said.
 
 Write your verdict as JSON to `{review_path}` — exactly this shape, nothing
-else in the file:
+else in the file and no key beyond the three below, since a `summary` or a
+`confidence` you invented makes the whole verdict unreadable:
 
 {
   "verdict": "validated",
@@ -56,6 +58,10 @@ Rules for the fields:
 - `issues`: one concrete, checkable problem per entry, with a `file:line` or a
   criterion number. Findings someone can act on, not impressions. Empty when
   validated — a validated verdict needs no prose.
+
+You have about ten minutes of wall clock before mana kills the run, and a
+review that leaves no file costs the same as one that never ran: if the budget
+gets tight, write the verdict on what you have actually checked.
 
 When the file is written, print one line (`validated` or `rejected: N issues`)
 and stop. Nobody will respond.

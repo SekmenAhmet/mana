@@ -123,10 +123,11 @@ pub fn serve(project_root: &Path) -> Result<()> {
 /// The server. Cheap to clone (the catalogue is a handful of parsed structs),
 /// which is what the SDK asks for. `in_flight` is the one piece of in-process
 /// state, and it is legitimately irrecoverable-from-disk: it exists to honour
-/// `[subagent].max_concurrent` (the PM skill promises "mana enforces per-CLI
-/// concurrency limits"), and the registry row that would prove a dispatch is
-/// live is written only *after* the spawn — by which time a second dispatch
-/// against a `max_concurrent = 1` CLI has already killed both (agy, 8s).
+/// `[subagent].max_concurrent` (the PM skill tells the PM an over-limit
+/// dispatch is refused and to re-send later), and the registry row that would
+/// prove a dispatch is live is written only *after* the spawn — by which time
+/// a second dispatch against a `max_concurrent = 1` CLI has already killed
+/// both (agy, 8s).
 #[derive(Clone)]
 pub struct ManaTools {
     project_root: PathBuf,
