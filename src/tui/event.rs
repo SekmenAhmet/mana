@@ -7,6 +7,9 @@ pub enum AppEvent {
     Enter,
     Backspace,
     ToggleGraph,
+    /// Shows or hides the technical lines the chat pane collapses by default
+    /// (thoughts, tool activity, stderr, frames no map matched).
+    ToggleRaw,
     /// Answers the permission the PM is waiting on: `true` allows, `false`
     /// rejects. Does nothing when there is none.
     AnswerPermission(bool),
@@ -27,6 +30,11 @@ pub enum AppEvent {
 /// same class of reason: a bare letter is a letter somebody is in the middle
 /// of typing, and stealing it the instant an agent asks for permission would
 /// mangle the turn being written and answer on the user's behalf.
+///
+/// Ctrl+O opens the technical lines. It is free everywhere mana runs: the
+/// terminal's own `discard` character (`^O` on macOS) is handled by `IEXTEN`,
+/// which raw mode turns off, so the byte reaches the application like any
+/// other control key.
 pub fn map_key_event(
     code: crossterm::event::KeyCode,
     modifiers: crossterm::event::KeyModifiers,
@@ -34,6 +42,7 @@ pub fn map_key_event(
     use crossterm::event::{KeyCode, KeyModifiers};
     match (code, modifiers) {
         (KeyCode::Char('g'), KeyModifiers::CONTROL) => Some(AppEvent::ToggleGraph),
+        (KeyCode::Char('o'), KeyModifiers::CONTROL) => Some(AppEvent::ToggleRaw),
         (KeyCode::Char('y'), KeyModifiers::CONTROL) => Some(AppEvent::AnswerPermission(true)),
         (KeyCode::Char('n'), KeyModifiers::CONTROL) => Some(AppEvent::AnswerPermission(false)),
         (KeyCode::Char('c'), KeyModifiers::CONTROL) => Some(AppEvent::Quit),
@@ -124,6 +133,20 @@ mod tests {
         assert_eq!(
             map_key_event(KeyCode::Char('g'), KeyModifiers::CONTROL),
             Some(AppEvent::ToggleGraph)
+        );
+    }
+
+    /// The chat pane collapses technical lines by default, so the key that
+    /// brings them back has to exist -- and the bare letter must still type.
+    #[test]
+    fn ctrl_o_toggles_the_raw_view_while_the_bare_letter_still_types() {
+        assert_eq!(
+            map_key_event(KeyCode::Char('o'), KeyModifiers::CONTROL),
+            Some(AppEvent::ToggleRaw)
+        );
+        assert_eq!(
+            map_key_event(KeyCode::Char('o'), KeyModifiers::NONE),
+            Some(AppEvent::Key('o'))
         );
     }
 

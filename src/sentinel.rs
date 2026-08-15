@@ -70,11 +70,24 @@ pub struct Outcome {
     /// The message with every `mana` block taken out -- what the chat pane
     /// renders as the PM talking. Blocks are machinery, not conversation.
     pub prose: String,
-    /// One compact line per block, in mana's own voice, so the operator sees
-    /// tool activity without a wall of JSON.
-    pub log: Vec<String>,
+    /// One compact line per block, so the operator sees tool activity without
+    /// a wall of JSON.
+    pub log: Vec<ToolLine>,
     /// The turn to inject, or `None` when the message carried no block at all.
     pub reply: Option<String>,
+}
+
+/// One line of tool activity, and how loudly it has to be said.
+///
+/// A call that worked is annotation: the same `⚙ name ✓` an ACP agent's tool
+/// call renders as, and it collapses with the rest of the machinery under the
+/// interface's raw view. A call that did *not* work is news -- mana refused
+/// the block, or the tool returned an error, and the PM is about to act on
+/// whatever it was told -- so it keeps mana's own voice and stays on screen.
+#[derive(Debug, PartialEq)]
+pub struct ToolLine {
+    pub text: String,
+    pub failed: bool,
 }
 
 impl Sentinel {
@@ -104,7 +117,10 @@ impl Sentinel {
                     (call.log_line(&outcome), call.result_line(&outcome))
                 }
                 Err(reason) => (
-                    format!("[mana] block not executed: {reason}"),
+                    ToolLine {
+                        text: format!("[mana] block not executed: {reason}"),
+                        failed: true,
+                    },
                     format!("not executed: {reason} {}", CORRECTION),
                 ),
             };
@@ -151,17 +167,30 @@ impl Call {
             .map_err(|error| format!("invalid arguments for {}: {error}", self.tool))
     }
 
-    /// The compact chat line: the tool, a glance at its arguments, and how it
-    /// went. Arguments are trimmed because the operator is reading a
-    /// conversation, not a request log.
-    fn log_line(&self, outcome: &Result<Value, String>) -> String {
-        let args = match &self.args {
-            Value::Object(map) if map.is_empty() => String::new(),
-            args => format!(" {}", truncate(&args.to_string(), 60)),
-        };
+    /// The compact chat line: the tool, and how it went.
+    ///
+    /// A call that worked is one glyph and a name -- the same shape the ACP
+    /// driver renders a tool call as, because it is the same event and the
+    /// operator should not have to learn two vocabularies for it. A call that
+    /// failed gets mana's voice, a glance at what was sent and the error
+    /// itself: that line has to be actionable, and arguments are trimmed
+    /// because the operator is reading a conversation, not a request log.
+    fn log_line(&self, outcome: &Result<Value, String>) -> ToolLine {
         match outcome {
-            Ok(_) => format!("[mana] tool: {}{args} -> ok", self.tool),
-            Err(error) => format!("[mana] tool: {}{args} -> failed: {error}", self.tool),
+            Ok(_) => ToolLine {
+                text: format!("⚙ {} ✓", self.tool),
+                failed: false,
+            },
+            Err(error) => {
+                let args = match &self.args {
+                    Value::Object(map) if map.is_empty() => String::new(),
+                    args => format!(" {}", truncate(&args.to_string(), 60)),
+                };
+                ToolLine {
+                    text: format!("[mana] tool {}{args} failed: {error}", self.tool),
+                    failed: true,
+                }
+            }
         }
     }
 
@@ -363,7 +392,15 @@ mod tests {
         ));
 
         assert_eq!(outcome.prose, "Listing what is installed.");
-        assert_eq!(outcome.log, ["[mana] tool: list_agents -> ok"]);
+        // The same shape an ACP agent's tool call renders as: one glyph, the
+        // tool's name, and how it went. It is the same event.
+        assert_eq!(
+            outcome.log,
+            [ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false
+            }]
+        );
         let reply = outcome.reply.unwrap();
         assert!(reply.starts_with("[mana] tool results"), "{reply}");
         assert!(
@@ -386,13 +423,11 @@ mod tests {
 
         assert_eq!(outcome.prose, "Two tasks.\nand");
         assert_eq!(outcome.log.len(), 2);
-        // Arguments are shown as JSON, so they come out key-sorted rather than
-        // in the order the PM wrote them -- a glance, not a transcript.
-        assert!(
-            outcome.log[0].contains("create_task {\"prompt\":\"do one\",\"title\":\"One\"}"),
-            "{:?}",
-            outcome.log
-        );
+        // Two calls, two identical lines: which task each one made is in the
+        // PM's own prose and in the reply it was handed, and repeating the
+        // arguments in the pane is the wall of JSON this line exists to avoid.
+        assert_eq!(outcome.log[0].text, "⚙ create_task ✓");
+        assert!(!outcome.log[0].failed);
         let reply = outcome.reply.unwrap();
         assert!(
             reply.contains("1. create_task ok: {\"task_id\":"),
@@ -414,7 +449,14 @@ mod tests {
             .handle(&block("create_task(title=\"One\")"));
 
         assert_eq!(outcome.log.len(), 1);
-        assert!(outcome.log[0].contains("not executed"), "{:?}", outcome.log);
+        // A block mana refused is news: it stays on screen rather than
+        // collapsing with the routine activity.
+        assert!(
+            outcome.log[0].text.contains("not executed"),
+            "{:?}",
+            outcome.log
+        );
+        assert!(outcome.log[0].failed);
         let reply = outcome.reply.unwrap();
         assert!(reply.contains("not valid JSON"), "{reply}");
         assert!(reply.contains("One call per ```mana block"), "{reply}");

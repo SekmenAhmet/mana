@@ -4,17 +4,19 @@
 //! ┌ chat ─────────────────────────┬ graph (Ctrl+G) ┐
 //! │ mana's own notices, the PM's  │ ◉ [EXE] ...    │
 //! │ prose, the user's turns, and  │ ○ [REV] ... ✅ │
-//! │ raw lines when a stream stops │                │
-//! │ matching the catalogue        │                │
+//! │ whatever it is blocked on     │                │
+//! │ · 42 technical lines (Ctrl+O) │                │
 //! ├───────────────────────────────┴────────────────┤
-//! │ PM Claude Code · output 44 · Ctrl+G · Ctrl+C   │  status
+//! │ PM Claude Code · output 44 · Ctrl+O raw off …  │  status
 //! ├────────────────────────────────────────────────┤
 //! │ > what the user is typing                      │  input
 //! └────────────────────────────────────────────────┘
 //! ```
 //!
 //! The graph pane is hidden until Ctrl+G, so a session that is just a
-//! conversation looks like one.
+//! conversation looks like one. The machinery -- reasoning, tool activity,
+//! stderr, frames no map matched -- is hidden until Ctrl+O for the same
+//! reason, and counted on one line so hiding it is never silence.
 
 use super::app::{App, AppMode, ChatLine, PendingPermission, Source};
 use super::graph::{BLINK_INTERVAL, GraphNode, is_blink_visible, node_line};
@@ -71,9 +73,37 @@ fn draw_chat(frame: &mut Frame, app: &App, area: Rect) {
 /// the newest lines off the bottom of the pane -- the one thing a chat window
 /// must never do. Walking the ring backwards also means a full scrollback
 /// costs a screenful of work per frame, not two thousand lines of it.
+///
+/// `Raw` lines are skipped while the raw view is closed (Ctrl+O) and replaced,
+/// at the very bottom, by one dim line counting them. Everything else always
+/// renders: the PM's prose, mana's notices, the user's turns, the permission
+/// the PM is blocked on.
 fn visible_lines(app: &App, width: usize, height: usize) -> Vec<Line<'static>> {
     let mut rows: Vec<Line> = Vec::new();
+    // Pushed first because the window is built newest-first and reversed, so
+    // this ends up on the last row of the pane -- where the eye already is.
+    if let Some(summary) = app.raw_summary() {
+        rows.extend(
+            render_line(
+                &ChatLine {
+                    source: Source::Raw,
+                    text: summary,
+                },
+                width,
+            )
+            .into_iter()
+            .rev(),
+        );
+        if rows.len() >= height {
+            rows.truncate(height);
+            rows.reverse();
+            return rows;
+        }
+    }
     for line in app.lines().rev() {
+        if line.source == Source::Raw && !app.show_raw {
+            continue;
+        }
         let wrapped = render_line(line, width);
         for row in wrapped.into_iter().rev() {
             rows.push(row);
@@ -206,11 +236,20 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
+        // Keys first, figures last, because this line is truncated and not
+        // wrapped: an ACP agent reports five token counters (68 columns of
+        // them on opencode), which pushed `Ctrl+C quit` off the end of a
+        // 120-column terminal. What a truncated status bar loses should be the
+        // arithmetic, never the way out.
         None => (
             format!(
-                " PM {} · {} · Ctrl+G graph · Ctrl+C quit",
+                " PM {} · Ctrl+G graph · Ctrl+O raw {} · Ctrl+C quit · {}",
                 app.cli_name,
-                app.usage.as_deref().unwrap_or("no usage reported yet")
+                // Named rather than implied: the pane hides most of what the
+                // session produced, and a key nobody knows about is a feature
+                // nobody has.
+                if app.show_raw { "on" } else { "off" },
+                app.usage.as_deref().unwrap_or("no usage reported yet"),
             ),
             Style::default().fg(Color::DarkGray),
         ),
@@ -300,7 +339,7 @@ mod tests {
         app.usage = Some("output 44".to_string());
         app.input = "and a test".to_string();
 
-        let rows = screen(&app, &[], 60, 12);
+        let rows = screen(&app, &[], 100, 12);
         let rendered = dump(&rows);
         assert!(rendered.contains("Chat"), "{rendered}");
         assert!(
@@ -315,13 +354,107 @@ mod tests {
             rendered.contains("* [mana] executor finished"),
             "{rendered}"
         );
+        // The keys come first and the figures last: a narrow terminal that has
+        // to lose something loses the arithmetic, not the way out.
         assert!(
-            rendered.contains("PM Claude Code · output 44"),
+            rendered.contains("PM Claude Code · Ctrl+G graph · Ctrl+O raw off · Ctrl+C quit"),
             "{rendered}"
         );
+        assert!(rendered.contains("output 44"), "{rendered}");
         assert!(rendered.contains("› and a test"), "{rendered}");
         // The graph is hidden until asked for.
         assert!(!rendered.contains("Graph"), "{rendered}");
+    }
+
+    /// The status bar is truncated, not wrapped, and an ACP agent's usage
+    /// string is long enough to push the keys off the end of a real terminal
+    /// (opencode reports five counters -- 68 columns of them).
+    #[test]
+    fn a_long_usage_string_cannot_push_the_keys_off_the_status_bar() {
+        let mut app = App::new("opencode");
+        app.usage = Some(
+            "cached read 84352 · input 357 · output 29 · thought 57 · total 84795".to_string(),
+        );
+        let rendered = dump(&screen(&app, &[], 120, 8));
+        assert!(rendered.contains("Ctrl+O raw off"), "{rendered}");
+        assert!(rendered.contains("Ctrl+C quit"), "{rendered}");
+    }
+
+    /// The v2.1 content rule, in one frame: the two lines the operator has to
+    /// read are on screen, and the machinery around them is one dim counter.
+    #[test]
+    fn technical_lines_collapse_to_one_counter_until_the_raw_view_is_opened() {
+        let mut app = App::new("opencode");
+        app.push(Source::Raw, "session initialized");
+        app.push(Source::Pm, "What are we building?");
+        for line in [
+            "The user wants me to",
+            "⚙ mana_list_agents …",
+            "⚙ mana_list_agents ✓",
+        ] {
+            app.push(Source::Raw, line);
+        }
+        app.push(Source::Mana, "[mana] executor finished for task 3f2a1b6c");
+
+        let closed = dump(&screen(&app, &[], 100, 12));
+        assert!(closed.contains("What are we building?"), "{closed}");
+        assert!(closed.contains("* [mana] executor finished"), "{closed}");
+        assert!(closed.contains("· 4 technical lines (Ctrl+O)"), "{closed}");
+        // None of the collapsed lines leaked through.
+        for hidden in [
+            "session initialized",
+            "The user wants me to",
+            "mana_list_agents",
+        ] {
+            assert!(!closed.contains(hidden), "{hidden} rendered: {closed}");
+        }
+        // ...and the key that opens them is named where the keys live.
+        assert!(closed.contains("Ctrl+O raw off"), "{closed}");
+
+        app.toggle_raw();
+        let open = dump(&screen(&app, &[], 100, 12));
+        for shown in [
+            "· session initialized",
+            "· The user wants me to",
+            "· ⚙ mana_list_agents …",
+            "· ⚙ mana_list_agents ✓",
+        ] {
+            assert!(open.contains(shown), "{shown} missing: {open}");
+        }
+        // The counter is gone: the lines themselves are the answer now.
+        assert!(!open.contains("technical lines (Ctrl+O)"), "{open}");
+        assert!(open.contains("Ctrl+O raw on"), "{open}");
+        // What always renders, renders in both states.
+        assert!(open.contains("What are we building?"), "{open}");
+    }
+
+    /// The summary is the newest thing in the pane, so it comes after the
+    /// conversation rather than above it -- a counter the eye has to hunt for
+    /// is a counter nobody reads.
+    #[test]
+    fn the_counter_comes_after_everything_else_in_the_chat_pane() {
+        let mut app = App::new("opencode");
+        app.push(Source::Raw, "hidden");
+        app.push(Source::Pm, "first");
+        let rows = screen(&app, &[], 40, 8);
+        // The chat pane is everything between its own two borders.
+        let chat: Vec<&String> = rows
+            .iter()
+            .take_while(|row| !row.starts_with('└'))
+            .filter(|row| row.starts_with('│') && !row.trim_matches(['│', ' ']).is_empty())
+            .collect();
+        let last = chat.last().expect("the chat pane rendered something");
+        assert!(last.contains("· 1 technical line (Ctrl+O)"), "{rows:#?}");
+    }
+
+    /// A pane with nothing hidden says nothing about hiding: a session that
+    /// never degraded must look like a plain conversation.
+    #[test]
+    fn no_technical_lines_means_no_counter_at_all() {
+        let mut app = App::new("opencode");
+        app.push(Source::Pm, "hello");
+        let rendered = dump(&screen(&app, &[], 40, 8));
+        assert!(!rendered.contains("technical"), "{rendered}");
     }
 
     /// Visible degradation (design §4): a line the event map did not match is
@@ -329,6 +462,7 @@ mod tests {
     #[test]
     fn a_raw_line_is_marked_and_dimmed() {
         let mut app = App::new("Claude Code");
+        app.show_raw = true;
         app.push(Source::Raw, "boom: no credentials found");
 
         let mut terminal = Terminal::new(TestBackend::new(40, 8)).unwrap();

@@ -36,7 +36,7 @@ use crate::pm::{self, PmEvent, PmTransport, Resume};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
-use crate::sentinel::Sentinel;
+use crate::sentinel::{Sentinel, ToolLine};
 use crate::status::{self, DispatchStatus, short};
 use crate::task::Role;
 use crate::tui::app::{App, Source};
@@ -136,15 +136,7 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     let agent_cli = resolve_cli(&paths, agent_cli, resume)?;
     let mut session = prepare_session(&home, &project_root, &agent_cli, resume)?;
     let mut app = App::new(&session.cli_name);
-    app.push(
-        Source::Mana,
-        &format!(
-            "[mana] PM session {} on {}. The mana-pm skill is installed at {}.",
-            if resume { "resumed" } else { "started" },
-            session.cli_name,
-            session.skill_path.display()
-        ),
-    );
+    app.push(Source::Raw, &launch_line(&session, resume));
     // Anything the launch did to the user's disk beyond writing that one file
     // -- a stale copy of the role deleted out of another skills directory --
     // is said here rather than done quietly.
@@ -201,6 +193,40 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     }
 }
 
+/// How loudly one line of sentinel tool activity is said.
+///
+/// A call that worked is annotation, and it collapses with the rest of the
+/// machinery -- the same class as the `⚙ …` lines an ACP agent's tool calls
+/// become, because it is the same event seen through a different channel. A
+/// call that failed is mana telling the operator something they have to know:
+/// a block it refused, a tool that errored, results that never reached the PM.
+fn tool_line_source(line: &ToolLine) -> Source {
+    if line.failed {
+        Source::Mana
+    } else {
+        Source::Raw
+    }
+}
+
+/// Everything a launch is worth in the chat pane: one dim line.
+///
+/// It is `Source::Raw` rather than a notice, and that is the v2.1 rule made
+/// concrete. A launch sends the PM a briefing that can run to the whole role
+/// text, writes a file under the user's home and registers an MCP server --
+/// and none of it is what the operator opened the pane to read. The line says
+/// the session exists and where the role went; the raw view (Ctrl+O) has it in
+/// full, and the counter says it is there. Anything a launch had to do
+/// *differently* -- a skills directory it could not write, a stale copy it
+/// removed -- is a notice instead, because that is news.
+fn launch_line(session: &Session, resume: bool) -> String {
+    format!(
+        "session {} on {} · mana-pm role at {}",
+        if resume { "resumed" } else { "initialized" },
+        session.cli_name,
+        session.skill_path.display()
+    )
+}
+
 /// Why the loop returned.
 #[derive(Debug, PartialEq)]
 enum SessionEnd {
@@ -242,7 +268,25 @@ impl Session {
         std::iter::from_fn(|| self.pm.events().try_recv().ok()).collect()
     }
 
-    fn send_user(&mut self, text: &str) -> Result<()> {
+    /// The one turn whose words the chat pane shows: a human typed it. The
+    /// echo itself is `apply_app_event`'s, because that is the only place that
+    /// knows somebody pressed Enter.
+    fn send_typed(&mut self, text: &str) -> Result<()> {
+        self.pm.send_user(text)
+    }
+
+    /// A turn mana wrote itself -- the activation (and, on the CLIs that cannot
+    /// read a file, the whole role text it carries), the results of the PM's
+    /// own tool calls, the notice that a dispatch finished.
+    ///
+    /// This is plumbing between mana and its PM, not conversation, and it is a
+    /// method of its own rather than a comment on `send_typed` because the
+    /// distinction is exactly what v2.0 lost: every one of these went out
+    /// through the same call as a typed turn, and the interface had no way to
+    /// tell them apart. The chat pane may say *that* mana spoke to the PM --
+    /// one short line, or the one-line notice a finished dispatch deserves --
+    /// and never *what* was said. Nothing here returns text to render.
+    fn send_internal(&mut self, text: &str) -> Result<()> {
         self.pm.send_user(text)
     }
 
@@ -251,17 +295,21 @@ impl Session {
     }
 
     /// Injects one user turn per dispatch that finished since the last poll,
-    /// and returns what was injected so the chat pane can show it too.
+    /// and returns the one-line notice each of them is worth in the pane.
     ///
     /// This is the whole reason the PM does not have to poll: it asked for a
     /// dispatch minutes ago, the thread that ran it wrote a line to
     /// `notifications.jsonl` when it ended, and mana turns that line into a
     /// turn the PM reads like any other message.
+    ///
+    /// The one internal send whose text the pane does show, because here the
+    /// text *is* the news: an executor finished, and that is a fact the
+    /// operator is waiting for rather than plumbing they have to scroll past.
     fn poll_notifications(&mut self, now: Instant) -> Result<Vec<String>> {
         let mut sent = Vec::new();
         for notification in self.notifications.poll(now) {
             let message = notification_message(&notification);
-            self.pm.send_user(&message)?;
+            self.send_internal(&message)?;
             sent.push(message);
         }
         Ok(sent)
@@ -281,15 +329,19 @@ impl Session {
             None => return ToolPass::default(),
         };
         let mut log = outcome.log;
+        // The results themselves never render: they are a tool's answer to the
+        // PM, often a page of JSON, and the operator gets `outcome.log`'s one
+        // compact line per call instead.
         if let Some(reply) = outcome.reply
-            && let Err(error) = self.pm.send_user(&reply)
+            && let Err(error) = self.send_internal(&reply)
         {
             // Almost always a PM that just died. Reported where the operator
             // is looking rather than propagated: the `Exited` event ends the
             // session a tick later with a better message than this one.
-            log.push(format!(
-                "[mana] the tool results never reached the PM: {error:#}"
-            ));
+            log.push(ToolLine {
+                text: format!("[mana] the tool results never reached the PM: {error:#}"),
+                failed: true,
+            });
         }
         ToolPass {
             prose: Some(outcome.prose),
@@ -309,8 +361,9 @@ struct ToolPass {
     /// words with the machinery taken out. `None` when this CLI has no
     /// sentinel channel and the message is the PM's words already.
     prose: Option<String>,
-    /// One compact line per tool call, in mana's voice.
-    log: Vec<String>,
+    /// One compact line per tool call: routine activity to collapse with the
+    /// rest of the machinery, and anything that failed to say out loud.
+    log: Vec<ToolLine>,
 }
 
 /// Resolves the CLI, installs the skill, wires the tool channel and starts the
@@ -350,7 +403,7 @@ fn prepare_session(
     // it, and the id mana stores after the handshake is the same string either
     // way.
     let stored = state.sessions.get(agent_cli).cloned();
-    let mut pm = pm::start(
+    let pm = pm::start(
         entry,
         &extra_args,
         resume.then_some(Resume {
@@ -376,10 +429,8 @@ fn prepare_session(
     } else {
         activation(entry, &skill.path)
     };
-    pm.send_user(&opening)
-        .context("sending the opening message to the PM")?;
 
-    Ok(Session {
+    let mut session = Session {
         pm,
         cli_name: entry.cli.name.clone(),
         skill_path: skill.path,
@@ -388,7 +439,15 @@ fn prepare_session(
         sentinel,
         project,
         paths,
-    })
+    };
+    // Through `send_internal` rather than straight down the transport, so the
+    // rule holds where it matters most: this message is a briefing mana wrote,
+    // it can be the entire role text (`[skills].inline_in_activation`), and
+    // v2.0 put all of it in the pane as though the user had typed it.
+    session
+        .send_internal(&opening)
+        .context("sending the opening message to the PM")?;
+    Ok(session)
 }
 
 /// Which CLI this launch is for.
@@ -906,7 +965,7 @@ fn run_loop<B: Backend>(
                     None => app.apply(&event),
                 }
                 for line in pass.log {
-                    app.push(Source::Mana, &line);
+                    app.push(tool_line_source(&line), &line.text);
                 }
                 continue;
             }
@@ -968,6 +1027,7 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
     match event {
         AppEvent::Quit => return false,
         AppEvent::ToggleGraph => app.toggle_graph(),
+        AppEvent::ToggleRaw => app.toggle_raw(),
         AppEvent::AnswerPermission(allow) => answer_permission(allow, app, session),
         AppEvent::Key(c) => app.input.push(c),
         AppEvent::Backspace => {
@@ -981,7 +1041,7 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
                 app.toggle_graph();
             } else if !message.trim().is_empty() {
                 app.push(Source::User, &message);
-                if let Err(error) = session.send_user(&message) {
+                if let Err(error) = session.send_typed(&message) {
                     app.push(
                         Source::Mana,
                         &format!("[mana] that turn did not reach the PM: {error:#}"),
@@ -1611,6 +1671,26 @@ url = "https://example.invalid/fixture"
         }
     }
 
+    /// Tool activity is annotation whichever channel produced it, and a
+    /// failure is news whichever channel produced it.
+    #[test]
+    fn a_sentinel_call_that_worked_collapses_and_one_that_failed_does_not() {
+        assert_eq!(
+            tool_line_source(&ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false,
+            }),
+            Source::Raw
+        );
+        assert_eq!(
+            tool_line_source(&ToolLine {
+                text: "[mana] block not executed: not valid JSON".to_string(),
+                failed: true,
+            }),
+            Source::Mana
+        );
+    }
+
     #[test]
     fn a_finished_dispatch_becomes_a_turn_that_asks_for_a_decision() {
         let message =
@@ -1823,6 +1903,16 @@ mod smoke {
             std::fs::write(self.home.join(CATALOG_OVERRIDE), source).unwrap();
         }
 
+        /// A CLI that cannot read the role off disk, so the activation carries
+        /// the whole of `SKILL.md` -- the longest thing mana ever sends a PM,
+        /// and the one v2.0 printed into the chat pane as a user turn.
+        fn write_override_inlining_the_role(&self, bin: &str) {
+            let source =
+                super::tests::entry_source(bin, &[self.skills.to_str().unwrap()], "", "mcp")
+                    .replace("dirs = ", "inline_in_activation = true\ndirs = ");
+            std::fs::write(self.home.join(CATALOG_OVERRIDE), source).unwrap();
+        }
+
         fn paths(&self) -> ProjectPaths {
             resolve_project_paths(&self.home, &project_name_from_dir(&self.project))
         }
@@ -1915,6 +2005,16 @@ mod smoke {
         let injected = session.poll_notifications(Instant::now()).unwrap();
         assert_eq!(injected.len(), 1);
         assert!(injected[0].contains("executor finished for task task-1"));
+        // The one internal send the pane does show, and it stays one line: it
+        // is news the operator is waiting for, not plumbing.
+        assert!(!injected[0].contains('\n'), "{}", injected[0]);
+        app.push(Source::Mana, &injected[0]);
+        assert_eq!(
+            app.lines()
+                .filter(|line| line.source == Source::Mana)
+                .count(),
+            1
+        );
         let received = fixture.wait_for(&fixture.received, "executor finished");
         assert_eq!(received.lines().count(), 2, "{received}");
 
@@ -1928,6 +2028,94 @@ mod smoke {
                 .any(|event| matches!(event, PmEvent::Exited { .. })),
             "{events:?}"
         );
+    }
+
+    /// Everything the pane holds, as text, oldest first.
+    fn rendered(app: &App) -> String {
+        app.lines()
+            .map(|line| line.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Reads events into the pane until one of them says something, the way
+    /// the render loop does.
+    fn pump_until_pm_speaks(session: &mut Session, app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            for event in session.drain() {
+                app.apply(&event);
+            }
+            if app.lines().any(|line| line.source == Source::Pm) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the PM never answered: {}", rendered(app));
+    }
+
+    /// The defect this pass exists for: mana's own briefing, role text and all,
+    /// rendered in the chat pane as though the operator had typed it.
+    ///
+    /// The entry here is the worst case -- a CLI that cannot read the file, so
+    /// the activation carries the whole of `SKILL.md`. The PM is told all of
+    /// it; the pane gets one dim line and the PM's answer.
+    #[test]
+    fn the_activation_and_the_role_text_it_carries_never_reach_the_chat_pane() {
+        let fixture = Fixture::new();
+        fixture.write_override_inlining_the_role(&fixture.fake_pm());
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+
+        // The PM really was told everything: this is a suppression at the
+        // interface, not a briefing mana quietly stopped sending.
+        let received = fixture.wait_for(&fixture.received, ACTIVATION);
+        assert!(received.contains("mana-pm skill"), "{received}");
+
+        let mut app = App::new(&session.cli_name);
+        app.push(Source::Raw, &launch_line(&session, false));
+        pump_until_pm_speaks(&mut session, &mut app);
+
+        let shown = rendered(&app);
+        assert!(!shown.contains(ACTIVATION), "{shown}");
+        for paragraph in PM_SKILL.lines().filter(|line| line.len() > 40).take(5) {
+            assert!(
+                !shown.contains(paragraph),
+                "the role text rendered: {shown}"
+            );
+        }
+        // What the launch is worth: one line, dim, and nothing the PM said is
+        // attributed to the user.
+        let ours: Vec<&str> = app
+            .lines()
+            .filter(|line| line.source != Source::Pm)
+            .map(|line| line.text.as_str())
+            .collect();
+        assert_eq!(ours.len(), 1, "{ours:?}");
+        assert!(
+            ours[0].starts_with("session initialized on Fixture CLI"),
+            "{ours:?}"
+        );
+        assert_eq!(app.raw_lines, 1);
+        assert!(
+            !app.lines().any(|line| line.source == Source::User),
+            "mana's own message was echoed as a user turn: {shown}"
+        );
+        session.shutdown().unwrap();
+    }
+
+    /// A resumed launch says so in the same one line, and still sends the PM
+    /// its re-entry turn.
+    #[test]
+    fn a_resumed_launch_is_also_one_dim_line() {
+        let fixture = Fixture::new();
+        fixture.write_override_with(&fixture.fake_pm(), "mcp", "\nresume_args = [\"--resumed\"]");
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", true).unwrap();
+        let line = launch_line(&session, true);
+        assert!(line.starts_with("session resumed on Fixture CLI"), "{line}");
+        assert!(!line.contains(RESUMED), "{line}");
+        session.shutdown().unwrap();
     }
 
     /// `mana launch -c` end to end, at the one layer where the decision is
@@ -2055,7 +2243,13 @@ mod smoke {
         // The operator sees the sentence and one line of tool activity, not
         // the block and not the JSON that came back.
         assert_eq!(pass.prose.as_deref(), Some("Checking what is installed."));
-        assert_eq!(pass.log, ["[mana] tool: list_agents -> ok"]);
+        assert_eq!(
+            pass.log,
+            [ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false
+            }]
+        );
 
         // ...and the PM was handed the result as a turn of its own.
         let received = fixture.wait_for(&fixture.received, "tool results");
@@ -2067,6 +2261,19 @@ mod smoke {
             "{injected}"
         );
         assert!(injected.contains("fixture"), "{injected}");
+        // ...which the pane never sees: an internal send carries whatever the
+        // tool returned, and a page of JSON is not conversation.
+        let shown = format!(
+            "{}\n{}",
+            pass.prose.as_deref().unwrap_or_default(),
+            pass.log
+                .iter()
+                .map(|line| line.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+        assert!(!shown.contains("\"agents\""), "{shown}");
+        assert!(!shown.contains("tool results"), "{shown}");
         session.shutdown().unwrap();
     }
 

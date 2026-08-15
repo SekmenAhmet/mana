@@ -65,6 +65,21 @@ pub struct App {
     /// which arrives here -- and the chat pane is gone by the time mana can
     /// print anything, so the launch flow reads it back from here.
     pub last_raw: Option<String>,
+    /// Whether the chat pane shows its `Raw` lines (Ctrl+O). Off by default.
+    ///
+    /// A PM session is mostly machinery -- reasoning chunks, tool activity, the
+    /// CLI's own stderr -- and a pane that renders all of it buries the two or
+    /// three lines the operator actually has to read. The lines are still kept
+    /// (they go into the ring like any other), and `raw_lines` says how many
+    /// there are, so "degraded, never silent" survives as a counter that climbs
+    /// and a key that opens it rather than as an unreadable wall.
+    pub show_raw: bool,
+    /// How many `Raw` lines this session has produced, counted from launch and
+    /// never reset -- there is no "clear" in this interface, and a counter that
+    /// went backwards would be one more thing to explain. It counts lines
+    /// *pushed*, so it keeps counting past the ring's capacity: what it reports
+    /// is how much machinery ran, not how much of it is still scrollable.
+    pub raw_lines: usize,
     /// The permission the PM is waiting on, if any. `Some` blocks nothing in
     /// mana -- the loop keeps drawing and the user keeps typing -- but it is
     /// what the status bar and the answer keys act on.
@@ -108,6 +123,8 @@ impl App {
             cli_name: cli_name.to_string(),
             usage: None,
             last_raw: None,
+            show_raw: false,
+            raw_lines: 0,
             pending_permission: None,
             started_at: Instant::now(),
         }
@@ -164,6 +181,9 @@ impl App {
     /// the oldest once the ring is full.
     pub fn push(&mut self, source: Source, text: &str) {
         for line in text.split('\n') {
+            if source == Source::Raw {
+                self.raw_lines += 1;
+            }
             // A trailing newline is framing, not an empty line worth keeping;
             // blank lines *inside* a paragraph are the PM's own formatting and
             // stay.
@@ -190,6 +210,23 @@ impl App {
             AppMode::Chat => AppMode::Graph,
             AppMode::Graph => AppMode::Chat,
         };
+    }
+
+    pub fn toggle_raw(&mut self) {
+        self.show_raw = !self.show_raw;
+    }
+
+    /// The one line the chat pane shows in place of the collapsed machinery,
+    /// or `None` when there is nothing to collapse (or it is already open).
+    pub fn raw_summary(&self) -> Option<String> {
+        if self.show_raw || self.raw_lines == 0 {
+            return None;
+        }
+        Some(format!(
+            "{} technical line{} (Ctrl+O)",
+            self.raw_lines,
+            if self.raw_lines == 1 { "" } else { "s" }
+        ))
     }
 }
 
@@ -438,6 +475,58 @@ mod tests {
         assert_eq!(app.take_permission().unwrap().id, 7);
         assert!(app.pending_permission.is_none());
         assert!(app.take_permission().is_none());
+    }
+
+    /// The collapse contract, as data: every raw line is kept and counted, and
+    /// the summary is what the pane shows instead of them.
+    #[test]
+    fn raw_lines_are_counted_and_summarised_while_the_view_is_closed() {
+        let mut app = App::new("Fixture CLI");
+        assert!(!app.show_raw, "the raw view must start closed");
+        assert_eq!(app.raw_summary(), None);
+
+        app.apply(&PmEvent::Raw("thinking about it".to_string()));
+        assert_eq!(
+            app.raw_summary().as_deref(),
+            Some("1 technical line (Ctrl+O)")
+        );
+
+        app.apply(&PmEvent::Raw("two\nmore".to_string()));
+        app.apply(&PmEvent::Text("the answer".to_string()));
+        assert_eq!(
+            app.raw_summary().as_deref(),
+            Some("3 technical lines (Ctrl+O)")
+        );
+        // Kept, not dropped: opening the view has something to show.
+        assert_eq!(app.lines().count(), 4);
+    }
+
+    #[test]
+    fn opening_the_raw_view_replaces_the_summary_with_the_lines_themselves() {
+        let mut app = App::new("Fixture CLI");
+        app.apply(&PmEvent::Raw("boom".to_string()));
+        app.toggle_raw();
+        assert!(app.show_raw);
+        assert_eq!(app.raw_summary(), None);
+        app.toggle_raw();
+        assert!(!app.show_raw);
+        // The counter is a session total: it does not reset on a toggle.
+        assert_eq!(
+            app.raw_summary().as_deref(),
+            Some("1 technical line (Ctrl+O)")
+        );
+    }
+
+    /// The counter counts what happened, not what is still scrollable: a
+    /// session that overflowed the ring must not start under-reporting.
+    #[test]
+    fn the_counter_keeps_counting_past_the_rings_capacity() {
+        let mut app = App::new("Fixture CLI");
+        for index in 0..CHAT_CAPACITY + 10 {
+            app.push(Source::Raw, &format!("line {index}"));
+        }
+        assert_eq!(app.raw_lines, CHAT_CAPACITY + 10);
+        assert_eq!(app.lines().count(), CHAT_CAPACITY);
     }
 
     #[test]

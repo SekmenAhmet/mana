@@ -36,8 +36,21 @@ mana's own tools, which is what lets mana pick the (CLI × model), own the
 worktree and observe the run.
 
 In the TUI: type to talk to the PM, `Enter` to send, `Ctrl+G` for the graph
-pane, `Ctrl+C` to quit. `Esc` does nothing — it is the interrupt key of the
-agent CLIs themselves, and quitting on it was a v1 mistake.
+pane, `Ctrl+O` for the technical lines, `Ctrl+C` to quit. `Esc` does nothing —
+it is the interrupt key of the agent CLIs themselves, and quitting on it was a
+v1 mistake.
+
+The chat pane shows what the PM said, what you asked, mana's own notices and
+anything it is blocked on. Everything else a session produces — the model's
+reasoning, tool activity, the CLI's stderr, frames mana did not recognise — is
+kept but collapsed to one dim line counting it:
+
+    · 42 technical lines (Ctrl+O)
+
+`Ctrl+O` opens those lines and closes them again; the counter runs from the
+start of the session and does not reset. Nothing is dropped and nothing is
+silent — a CLI whose output stops making sense shows up as a counter climbing
+far too fast, and one keystroke says why.
 
 ### Quitting
 
@@ -191,9 +204,14 @@ whether the PM actually behaves like one. That is what this checklist is for.
    - `~/.mana/projects/<dirname>/mcp-config.json` names mana's **own binary**
      by absolute path and passes `--project-root <that directory>`;
    - `~/.mana/projects/<dirname>/{tasks,logs,reviews}` exist;
-   - the PM greets you in the chat pane within a few seconds — not as dimmed
-     `·` lines. Dimmed lines mean the catalogue's `[pm.events]` paths no longer
-     match claude's stream (degraded on purpose, never silent).
+   - the PM greets you in the chat pane within a few seconds, as plain text.
+     If all you get is the counter climbing (`· N technical lines (Ctrl+O)`),
+     press `Ctrl+O`: the greeting arriving as dimmed `·` lines means the
+     catalogue's `[pm.events]` paths no longer match claude's stream (degraded
+     on purpose, never silent);
+   - nothing mana sent the PM is in the pane. The activation is a briefing
+     mana wrote, and the launch is worth exactly one dim line
+     (`session initialized on …`), not a paragraph attributed to you.
 4. Ask: *"list the agents you can dispatch to"*. The PM must call
    `list_agents` and answer with the CLIs, their models, cost classes and
    counters. If it says it has no tools, the MCP registration did not take.
@@ -206,7 +224,9 @@ whether the PM actually behaves like one. That is what this checklist is for.
    Confirm the PM calls `create_task` then `launch_subagent`, and that it
    reports back roughly one line, not a narration of every tool call.
 7. Press `Ctrl+G`. The graph pane shows one node per dispatch:
-   `◉ [EXE] claude/haiku <task>` while it runs, `○` once done.
+   `◉ [EXE] claude/haiku <task>` while it runs, `○` once done. Press `Ctrl+O`:
+   the collapsed lines appear — tool activity as `⚙ <name> …` / `⚙ <name> ✓`,
+   never a call id — and pressing it again puts the counter back.
 8. When the executor finishes, confirm the PM reacts on its own — mana injects
    `[mana] executor finished for task …` into the session (visible as a cyan
    `*` line), and the PM should launch a reviewer without being asked.
