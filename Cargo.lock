@@ -1220,6 +1220,7 @@ dependencies = [
  "crossterm",
  "dialoguer",
  "dirs",
+ "libc",
  "notify",
  "portable-pty",
  "ratatui",
