@@ -13,8 +13,8 @@ mod review;
 mod spawn;
 mod subprocess;
 mod task;
-mod worktree;
 mod tui;
+mod worktree;
 
 use clap::Parser;
 use cli::{Cli, Command, normalize_help_invocation};
