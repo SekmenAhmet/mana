@@ -1,9 +1,10 @@
 //! `mana doctor` — the catalogue, this project and the configuration, as mana
 //! sees them right now.
 //!
-//! Catalogue-first, because the catalogue is what mana actually acts on: the
-//! config file only records which CLIs were registered, while every flag,
-//! driver, model, quota pool and failure signature is data in
+//! Catalogue-first, because the catalogue is the only thing mana acts on:
+//! there is no registry of installed CLIs any more (that went with
+//! `~/.mana/config.toml`), so a binary is either on `PATH` or it is not, and
+//! every flag, driver, model, quota pool and failure signature is data in
 //! `catalog/*.toml`. Nothing below branches on a CLI's id — every per-CLI fact
 //! printed here is read off its entry, which is the only way this report can
 //! stay true for a CLI added through `~/.mana/catalog.local.toml`.
@@ -19,14 +20,14 @@
 //!   (the list degrades, dispatch does not), a quota pool resting on a cooldown
 //!   (that is the system working), a leftover worktree (disk, not
 //!   correctness).
-//! - **1** — the report ran and at least one finding is broken, i.e. anything
-//!   `Report::broken` was called for: a *registered* CLI whose binary has
-//!   vanished (every dispatch to it fails at spawn); a **stale** dispatch (a
-//!   dead pid with no exit record — an agent that will never finish and never
-//!   notify the PM); a config file mana cannot read, including v1's leftover
-//!   `config.yaml`; a `catalog.local.toml` mana cannot parse (dispatch silently
-//!   runs on the shipped entry instead of yours); a `--prune` that failed and
-//!   left the worktree behind.
+//! - **1** — the report ran and at least one finding is broken. Stated as the
+//!   rule rather than as a list, because the list is meant to grow and a list
+//!   here would go stale the first time it did: broken is whatever
+//!   `Report::broken` was called for, and `Report::exit_code` is exactly "is
+//!   that collection non-empty". The bar for calling it is that mana keeps
+//!   doing the wrong thing until a human acts — a dispatch nothing will ever
+//!   finish, an override that silently routes on the shipped catalogue instead
+//!   of yours, a cleanup that was asked for and did not happen.
 //! - **2** — no report: doctor could not get far enough to print one. Never
 //!   returned for a finding, only for doctor itself failing.
 //!
@@ -300,8 +301,9 @@ fn catalogue_section(
                     },
                 );
             }
-            // Not broken: nobody has to install every catalogued CLI. It only
-            // becomes broken once it is *registered* -- see `config_section`.
+            // Not broken: nobody has to install every catalogued CLI, and
+            // nothing registers one either -- a dispatch that names a missing
+            // binary fails loudly at spawn, when it is asked for.
             None => {
                 field(
                     report,
@@ -772,9 +774,9 @@ fn worktree_section(
             // not broken -- but a *failed* prune is: the cleanup the user
             // asked for did not happen, and a script that read exit 0 here
             // would move on believing the directory is gone.
-            Err(error) => {
-                report.broken(format!("  {dir_name}  age {age}  prune failed: {error:#}"))
-            }
+            Err(error) => report.broken(format!(
+                "  BROKEN: {dir_name}  age {age}  prune failed: {error:#}"
+            )),
         }
     }
     Ok(())

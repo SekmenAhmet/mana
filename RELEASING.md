@@ -233,6 +233,15 @@ whether a newer release exists, and prints one line into the chat pane if so:
 
 Never blocking, never fatal, silent when offline. The answer is cached in
 `~/.mana/update-check.json` for 24 hours, so at most one request a day.
-`MANA_NO_UPDATE_CHECK=1` turns it off entirely. `mana ps`, `mana kill`, `mana
-doctor` and `mana mcp-server` never touch the network — the last of those is a
-protocol server on stdio, where a stray HTTP request would be a defect.
+`MANA_NO_UPDATE_CHECK=1` turns it off entirely.
+
+`mana ps` and `mana kill` never touch the network. Two neighbours that used to
+be listed here do not qualify, and saying so is cheaper than a surprise:
+
+- `mana doctor` runs each catalogue entry's own discovery command (`agy
+  models`, `opencode models` today) to report a live model list, and those
+  answer over their CLI's network. It issues no request of mana's own, which is
+  a different claim from making none.
+- `mana mcp-server` is a protocol server on stdio, so a stray HTTP request from
+  *its* process would be a defect — but the sub-agents it spawns are agent CLIs
+  talking to their providers, which is the entire point of them.

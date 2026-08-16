@@ -391,7 +391,9 @@ pub(crate) fn signal(pid: u32) -> Result<()> {
 /// its timeout: an operator kill and a timeout must give the same guarantee on
 /// the same platform, and the tree walk is the only thing that reaches the
 /// agent once the direct child is the `.cmd` shim's `cmd.exe`.
-/// Unmeasured on a real Windows box — v2 ships no Windows CI.
+/// Compiled and linted on `windows-latest` by CI, never executed there: every
+/// test that spawns a real process lives in a `#[cfg(all(test, unix))]` module,
+/// so no run of this function has ever been measured.
 #[cfg(windows)]
 pub(crate) fn signal(pid: u32) -> Result<()> {
     let output = std::process::Command::new("taskkill")

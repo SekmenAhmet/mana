@@ -93,12 +93,13 @@ The PM reaches mana's own orchestration tools — `create_task`,
 ### Tasks and isolation
 
 Every task the PM creates gets its own git worktree, branched from the
-project's own repo under `~/.mana/worktrees/<project>/<task>`. Sub-agents work
-only inside that worktree, so parallel dispatches never collide with each
-other or with your own checkout. A project needs to be a git repository for
-any write role to run at all — without one, mana refuses the dispatch with a
-clear message rather than offering a degraded write path. Read-only roles
-(reviewers) need no worktree.
+project's own repo under `~/.mana/worktrees/<project>/<task>`. Sub-agents are
+spawned with that worktree as their working directory and told to stay in it,
+so parallel dispatches edit separate checkouts instead of racing on one — a
+convention, not a sandbox: see [Trust model](#trust-model). A project needs to
+be a git repository for any write role to run at all — without one, mana
+refuses the dispatch with a clear message rather than offering a degraded
+write path. Read-only roles (reviewers) need no worktree.
 
 ### Executor and reviewer loop
 
@@ -130,9 +131,13 @@ explicitly.
 Every CLI-specific fact — argv templates, event JSONPaths, failure
 signatures, skill directories — lives in `catalog/*.toml`, one file per CLI,
 embedded in the binary and validated at build time: a malformed catalogue
-fails `cargo test`, never ships. `~/.mana/catalog.local.toml` can replace any
-one entry wholesale, so a CLI that changes its flags overnight is a config
-edit, not a release. This is the rule the whole design answers to:
+fails `cargo test`, never ships. `~/.mana/catalog.local.toml` replaces one
+shipped entry wholesale — or adds a fifth CLI — so a CLI that changes its
+flags overnight is a config edit, not a release. One entry, and exactly one:
+the file is parsed as a single entry, so a second `[cli]` table in it is a
+TOML error, and every command but `mana doctor` (which falls back to the
+shipped catalogue and reports the failure) refuses to start until it is fixed.
+This is the rule the whole design answers to:
 
 > **Anything that differs between CLIs is a field in the catalogue, never a
 > branch in the code.**
@@ -146,7 +151,7 @@ meant to be rare, the way adding a new database driver is rare.
 | CLI | PM driver | Tool channel | Sub-agent support | Notes |
 |---|---|---|---|---|
 | **Claude Code** (`claude`) | `stream` | `mcp` | yes, unlimited concurrency | PM is mechanically read-only: `--allowedTools mcp__mana__*,Read,Grep,Glob` is verified to block Edit/Write at the tool layer, not just by instruction. |
-| **Antigravity** (`agy`) | `oneshot-continue` | `sentinel` | yes, max 1 concurrent — two parallel dispatches crashed within 8s in testing | No MCP or ACP surface exists on this CLI, and no permission-allowlist flag either, so the no-code rule rests on the skill text alone — though print mode happens to auto-deny every tool permission request, which blocks writes as a side effect. The PM can't read its own skill file here, so the role text is inlined straight into the activation message instead. No quota failure has ever been observed from it, so no cooldown signature is catalogued yet. |
+| **Antigravity** (`agy`) | `oneshot-continue` | `sentinel` | yes, max 1 concurrent — two parallel dispatches crashed within 8s in testing. The cap counts sub-agent dispatches only, so while agy is the PM its own turn plus one agy sub-agent are already two agy processes; mana permits that and builds nothing to avoid it, so route sub-agents to another CLI. | No MCP or ACP surface exists on this CLI, and no permission-allowlist flag either, so the no-code rule rests on the skill text alone — though print mode happens to auto-deny every tool permission request, which blocks writes as a side effect of blocking reads too: an agy PM cannot inspect the repository and plans from what you paste into the chat. The PM can't read its own skill file here, so the role text is inlined straight into the activation message instead. No quota failure has ever been observed from it, so no cooldown signature is catalogued yet. |
 | **GitHub Copilot CLI** (`copilot`) | `acp` | `mcp` (attached over argv, not the native ACP path) | yes, max 1 concurrent (unmeasured; conservative default) | ACP's `session/new` rejects mana's stdio MCP server outright (`Rejecting non-http/sse MCP server`); `--additional-mcp-config @<file>` is the path that actually works. Its model list could not be measured — the only account available had already exhausted its monthly quota — so only `auto` is catalogued. |
 | **opencode** | `acp` | `mcp` (native, via `session/new`'s `mcpServers`) | yes, unlimited — two in parallel measured clean | Degraded: the PM is **not** mechanically read-only here. In testing it ran opencode's own `bash` and `read` tools directly, with no permission prompt, even though mana advertised no filesystem or terminal capability at the ACP handshake. The no-code rule rests on the skill text alone. |
 
@@ -193,8 +198,9 @@ mana can only drive CLIs the catalogue knows about — currently claude, agy,
 copilot, opencode. A CLI with no entry has no spawn flags, no failure
 signatures and no PM driver, so a name alone would only be a name every
 dispatch then fails on. Add one by dropping an entry into
-`~/.mana/catalog.local.toml`; set its `bin` to an absolute path there if you
-need to pin a specific binary rather than take whatever `PATH` offers.
+`~/.mana/catalog.local.toml`, which holds a single entry and no more; set its
+`bin` to an absolute path there if you need to pin a specific binary rather
+than take whatever `PATH` offers.
 
 ## Usage
 
@@ -278,10 +284,17 @@ daad9367  executor  agy/gemini-3  9d4e4a7b  75899  2d   stale
 ```
 
 Status is derived, never stored: `done` means the agent's log carries an
-`exited` record, `running` means its pid still answers, and `stale` means
-neither — the process is gone and no exit was ever recorded, so nothing will
-finish that dispatch and the PM is still waiting on it. `mana ps` always exits
-0, so it is always safe to pipe.
+`exited` record, `running` means its pid still answers, and `stale` means the
+process is gone and no exit was ever recorded, so nothing will finish that
+dispatch and the PM is still waiting on it. There is a fourth, `unknown`, for
+when mana could not ask at all: the record carries no pid, or the platform gave
+no answer about it — Windows, where liveness is `tasklist` and a `tasklist`
+that fails is not evidence of a dead process. `mana ps` prints a note under the
+table saying which of the two it was. It is an unhelpful state, and it stays
+that way: `mana kill` refuses a pid-less row rather than guess what to signal,
+and `mana doctor --prune` spares only the worktrees of dispatches it can see
+running, so an `unknown` one's worktree is treated as a leftover. `mana ps`
+always exits 0, so it is always safe to pipe.
 
 ### `mana kill`
 
@@ -323,10 +336,15 @@ its PM driver and tool channel, its models (static or discovered live), its
 quota pools and failure signatures, any pair currently on cooldown, and every
 capability it lacks (no auto-approve flag, no allowlist, a concurrency cap).
 Then the project's dispatch counters, anything still running or stale, and
-leftover worktrees. The exit code is `1` for a stale dispatch and `0` for
-everything else (a catalogued CLI that is not installed, an active cooldown,
-a leftover worktree are all reported and still exit clean), so
-`mana doctor | grep BROKEN` is a meaningful check.
+leftover worktrees. Three exit codes, because "the report never ran" and "the
+report ran and found something" are different answers: `0` is a report with
+nothing broken in it, `1` a report carrying at least one broken finding, and
+`2` no report at all — doctor could not get far enough to print one. What
+counts as broken is whatever the report flagged as such, and that list grows
+with the checks; reported but deliberately not broken are a catalogued CLI you
+never installed, a failed model discovery, an active cooldown, a leftover
+worktree. Every finding is labelled `BROKEN`, so `mana doctor | grep BROKEN`
+and the exit code agree.
 
 ### `mana upgrade`
 
@@ -344,8 +362,12 @@ exists, prints a single line into the chat pane:
 Never blocking and never fatal — offline looks the same as up to date. The
 answer is cached for 24 hours in `~/.mana/update-check.json`, so it costs at
 most one request a day; set `MANA_NO_UPDATE_CHECK=1` to turn it off entirely.
-`mana ps`, `mana kill`, `mana doctor`, and the MCP server never touch the
-network.
+Apart from that check, `mana ps` and `mana kill` never touch the network.
+`mana doctor` does: to report a live model list it runs each entry's own
+discovery command (`agy models` and `opencode models` today), and those answer
+over their CLI's network, on their CLI's account. The MCP server issues no
+request of its own — but the sub-agents it spawns are agent CLIs, and talking
+to a provider is what they are for.
 
 ### `mana mcp-server`
 
@@ -412,10 +434,19 @@ the installers.
 Sub-agents run with whatever auto-approve flag the catalogue declares for
 that CLI (claude's `--dangerously-skip-permissions`, copilot's
 `--allow-all-tools`, and so on) — they are unattended by design, with no
-human available to answer a permission prompt, and the git worktree each task
-gets is what makes that safe: an executor can only damage its own disposable
-checkout, never the project you are actually working in or another task's
-in-flight work.
+human available to answer a permission prompt. The git worktree each task gets
+is not what makes that safe, and nothing else here is either: mana spawns the
+sub-agent with the worktree as its working directory, and the executor prompt
+tells it to work only inside that path. That is a convention, not a
+confinement. No sandbox, no path allowlist, no filesystem restriction is ever
+passed, so the process runs with your full rights — an executor given, or
+inventing, an absolute path outside `~/.mana/worktrees/<project>/<task>` writes
+there, and your own checkout and every sibling task's worktree are as writable
+as anything else you own. What the worktree does buy is narrower and real:
+parallel dispatches edit separate checkouts instead of racing on one, and the
+executor's commits land on their own branch instead of in your working tree.
+Pre-approving permissions for an unattended agent is a bet on the CLI and the
+model; the worktree does not cover it.
 
 The PM is a different story, and deliberately not as clean: it needs to read
 the project to plan, but should never write code, and how well that is
@@ -423,13 +454,18 @@ actually enforced varies by CLI. Claude gives mana a real mechanism —
 `--allowedTools mcp__mana__*,Read,Grep,Glob` — verified to block Edit/Write at
 the tool layer, not just by instruction. agy has no allowlist flag at all, but
 its print mode happens to auto-deny every tool permission request, which
-blocks writes as a side effect of blocking everything. Copilot's equivalent is
-unverified — the one real test run hit an exhausted quota before any tool call
-landed. opencode is the honest bad case: in testing it ran its own `bash` and
-`read` tools directly, no permission prompt sent, so its PM's no-code rule
-rests entirely on the skill text asking nicely. Where the mechanism is
-missing, that is not hidden — the catalogue's notes say so, and so does this
-README.
+blocks writes as a side effect of blocking everything — `view_file`,
+`grep_search` and `run_command` were each denied in testing, so an agy PM
+cannot read the project it is planning for and works from what you paste into
+the chat and nothing else. There is no read-only-approve mode to reach for:
+agy's one permission flag is the all-or-nothing
+`--dangerously-skip-permissions`, which a PM must never be given. Copilot's
+equivalent is unverified — the one real test run hit an exhausted quota before
+any tool call landed. opencode is the honest bad case: in testing it ran its
+own `bash` and `read` tools directly, no permission prompt sent, so its PM's
+no-code rule rests entirely on the skill text asking nicely. Where the
+mechanism is missing, that is not hidden — the catalogue's notes say so, and
+so does this README.
 
 ## Status and roadmap
 

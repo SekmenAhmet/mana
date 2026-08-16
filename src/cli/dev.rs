@@ -1,16 +1,18 @@
-//! `mana dev` -- the scaffolding that lets a human drive the pipeline before
-//! the PM can.
+//! `mana dev` -- the scaffolding that lets a human drive the pipeline without
+//! the PM.
 //!
 //! Milestone 1 is "task → executor → reviewer → verdict, against a real CLI",
-//! and the PM that will eventually issue those dispatches does not exist yet
-//! (phase 2). Rather than wait, this command composes the same functions the
-//! MCP tools will call, so the loop is exercised end to end months before its
-//! caller lands -- v1's core defect was five phases that had never once run
-//! together.
+//! and this predates the PM that issues those dispatches (`crate::mcp`,
+//! `cli::launch_pm`, both landed since). Rather than wait, this command
+//! composes the same functions the MCP tools call, so the loop was exercised
+//! end to end months before its caller existed -- v1's core defect was five
+//! phases that had never once run together. It stays because driving one task
+//! against a named CLI and model, with no PM session in the way, is still the
+//! shortest way to exercise the loop.
 //!
 //! Hidden from `--help` because it is developer scaffolding with an unstable
-//! surface: it takes a CLI *and* a model as arguments precisely because the
-//! router that will choose them is task 2.1.
+//! surface: it takes a CLI *and* a model as arguments to bypass `mcp::routing`,
+//! which is what picks them for a real dispatch.
 
 use crate::catalog::{Catalog, CliEntry};
 use crate::dispatch::{self, DispatchOutcome, ExecutorRun, ReviewerRun};

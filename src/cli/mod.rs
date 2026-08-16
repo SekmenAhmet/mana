@@ -67,8 +67,8 @@ pub enum Command {
     /// Update mana
     Upgrade,
     /// Developer scaffolding for the v2 pipeline. Hidden because its surface
-    /// is unstable and it exists to drive by hand what the PM will drive over
-    /// MCP once phase 2 lands -- not something to document to users.
+    /// is unstable and it drives by hand what the PM now drives over MCP --
+    /// not something to document to users.
     #[command(hide = true)]
     Dev {
         #[command(subcommand)]
@@ -91,9 +91,14 @@ pub enum Command {
     },
 }
 
-/// clap's generated `help` subcommand only understands `mana help <cmd>`.
-/// `mana help.md` also documents `mana <cmd> help` as valid — this rewrites
-/// a trailing `help` token to the front so both forms parse identically.
+/// clap's generated `help` subcommand only understands `mana help <cmd>`; this
+/// rewrites a trailing `help` token to the front so `mana <cmd> help` parses
+/// identically. The second form came from a `mana help.md` that is not in this
+/// repo and never was, so there is nothing left to check the requirement
+/// against: the one spec in the tree that mentions help
+/// (`docs/superpowers/specs/2026-08-13-mana-design.md`, §`mana help`) delegates
+/// it to clap entirely and names no such form. What is left is a habit and this
+/// file's tests; see #55 for whether that earns the function.
 /// `args` includes the program name at index 0, same shape as
 /// `std::env::args().collect()`.
 pub fn normalize_help_invocation(args: Vec<String>) -> Vec<String> {
