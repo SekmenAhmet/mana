@@ -94,9 +94,17 @@ alternative was adding the `zip` crate to the audit surface for one platform.
 
 Each archive unpacks to a directory, not a flat set of files:
 `mana-<target>/mana`. `src/cli/upgrade.rs` knows this, and a test asserts the
-names and the layout against what `dist plan` actually prints — change
+names and the layout against a *recorded* `dist plan` run — change
 `dist-workspace.toml` in a way that would break `mana upgrade` and the test
 fails first.
+
+No test runs `dist`; the recording is a hand-copied list, pinned to the dist
+version it was taken from. So **bumping `cargo-dist-version` is a two-step
+edit**: change the version in `dist-workspace.toml` *and* the installer URL in
+`ci.yml`, then re-run `dist plan` and re-copy its artifact names into
+`DIST_PLAN_ARTIFACTS`. `recorded_dist_plan_is_still_the_pinned_dist` fails until
+you do — that is the only thing standing between a dist that renames archives
+and a `mana upgrade` that cannot find the binary.
 
 ## Decisions, and why
 

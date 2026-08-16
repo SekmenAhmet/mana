@@ -77,7 +77,7 @@ struct Driven {
     reviewer: Option<ReviewerRun>,
     verdict: Option<Verdict>,
     /// Why the verdict is missing, already rendered: two reviewer runs both
-    /// failed to leave a usable one.
+    /// failed to leave a usable one, or a reviewer never started at all.
     verdict_error: Option<String>,
     /// Whether the corrective re-dispatch was needed. Worth surfacing: a
     /// model that needs it every time is a role-text problem, not a fluke.
@@ -97,6 +97,11 @@ fn drive(
     project_root: &Path,
     mana_home: &Path,
 ) -> Result<Driven> {
+    // The same gate the MCP path runs before it spends anything: this command
+    // takes the model straight off the command line, so a typo would otherwise
+    // buy a worktree and a real dispatch to hear the CLI say "no such model".
+    crate::mcp::routing::validate_model(entry, model)?;
+
     // A fresh id per dispatch: each one is a separate registry record with a
     // log of its own, and `mana ps`/`mana kill` resolve agents by that id.
     let executor_id = new_agent_id();
@@ -121,7 +126,7 @@ fn drive(
     }
 
     let first_review_id = new_agent_id();
-    let mut reviewer = dispatch::dispatch_reviewer(
+    let first = dispatch::dispatch_reviewer(
         &dispatch::Assignment {
             agent_id: &first_review_id,
             entry,
@@ -132,7 +137,22 @@ fn drive(
         },
         &executor.worktree,
         None,
-    )?;
+    );
+    // A reviewer that never spawned -- CLI gone, worktree removed under it --
+    // must not `?` out of here: the executor's run is finished and paid for,
+    // and the summary is the only thing that names the worktree holding it.
+    let mut reviewer = match first {
+        Ok(run) => run,
+        Err(error) => {
+            return Ok(Driven {
+                executor,
+                reviewer: None,
+                verdict: None,
+                verdict_error: Some(format!("the reviewer never ran: {error:#}")),
+                retried: false,
+            });
+        }
+    };
 
     let mut retried = false;
     let mut verdict = None;
@@ -146,7 +166,7 @@ fn drive(
             // registry record and a log of its own, and reusing the first id
             // would make `mana ps`/`mana kill` see one agent twice.
             let retry_id = new_agent_id();
-            reviewer = dispatch::dispatch_reviewer(
+            let retry = dispatch::dispatch_reviewer(
                 &dispatch::Assignment {
                     agent_id: &retry_id,
                     entry,
@@ -157,10 +177,21 @@ fn drive(
                 },
                 &executor.worktree,
                 Some(&correction(&error, &reviewer.review_path)),
-            )?;
-            match review::read_verdict(&reviewer.review_path) {
-                Ok(second) => verdict = Some(second),
-                Err(second_error) => verdict_error = Some(format!("{second_error:#}")),
+            );
+            match retry {
+                Ok(second_run) => {
+                    reviewer = second_run;
+                    match review::read_verdict(&reviewer.review_path) {
+                        Ok(second) => verdict = Some(second),
+                        Err(second_error) => verdict_error = Some(format!("{second_error:#}")),
+                    }
+                }
+                // Same reason as the first dispatch, and the first reviewer
+                // run stays in the summary because it too was paid for.
+                Err(dispatch_error) => {
+                    verdict_error =
+                        Some(format!("the second reviewer never ran: {dispatch_error:#}"));
+                }
             }
         }
     }
@@ -209,6 +240,10 @@ fn render_summary(driven: &Driven, project_root: &Path) -> String {
         if driven.retried {
             out.push_str("          (re-dispatched once after an unusable verdict)\n");
         }
+    } else if driven.executor.outcome.succeeded() {
+        // The executor finished, so the missing reviewer is a dispatch that
+        // never started; the verdict line below carries why.
+        out.push_str("reviewer  not run -- the dispatch failed\n");
     } else {
         out.push_str("reviewer  not run -- the executor did not finish cleanly\n");
         // The first real M1 dispatch failed in 2.5s on a CLI flag error that
@@ -250,12 +285,15 @@ fn render_summary(driven: &Driven, project_root: &Path) -> String {
         worktree.branch, worktree.base_ref
     ));
     // Cleanup stays manual for milestone 1: the whole point of the worktree
-    // is that a human can go and look at what the agent actually did.
+    // is that a human can go and look at what the agent actually did. The hint
+    // names `doctor --prune` rather than a hand-written `git worktree remove`,
+    // which is what `worktree::remove_at` does anyway -- doubled `--force`, a
+    // directory removal when git refuses, then a prune -- and the bare git call
+    // gives up on the half-dead worktree that most needs removing.
     out.push_str(&format!(
-        "worktree  {} (kept)\n          cleanup: git -C {} worktree remove --force {}",
+        "worktree  {} (kept)\n          cleanup: mana doctor --prune (in {})",
         worktree.path.display(),
         project_root.display(),
-        worktree.path.display()
     ));
     out
 }
@@ -283,7 +321,8 @@ fn exit_status(driven: &Driven) -> Result<()> {
             "the reviewer rejected this task ({} issue(s))",
             verdict.issues.len()
         ),
-        (None, Some(error)) => bail!("no usable verdict after two reviewer runs: {error}"),
+        // The stored reason already says which run failed and how.
+        (None, Some(error)) => bail!("no usable verdict: {error}"),
         (None, None) => bail!("the reviewer produced no verdict"),
     }
 }
@@ -362,7 +401,7 @@ esac
         let summary = render_summary(&driven, &fixture.project);
         assert!(summary.contains("verdict   Validated"), "{summary}");
         assert!(summary.contains("worktree"), "{summary}");
-        assert!(summary.contains("worktree remove --force"), "{summary}");
+        assert!(summary.contains("mana doctor --prune"), "{summary}");
         // The worktree survives the run: milestone 1 wants it inspectable.
         assert!(driven.executor.worktree.path.join("done.txt").exists());
     }
@@ -511,6 +550,73 @@ esac
         // One dispatch only: no reviewer was paid for.
         let registry = crate::lock::load_registry(&fixture.paths().subagents_file).unwrap();
         assert_eq!(registry.records.len(), 1);
+        assert!(exit_status(&driven).is_err());
+    }
+
+    #[test]
+    fn an_unknown_model_is_refused_before_anything_is_spawned() {
+        let fixture = Fixture::new();
+        let mut entry = both_roles(&fixture, "");
+        // No discovery args either, so the catalogue can prove this id wrong
+        // -- which is the state a real entry with a curated list is in.
+        entry.models.discovery_args.clear();
+
+        let error = drive(
+            &entry,
+            "gpt-5",
+            &task(),
+            &fixture.project,
+            &fixture.mana_home,
+        )
+        .map(|_| ())
+        .unwrap_err()
+        .to_string();
+
+        assert!(error.contains("unknown model"), "{error}");
+        // Nothing was paid for and nothing was created: mana's home is where
+        // the worktree, the log and the registry record would have appeared.
+        assert!(!fixture.mana_home.exists(), "a refused model still spawned");
+    }
+
+    #[test]
+    fn a_reviewer_that_cannot_be_dispatched_still_reports_the_worktree() {
+        let fixture = Fixture::new();
+        // The executor deletes the CLI on its way out, so the reviewer cannot
+        // be spawned at all -- the executor's work is done and paid for, and
+        // its worktree is the only thing the run produced.
+        let bin = fixture.script(
+            "vanishing-cli",
+            &format!("{COMMITTING_EXECUTOR}\nrm -f \"$0\"\n"),
+        );
+        let entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
+
+        let driven = drive(
+            &entry,
+            "cheapo",
+            &task(),
+            &fixture.project,
+            &fixture.mana_home,
+        )
+        .unwrap();
+
+        assert!(driven.executor.outcome.succeeded());
+        assert!(driven.reviewer.is_none());
+        let error = driven.verdict_error.as_ref().unwrap();
+        assert!(error.contains("never ran"), "{error}");
+
+        let summary = render_summary(&driven, &fixture.project);
+        assert!(
+            summary.contains(&driven.executor.worktree.path.display().to_string()),
+            "{summary}"
+        );
+        assert!(
+            summary.contains(&driven.executor.worktree.branch),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("reviewer  not run -- the dispatch failed"),
+            "{summary}"
+        );
         assert!(exit_status(&driven).is_err());
     }
 

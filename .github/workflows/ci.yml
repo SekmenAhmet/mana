@@ -33,6 +33,23 @@ jobs:
       matrix:
         # windows is in the matrix because v2 claims cross-platform support —
         # claimed-but-untested is how the v1 flow shipped broken.
+        #
+        # What that leg actually proves, measured at 0.1.0 (issue #105): 427 of
+        # 548 in-module tests run there — 423 shared with unix plus 4 that only
+        # exist here — and all 5 in tests/cli_smoke.rs. The 125 that do not are
+        # `#[cfg(all(test, unix))]` because they exec `sh` fixtures: fake CLIs,
+        # backgrounded grandchildren, `process_group(0)`. Porting each to a
+        # batch file would be a second fixture suite to keep true, not a second
+        # platform tested — those tests cover logic that already has a
+        # platform-free test beside it (see `age_check_with`, `recycled_by_age`,
+        # `render_table`: the pure half split out from the syscall on purpose).
+        #
+        # The gap that was worth closing is the other direction — Windows-only
+        # code no leg could reach at all, where a typo in a shelled-out argument
+        # list is invisible to the compiler. Now covered:
+        # `spawn::windows_process_tests` (the `.cmd`-shim tree kill, hence
+        # `taskkill /T /F`) and `status::windows_process_tests` (`tasklist`
+        # parsing, the PowerShell creation-time read, and `guard`'s refusal).
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       # Every third-party action is pinned to a full commit SHA, not a tag: a

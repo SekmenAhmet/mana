@@ -4,9 +4,15 @@
 //! Both halves talk to the same GitHub Release that `cargo-dist` built from
 //! the tag `release-plz` pushed (see RELEASING.md). That is why the artifact
 //! layout is spelled out here as constants rather than left to `self_update`'s
-//! guesswork: `archive_name` is asserted against what `dist plan` actually
-//! prints, so a change to `dist-workspace.toml` that would break `mana upgrade`
-//! fails a test instead of a user's update.
+//! guesswork: `archive_name` is asserted against a *recorded* run of `dist
+//! plan` (`DIST_PLAN_ARTIFACTS` below), so a change to `dist-workspace.toml`
+//! that would break `mana upgrade` fails a test instead of a user's update.
+//!
+//! No test here runs `dist`. The recording is pinned to the dist version that
+//! produced it, and that pin is checked against `dist-workspace.toml` and
+//! `ci.yml` — so the one thing a snapshot cannot notice on its own, dist
+//! changing its naming under a version bump, becomes a failing test at the
+//! moment of the bump rather than at the next `mana upgrade`.
 
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -80,7 +86,7 @@ const CACHE_FILE: &str = "update-check.json";
 
 /// The archive cargo-dist uploads for `target`.
 ///
-/// Asserted against `dist plan`'s real output in the tests below.
+/// Asserted against a recorded `dist plan` run in the tests below.
 fn archive_name(target: &str) -> String {
     format!("{BIN_NAME}-{target}{ARCHIVE_EXT}")
 }
@@ -496,9 +502,22 @@ mod tests {
         );
     }
 
+    /// The dist that produced `DIST_PLAN_ARTIFACTS`. Everything below is a
+    /// recording, not a query, so this is the recording's expiry date:
+    /// `recorded_dist_plan_is_still_the_pinned_dist` fails the moment either
+    /// copy of the version moves, which is the only moment cargo-dist can
+    /// change how it names or lays out an archive.
+    const DIST_PLAN_VERSION: &str = "0.32.0";
+
     /// The names `dist plan` printed for this exact `dist-workspace.toml`
-    /// (dist 0.32.0, 2026-08-15), copied verbatim. If cargo-dist ever changes
-    /// how it names archives, this list is what notices.
+    /// (dist 0.32.0, 2026-08-15), copied verbatim by hand.
+    ///
+    /// Nothing here executes `dist`: both sides of the comparison below are
+    /// files in this repo, so what the comparison proves is that `BIN_NAME`,
+    /// `ARCHIVE_EXT` and `[dist].targets` still agree with what was observed
+    /// once — not that dist would print the same today. `DIST_PLAN_VERSION` is
+    /// what carries the second half; re-run `dist plan` and re-copy this list
+    /// when it fails.
     const DIST_PLAN_ARTIFACTS: &[&str] = &[
         "mana-aarch64-apple-darwin.tar.gz",
         "mana-aarch64-unknown-linux-gnu.tar.gz",
@@ -511,9 +530,7 @@ mod tests {
     /// itself rather than repeated here: adding a target without teaching
     /// `mana upgrade` about it should fail, not ship.
     fn configured_targets() -> Vec<String> {
-        let config: toml::Value = toml::from_str(include_str!("../../dist-workspace.toml"))
-            .expect("dist-workspace.toml is valid TOML");
-        config["dist"]["targets"]
+        dist_config()["dist"]["targets"]
             .as_array()
             .expect("[dist].targets is an array")
             .iter()
@@ -521,8 +538,38 @@ mod tests {
             .collect()
     }
 
+    fn dist_config() -> toml::Value {
+        toml::from_str(include_str!("../../dist-workspace.toml"))
+            .expect("dist-workspace.toml is valid TOML")
+    }
+
+    /// The load-bearing half of the naming contract, and the one a snapshot
+    /// cannot check on its own.
+    ///
+    /// `DIST_PLAN_ARTIFACTS` is only as true as the dist that printed it. Both
+    /// places that decide which dist runs -- the version CI installs and the
+    /// version dist itself enforces -- are checked against it, because either
+    /// one moving alone is a release built by a dist nobody recorded. Bumping
+    /// them means re-running `dist plan` and re-copying its output, which is
+    /// exactly the manual step this test exists to force.
     #[test]
-    fn archive_name_matches_what_dist_plan_prints_for_every_target() {
+    fn recorded_dist_plan_is_still_the_pinned_dist() {
+        assert_eq!(
+            dist_config()["dist"]["cargo-dist-version"].as_str(),
+            Some(DIST_PLAN_VERSION),
+            "dist-workspace.toml pins a dist the recorded `dist plan` output was not taken from"
+        );
+        // The installer URL in CI carries the version as a path segment; a
+        // substring match is enough to catch the copy drifting.
+        let ci = include_str!("../../.github/workflows/ci.yml");
+        assert!(
+            ci.contains(&format!("/download/v{DIST_PLAN_VERSION}/")),
+            "ci.yml installs a different dist than dist-workspace.toml pins"
+        );
+    }
+
+    #[test]
+    fn archive_name_matches_the_recorded_dist_plan_for_every_target() {
         let mut produced: Vec<String> = configured_targets()
             .iter()
             .map(|target| archive_name(target))

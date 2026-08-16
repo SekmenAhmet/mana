@@ -192,13 +192,11 @@ pub fn probe(pid: u32) -> Liveness {
 /// the "no tasks match" line tasklist prints instead is prose, and prose in
 /// any language contains no `"1234"`.
 ///
-/// CI builds and lints this on `windows-latest`, but nothing there runs it:
-/// `probe_refuses_pid_zero_rather_than_signalling_our_own_group` returns before
-/// the `tasklist` call and every test that spawns a real process is in
-/// `process_tests`, which is `#[cfg(all(test, unix))]`. So the parsing below is
-/// unmeasured. Every failure reads as `Unknown`, so the worst case is a
-/// `mana ps` that says it does not know — never one that claims a dead agent is
-/// running.
+/// Exercised on `windows-latest` by `windows_process_tests` below, against the
+/// test runner's own pid and a freshly reaped one — both branches of the match,
+/// with a real `tasklist` on the other end. Every failure still reads as
+/// `Unknown`, so the worst case is a `mana ps` that says it does not know —
+/// never one that claims a dead agent is running.
 #[cfg(windows)]
 pub fn probe(pid: u32) -> Liveness {
     if pid == 0 {
@@ -864,6 +862,79 @@ mod tests {
             age_check_with(None, 4242, &long_ago, Utc::now(), unverified.clone()),
             unverified
         );
+    }
+}
+
+/// The Windows twin of `process_tests`, narrowed to the two functions no other
+/// platform has: `probe` shells out to `tasklist` and `elapsed_secs` to
+/// `powershell`, and both argument lists are plain strings the compiler cannot
+/// check. `cargo build --all-targets` on `windows-latest` type-checks them and
+/// runs neither, so a typo in `/FI "PID eq {pid}"` or in `-ErrorAction Stop`
+/// used to ship green through all three CI legs -- the whole point of having a
+/// Windows leg. Compiled on every host (`cargo clippy --target
+/// x86_64-pc-windows-gnu --all-targets`), run where the two binaries exist.
+///
+/// No `Sleeper` here: the test runner is itself a process guaranteed alive for
+/// the length of the call, which is one less spawn to race and nothing to
+/// reap.
+#[cfg(all(test, windows))]
+mod windows_process_tests {
+    use super::*;
+
+    /// A pid that is definitely free: spawn something trivial, reap it, and
+    /// hand back the pid the kernel just released -- the same trick the unix
+    /// module uses, with `cmd /C exit` standing in for `sh -c`.
+    fn reaped_pid() -> u32 {
+        let mut child = std::process::Command::new("cmd")
+            .args(["/C", "exit", "0"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        pid
+    }
+
+    /// Both sides of the CSV match: a row carrying `"<pid>"`, and the prose
+    /// line tasklist prints instead when its filter matches nothing.
+    #[test]
+    fn probe_sees_a_live_process_and_a_reaped_one() {
+        assert_eq!(probe(std::process::id()), Liveness::Alive);
+        assert_eq!(probe(reaped_pid()), Liveness::Dead);
+    }
+
+    /// `None` is `probe`'s and `guard`'s "could not tell", so a broken
+    /// PowerShell invocation degrades silently rather than failing. Asserting a
+    /// bounded number and not just `is_some` because the round-trip parse is
+    /// the part that can go wrong quietly: a mis-parsed date still yields
+    /// `Some`, just a nonsensical one.
+    #[test]
+    fn elapsed_secs_reads_a_creation_time_for_a_live_process() {
+        let elapsed =
+            elapsed_secs(std::process::id()).expect("powershell can read our own start time");
+        assert!((0..3600).contains(&elapsed), "implausible age: {elapsed}s");
+    }
+
+    /// The decision `mana kill` and the quit-time sweep branch on, end to end
+    /// on the platform where it has only one check to make. The refusal arm
+    /// matters more here than on unix: there is no process-group check behind
+    /// it, so this is the only thing between a recycled pid and a bystander.
+    #[test]
+    fn guard_accepts_a_live_pid_and_refuses_one_younger_than_the_record() {
+        let now = Utc::now();
+        assert_eq!(
+            guard(std::process::id(), &now.to_rfc3339(), now),
+            Guard::Ours
+        );
+
+        let long_ago = (now - TimeDelta::hours(3)).to_rfc3339();
+        match guard(std::process::id(), &long_ago, now) {
+            Guard::NotOurs(reason) => assert!(reason.contains("recycled"), "{reason}"),
+            other => {
+                panic!("a three-hour-old record on a seconds-old pid must be refused: {other:?}")
+            }
+        }
     }
 }
 
