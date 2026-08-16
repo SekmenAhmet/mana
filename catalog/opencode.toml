@@ -37,6 +37,13 @@ guessed. No [[failure]] entry: no quota-shaped failure has ever been observed
 from this CLI, and a signature borrowed from another one would trigger false
 cooldowns (the mistake caught on agy's entry on 2026-08-15).
 
+The [[models.static]] seed was added on 2026-08-16 for #31: with no statics,
+routing built its candidate list from an empty set and every cost_class
+dispatch went to claude while these free models sat idle -- the opposite of
+what the multi-quota design is for. Discovery gives ids and never a cost class,
+so the class had to be written down by a human; the ids are measured
+(`opencode models`, this machine, that day).
+
 DEGRADATION -- the PM is not mechanically read-only here. During a real
 `mana launch opencode` on 2026-08-15 the PM ran opencode's own `bash` and
 `read` tools and **no session/request_permission was ever sent**, even though
@@ -109,13 +116,67 @@ max_concurrent        = 0           # 0 = unlimited; two in parallel measured OK
 cwd_required_in_brief = false
 
 [models]
-discovery_args = ["models"]         # runtime discovery, so no curated list
+# Discovery stays authoritative. The static entries below are not a second copy
+# of it: they are the *routing seed*, the subset mana may choose on its own.
+# It needs one because discovery reports ids and nothing reports a cost class,
+# so with no statics at all every cost_class route silently resolved to claude
+# and this free tier -- the whole point of routing here -- was never used (#31).
+# An id outside the seed is still dispatchable when the PM names it together
+# with "cli"; see `routing::validate_model`.
+discovery_args = ["models"]         # refresh the seed from its output
 # No line_regex: the output is one bare "provider/model" id per line, unlike
 # agy's TSV, so the whole line is the id.
 
-# No [[quota.pools]]: nothing about this CLI's quota is observable here -- the
-# tier in use is free, `opencode stats` reports history rather than a balance,
-# and a pool nobody can exhaust would only produce cooldowns that mean nothing.
+# Seeded from `opencode models` on 2026-08-16 -- all seven, all cheap, because
+# they are all the free OpenCode Zen tier and nothing here distinguishes them
+# by cost. The router's alphabetical tiebreak therefore decides between them,
+# which is the honest answer when the catalogue has no reason to prefer one.
+[[models.static]]
+id         = "opencode/big-pickle"
+cost_class = "cheap"                # cheap | mid | expensive -- ordinal ONLY
+pool       = "zen"
+
+[[models.static]]
+id         = "opencode/deepseek-v4-flash-free"
+cost_class = "cheap"
+pool       = "zen"
+
+[[models.static]]
+id         = "opencode/hy3-free"
+cost_class = "cheap"
+pool       = "zen"
+
+[[models.static]]
+id         = "opencode/laguna-s-2.1-free"
+cost_class = "cheap"
+pool       = "zen"
+
+[[models.static]]
+id         = "opencode/mimo-v2.5-free"
+cost_class = "cheap"
+pool       = "zen"
+
+[[models.static]]
+id         = "opencode/nemotron-3-ultra-free"
+cost_class = "cheap"
+pool       = "zen"
+
+[[models.static]]
+id         = "opencode/nemotron-3.5-lightning-free"
+cost_class = "cheap"
+pool       = "zen"
+
+# This pool exists because a [[models.static]] has to name one, and it says
+# "unknown" twice because that is still the truth: the tier in use is free,
+# `opencode stats` reports history rather than a balance, and nothing on the
+# CLI exposes a limit. It cools nothing today either -- cooldowns are driven by
+# a matched [[failure]] signature and this entry declares none, for the reason
+# in the notes. Give it a kind and a period only when one is measured.
+[[quota.pools]]
+id         = "zen"
+kind       = "unknown"              # requests | tokens | credits | unknown
+period     = "unknown"
+pool_scope = "per-model"            # global | per-model
 
 [skills]
 dirs = ["~/.agents/skills"]         # verified: opencode reads SKILL.md from it

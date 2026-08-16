@@ -32,7 +32,10 @@
 //!   returned for a finding, only for doctor itself failing.
 //!
 //! Every finding is printed either way. Output is plain aligned text with no
-//! colour and no table crate, so `mana doctor | grep` works.
+//! colour and no table crate, so `mana doctor | grep` works — and it is printed
+//! only once the whole report is built, even though the per-CLI probes that
+//! dominate its runtime now run in parallel (`probe_all`). Nothing a script
+//! reads changes: same sections, same order, same three exit codes.
 
 use crate::catalog::{Catalog, CliEntry};
 use crate::cli::ps;
@@ -265,42 +268,22 @@ fn catalogue_section(
              fix or delete the file"
         ));
     }
-    for entry in options.entries {
+    for (entry, probe) in options.entries.iter().zip(probe_all(options.entries)) {
         report.say("");
         report.say(format!("{}  {}", entry.cli.id, entry.cli.name));
-        // The same lookup every spawn path uses, so "installed" here and
-        // "spawnable" there cannot diverge -- see `CliMeta::resolve`.
-        let installed = entry.cli.resolve().ok();
-        match &installed {
-            Some(path) => {
+        match (&probe.binary, &probe.version) {
+            (Some(path), version) => {
                 field(
                     report,
                     "binary",
                     format!("{} -> {}", entry.cli.bin(), path.display()),
                 );
-                field(
-                    report,
-                    "version",
-                    match capture_version_output(
-                        path,
-                        &entry.cli.version_args,
-                        VERSION_CHECK_TIMEOUT,
-                    ) {
-                        Ok(version) if version.is_empty() => {
-                            format!(
-                                "printed nothing for `{}`",
-                                args_line(&entry.cli.version_args)
-                            )
-                        }
-                        Ok(version) => version,
-                        Err(error) => format!("probe failed: {error}"),
-                    },
-                );
+                field(report, "version", version.clone().unwrap_or_default());
             }
             // Not broken: nobody has to install every catalogued CLI, and
             // nothing registers one either -- a dispatch that names a missing
             // binary fails loudly at spawn, when it is asked for.
-            None => {
+            (None, _) => {
                 field(
                     report,
                     "binary",
@@ -318,7 +301,7 @@ fn catalogue_section(
                 entry.tools.channel.word()
             ),
         );
-        field(report, "models", models_line(entry, installed.as_deref()));
+        field(report, "models", probe.models);
         field(report, "quota", quota_line(entry));
         field(report, "failures", failures_line(entry));
         if let Some(observations) = observations {
@@ -337,6 +320,71 @@ fn catalogue_section(
 /// longest label used above.
 fn field(report: &mut Report, label: &str, value: impl Into<String>) {
     report.say(format!("  {label:<12}{}", value.into()));
+}
+
+/// The three facts about a CLI that cost a subprocess to learn.
+///
+/// Separated from rendering because they are the whole of doctor's runtime
+/// (#48: 4.8s on an empty project, 5.7s with 2000 dispatches -- so the data is
+/// free and the probes are not) and they are independent per entry.
+#[derive(Debug, PartialEq, Eq)]
+struct Probe {
+    /// Resolved executable, or `None` for a CLI that is not on PATH.
+    binary: Option<PathBuf>,
+    /// The version line as it will be printed, probe failure included. `None`
+    /// when there was no binary to ask.
+    version: Option<String>,
+    models: String,
+}
+
+/// Every entry probed at once, one thread each, results in catalogue order.
+///
+/// Threads rather than an async runtime: four blocking subprocesses is what
+/// `std::thread::scope` is for, and the deadlines are already enforced inside
+/// `capture_output`. Wall time goes from the sum of the probes to the slowest
+/// of them, which matters most in the case the sum was worst: one CLI hanging
+/// out its full `VERSION_CHECK_TIMEOUT` used to gate the other three.
+///
+/// Collected rather than printed as each lands, deliberately. Streaming would
+/// make the section's line order depend on which CLI answered first, and a
+/// diagnostic whose output a script cannot diff between runs is a worse trade
+/// than the second it would save.
+fn probe_all(entries: &[CliEntry]) -> Vec<Probe> {
+    std::thread::scope(|scope| {
+        // Spawned into a Vec before any join, or this is a sequential run with
+        // extra steps.
+        let handles: Vec<_> = entries
+            .iter()
+            .map(|entry| scope.spawn(|| probe(entry)))
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("a doctor probe panicked"))
+            .collect()
+    })
+}
+
+fn probe(entry: &CliEntry) -> Probe {
+    // The same lookup every spawn path uses, so "installed" here and
+    // "spawnable" there cannot diverge -- see `CliMeta::resolve`.
+    let binary = entry.cli.resolve().ok();
+    let version = binary.as_deref().map(|path| {
+        match capture_version_output(path, &entry.cli.version_args, VERSION_CHECK_TIMEOUT) {
+            Ok(version) if version.is_empty() => {
+                format!(
+                    "printed nothing for `{}`",
+                    args_line(&entry.cli.version_args)
+                )
+            }
+            Ok(version) => version,
+            Err(error) => format!("probe failed: {error}"),
+        }
+    });
+    Probe {
+        models: models_line(entry, binary.as_deref()),
+        binary,
+        version,
+    }
 }
 
 /// The static list, or the result of actually running the CLI's discovery
@@ -1223,6 +1271,48 @@ mod process_tests {
             models_line(&entry, None).contains("needs the binary"),
             "an uninstalled CLI must not claim a discovery result"
         );
+    }
+
+    /// #48: the probes run in parallel now, and the only thing that may not
+    /// change is the report. Compared against the sequential walk it replaced
+    /// -- a timing assertion would say less and fail on a loaded machine.
+    #[test]
+    fn probing_in_parallel_yields_exactly_what_probing_in_sequence_would() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_script(
+            tmp.path(),
+            "alpha",
+            "#!/bin/sh\nif [ \"$1\" = models ]; then\n  printf 'fast\\tcheap\\nslow\\tdear\\n'\nelse\n  echo 9.9.9\nfi\n",
+        );
+        let installed = parse_entry(
+            &super::tests::FIXTURE
+                .replace(
+                    r#"bin = "alpha-does-not-exist""#,
+                    &format!("bin = {script:?}"),
+                )
+                .replace(
+                    "discovery_args = []",
+                    "discovery_args = [\"models\"]\nline_regex = '^(\\S+)\\t'",
+                ),
+        )
+        .unwrap();
+        // Real subprocesses on both sides, and a missing binary in the middle:
+        // two empty probes would compare equal while proving nothing, and the
+        // gap is where a scrambled result order would hide.
+        let missing = parse_entry(super::tests::FIXTURE).unwrap();
+        let entries = vec![installed.clone(), missing, installed];
+
+        // Warm-up, and not superstition: the *first* exec of a just-written
+        // script cost over 5s on the machine this was written on (macOS scans a
+        // binary it has never seen), which timed the version probe out in
+        // whichever pass ran first and nowhere else. Paying it once up front
+        // keeps the comparison about the two orderings.
+        let _ = probe(&entries[0]);
+
+        let sequential: Vec<Probe> = entries.iter().map(probe).collect();
+        assert_eq!(probe_all(&entries), sequential);
+        assert_eq!(sequential[0].models, "fast, slow (discovered)");
+        assert_eq!(sequential[1].binary, None);
     }
 
     #[test]

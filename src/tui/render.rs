@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! ┌ ◆ mana · PM opencode ─────────┬ Graph ─────────┐
-//! │ mana's own notices, the PM's  │ ◉ [EXE] ...    │
+//! │ mana's own notices, the PM's  │ ◐ [EXE] ...    │
 //! │ prose, the user's turns, and  │ ○ [REV] ... ✅ │
 //! │ whatever it is blocked on     │                │
 //! │ · 42 technical lines (Ctrl+O) │                │
@@ -24,7 +24,7 @@
 //! and the permission banner is the only thing allowed to be warm.
 
 use super::app::{App, AppMode, ChatLine, PendingPermission, Source};
-use super::graph::{BLINK_INTERVAL, GraphNode, is_blink_visible, node_body, verdict_symbol};
+use super::graph::{GraphNode, SPINNER_INTERVAL, node_body, running_frame, verdict_symbol};
 use super::theme;
 use crate::review::Decision;
 use ratatui::Frame;
@@ -269,7 +269,7 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
 }
 
 fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
-    let blink = is_blink_visible(app.started_at.elapsed(), BLINK_INTERVAL);
+    let running = running_frame(app.started_at.elapsed(), SPINNER_INTERVAL);
     let rows: Vec<Line> = if nodes.is_empty() {
         vec![Line::styled("no dispatches yet", theme::GRAPH_EMPTY)]
     } else {
@@ -286,7 +286,7 @@ fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
                     None => theme::GRAPH_NODE,
                 };
                 Line::from(vec![
-                    Span::styled(node_body(node, blink), theme::GRAPH_NODE),
+                    Span::styled(node_body(node, running), theme::GRAPH_NODE),
                     Span::styled(verdict_symbol(&node.verdict), verdict_style),
                 ])
             })

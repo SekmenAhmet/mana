@@ -107,6 +107,14 @@ keys off it. It is the *model* that will not use it to resolve relative paths.)
 
 `--version` prints more than one line here; callers must keep only the first.
 
+The [[models.static]] seed below was added on 2026-08-16 for #31, where a PM
+told to dispatch onto agy invented `gemini-2.5-flash` and then
+`gemini-2.5-pro`, and both died in 3.5 s. Discovery gives ids and never a cost
+class, so an entry with no statics is unreachable by every cost_class route and
+invisible in `list_agents` -- the PM had nothing to name but a guess. The seed
+is measured (`agy models`, this machine, that day) and deliberately partial;
+the cost classes in it are ordinal judgements, not prices agy publishes.
+
 Still unverified:
 - Whether every one of agy's ~30 tools is denied the same way, or only the ones
   observed (`grep_search`, `run_command`, `view_file`). The PM's no-code rule
@@ -181,8 +189,45 @@ max_concurrent        = 1          # two parallel dispatches died in 8s
 cwd_required_in_brief = true       # 306k tokens wasted without it
 
 [models]
-discovery_args = ["models"]        # runtime discovery, so no curated list
+# Discovery stays authoritative -- `agy models` returns 14 ids across three
+# vendors and no curated list will keep up with that. The static entries below
+# are not that list: they are the *routing seed*, the subset mana is allowed to
+# choose on its own. It needs one because discovery reports ids and nothing
+# reports a cost class, so with no statics at all every cost_class route
+# silently resolved to claude and this CLI's quota was never spent (#31). An id
+# outside the seed is still dispatchable when the PM names it together with
+# "cli" -- see `routing::validate_model`.
+discovery_args = ["models"]        # refresh the seed from its output
 line_regex     = '^(\S+)\t'        # capture group = model id (output is TSV)
+
+# Seeded from `agy models` on 2026-08-16. One generation only, on purpose: the
+# router breaks a cost-class tie alphabetically, so listing gemini-3.5 and
+# gemini-3.6 beside gemini-3.7 would send every cheap dispatch to the oldest
+# flash on the list. Same reason the three reasoning efforts are not all here.
+[[models.static]]
+id         = "gemini-3.7-flash-low"
+cost_class = "cheap"               # cheap | mid | expensive -- ordinal ONLY
+pool       = "default"
+
+[[models.static]]
+id         = "gemini-3.7-flash-high"
+cost_class = "mid"                 # same model, more reasoning spent per turn
+pool       = "default"
+
+[[models.static]]
+id         = "claude-sonnet-4-6"
+cost_class = "mid"
+pool       = "default"
+
+[[models.static]]
+id         = "gemini-3.1-pro-high"
+cost_class = "expensive"
+pool       = "default"
+
+[[models.static]]
+id         = "claude-opus-4-6-thinking"
+cost_class = "expensive"
+pool       = "default"
 
 [[quota.pools]]
 id         = "default"

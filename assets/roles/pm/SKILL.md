@@ -49,9 +49,11 @@ another CLI.
   cooldowns. Call it before routing decisions; it is always current, your
   memory of it may not be.
 - `create_task {title, prompt, depends_on?}` → `task_id`. mana handles ids,
-  files, and paths — never write task files yourself. `depends_on` records the
-  order, it does not enforce it: holding a task back until its dependency is
-  validated is your job.
+  files, and paths — never write task files yourself. `title` and `prompt` must
+  both say something; mana refuses an empty one rather than spending a run on
+  it. `depends_on` is enforced: mana refuses an executor on a task whose
+  dependencies are not all validated, and names the one that is not. Nothing is
+  queued behind the refusal — dispatch the task yourself once the verdict lands.
 - `launch_subagent {task_id, role, cost_class | cli + model}` →
   `{agent_id, resolved: {cli, model}}`. Prefer passing a `cost_class` and let
   mana pick the concrete model: mana knows the live quota state, you don't.
@@ -74,6 +76,10 @@ with your next decision rather than with a report for them. `exit 0` is a run
 that finished; `exit 1 ...`, `timed out ...`, `never started: ...` and a
 trailing `quota_exhausted` are not. Failed work has nothing to review — mana
 refuses a reviewer on it — so it needs another executor or the user.
+
+A failure carries a `last output:` block with the end of what the sub-agent
+printed. Read it before deciding: it is where the CLI says what actually went
+wrong, and it is usually something no rewrite of the brief would have fixed.
 
 ## When the tools are not available
 
@@ -169,7 +175,8 @@ Every brief contains:
 
 ## Verdicts
 
-- `validated` — mark the task done, unblock its dependents.
+- `validated` — mark the task done. Anything that declared it in `depends_on`
+  becomes dispatchable now; mana was refusing those until this verdict landed.
 - `rejected` with `attribution: code` — a task's brief cannot be edited once
   it exists, and relaunching the same `task_id` re-runs the identical brief in
   a worktree built fresh from the same starting point. So call `create_task`

@@ -14,11 +14,31 @@ use crate::log::{Status, read_last_status};
 use crate::project::ProjectPaths;
 use crate::review::{Decision, read_verdict};
 use crate::task::Role;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-/// How long each on/off half-cycle of the "running" blink lasts.
-pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
+/// How long each frame of the "running" marker is held.
+///
+/// Four frames at 300ms is a 1.2s cycle, deliberately not a divisor of
+/// `GRAPH_REFRESH`: anything that only samples this pane on that cadence -- the
+/// redraw safety net, a pty rig, an operator glancing every couple of seconds --
+/// would otherwise read the same phase every single time (#43).
+pub const SPINNER_INTERVAL: Duration = Duration::from_millis(300);
+
+/// The frames of the running marker. Every one of them is a glyph.
+///
+/// It used to blink between ◉ and a space, so half of every cycle drew a
+/// running node with *no marker at all* -- which reads as a node nothing knows
+/// anything about, and is what a reader sampling on the wrong phase saw for as
+/// long as they looked (#43). Which phase somebody lands on is not something
+/// this code gets to control, so the invisible frame had to go rather than be
+/// made rarer by redrawing faster.
+///
+/// U+25D0..U+25D3, the same Geometric Shapes block as the ○ below and as
+/// `theme::MARK`: quarter-turns of one circle, so the marker reads as motion
+/// and never as the ○ a finished node wears.
+const RUNNING_FRAMES: [&str; 4] = ["\u{25d0}", "\u{25d3}", "\u{25d1}", "\u{25d2}"];
 
 /// The safety net between event-driven rebuilds.
 ///
@@ -28,14 +48,15 @@ pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 /// Two seconds is slow enough to be free and fast enough that nobody notices.
 pub const GRAPH_REFRESH: Duration = Duration::from_secs(2);
 
-/// Pure on/off decision for the blink, given how long the TUI has been
+/// Which frame the running marker is on, given how long the TUI has been
 /// running. Kept separate from any real clock so it is testable without
 /// sleeping or faking a `Terminal`.
-pub fn is_blink_visible(elapsed: Duration, interval: Duration) -> bool {
+pub fn running_frame(elapsed: Duration, interval: Duration) -> &'static str {
     if interval.is_zero() {
-        return true;
+        return RUNNING_FRAMES[0];
     }
-    (elapsed.as_millis() / interval.as_millis()).is_multiple_of(2)
+    let frames = RUNNING_FRAMES.len() as u128;
+    RUNNING_FRAMES[(elapsed.as_millis() / interval.as_millis() % frames) as usize]
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -122,7 +143,31 @@ pub fn build_nodes(registry: &Registry, logs_dir: &Path, reviews_dir: &Path) -> 
                 .map(|verdict| verdict.verdict),
         })
         .collect();
-    nodes.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
+    // Grouped by task, executor above its reviewer, tasks in the order they
+    // were first dispatched. Sorting by `agent_id` was deterministic and told
+    // the reader nothing -- v4 uuids order by nothing, so a task's two nodes
+    // landed at unrelated positions and matching them meant hunting for short
+    // ids (#44). This pane is called a graph, and the one edge it has is
+    // "this reviewer reviews that executor's task": putting the pair on
+    // consecutive rows is that edge, drawn.
+    //
+    // The registry is append-only, so its own order *is* dispatch order and no
+    // timestamp has to be parsed (or trusted) to get chronology between tasks.
+    // `sort_by_key` is stable, which keeps that order for everything the key
+    // ties -- a task re-dispatched after a rejection stays behind its first try.
+    let mut first_dispatch: HashMap<&str, usize> = HashMap::new();
+    for (index, record) in registry.records.iter().enumerate() {
+        first_dispatch.entry(&record.task_id).or_insert(index);
+    }
+    nodes.sort_by_key(|node| {
+        (
+            first_dispatch
+                .get(node.task_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX),
+            matches!(node.role, Role::Reviewer),
+        )
+    });
     nodes
 }
 
@@ -133,10 +178,10 @@ pub fn build_nodes(registry: &Registry, logs_dir: &Path, reviews_dir: &Path) -> 
 /// halves are coloured apart: the body is mana's own lavender, while the ✓/✗
 /// wear the interface's only semantic colours (`theme::VERDICT_OK` /
 /// `theme::VERDICT_FAIL`).
-pub fn node_body(node: &GraphNode, blink_visible: bool) -> String {
+pub fn node_body(node: &GraphNode, running: &'static str) -> String {
     format!(
         "{} [{}] {}/{} {}",
-        status_symbol(&node.status, blink_visible),
+        status_symbol(&node.status, running),
         role_label(&node.role),
         node.cli,
         node.model,
@@ -144,16 +189,10 @@ pub fn node_body(node: &GraphNode, blink_visible: bool) -> String {
     )
 }
 
-pub fn status_symbol(status: &Option<Status>, blink_visible: bool) -> &'static str {
+pub fn status_symbol(status: &Option<Status>, running: &'static str) -> &'static str {
     match status {
-        Some(Status::Running) => {
-            if blink_visible {
-                "\u{25c9}" // ◉
-            } else {
-                " "
-            }
-        }
-        Some(Status::Done) => "\u{25cb}", // ○, fixed -- not blinking
+        Some(Status::Running) => running,
+        Some(Status::Done) => "\u{25cb}", // ○, fixed -- the work is over
         None => "?",
     }
 }
@@ -300,7 +339,7 @@ mod tests {
         )]);
         let line = node_body(
             &build_nodes(&registry, &paths.logs, &paths.reviews)[0],
-            true,
+            RUNNING_FRAMES[0],
         );
         assert_eq!(line, "? [REV] claude/haiku 3f2a1b6c");
         assert_eq!(verdict_symbol(&None), "");
@@ -375,37 +414,115 @@ mod tests {
 
     #[test]
     fn status_symbols_distinguish_running_and_done() {
-        assert_eq!(status_symbol(&Some(Status::Running), true), "\u{25c9}");
-        assert_eq!(status_symbol(&Some(Status::Done), true), "\u{25cb}");
-        assert_eq!(status_symbol(&None, true), "?");
+        let running = RUNNING_FRAMES[0];
+        assert_eq!(status_symbol(&Some(Status::Running), running), running);
+        assert_eq!(status_symbol(&Some(Status::Done), running), "\u{25cb}");
+        assert_eq!(status_symbol(&None, running), "?");
     }
 
     #[test]
-    fn running_status_blinks_off_when_not_visible() {
-        assert_eq!(status_symbol(&Some(Status::Running), false), " ");
+    fn only_the_running_marker_moves() {
+        assert_eq!(
+            status_symbol(&Some(Status::Done), RUNNING_FRAMES[2]),
+            "\u{25cb}"
+        );
+        assert_eq!(status_symbol(&None, RUNNING_FRAMES[2]), "?");
     }
 
     #[test]
-    fn done_status_never_blinks() {
-        assert_eq!(status_symbol(&Some(Status::Done), false), "\u{25cb}");
+    fn the_marker_advances_one_frame_per_interval_and_wraps() {
+        let interval = Duration::from_millis(300);
+        for (index, frame) in RUNNING_FRAMES.iter().enumerate() {
+            let elapsed = interval * u32::try_from(index).unwrap();
+            assert_eq!(running_frame(elapsed, interval), *frame);
+            assert_eq!(running_frame(elapsed + interval * 4, interval), *frame);
+        }
+    }
+
+    /// The bug (#43): a running node whose marker column is empty is a node
+    /// with no status at all, and there is no phase this may happen on -- not
+    /// the one the render loop lands on, not the one a two-second sampler does.
+    #[test]
+    fn a_running_node_always_carries_a_marker() {
+        for step in 0..200 {
+            let frame = running_frame(Duration::from_millis(step * 50), SPINNER_INTERVAL);
+            assert!(
+                !status_symbol(&Some(Status::Running), frame)
+                    .trim()
+                    .is_empty(),
+                "blank marker at step {step}"
+            );
+        }
+    }
+
+    /// The other half of #43: the phase froze because the redraw safety net was
+    /// an exact multiple of the blink's cycle. Sampling on that same cadence
+    /// must still show motion, or the interval has been picked badly again.
+    #[test]
+    fn the_marker_still_moves_when_sampled_at_the_refresh_cadence() {
+        let sampled: std::collections::HashSet<&str> = (0..4)
+            .map(|tick| running_frame(GRAPH_REFRESH * tick, SPINNER_INTERVAL))
+            .collect();
+        assert!(
+            sampled.len() > 1,
+            "the spinner aliases against GRAPH_REFRESH: {sampled:?}"
+        );
     }
 
     #[test]
-    fn is_blink_visible_alternates_every_interval() {
-        let interval = Duration::from_millis(500);
-        assert!(is_blink_visible(Duration::from_millis(0), interval));
-        assert!(is_blink_visible(Duration::from_millis(499), interval));
-        assert!(!is_blink_visible(Duration::from_millis(500), interval));
-        assert!(!is_blink_visible(Duration::from_millis(999), interval));
-        assert!(is_blink_visible(Duration::from_millis(1000), interval));
+    fn a_zero_interval_holds_the_first_frame_rather_than_dividing_by_it() {
+        assert_eq!(
+            running_frame(Duration::from_millis(1234), Duration::ZERO),
+            RUNNING_FRAMES[0]
+        );
     }
 
+    /// #44: the pane is a graph, so it is read by structure -- each task's
+    /// nodes together, executor above the reviewer that judged it, tasks in
+    /// the order they were dispatched. Ordering by `agent_id` scattered all
+    /// four of these rows.
     #[test]
-    fn is_blink_visible_treats_zero_interval_as_always_visible() {
-        assert!(is_blink_visible(
-            Duration::from_millis(1234),
-            Duration::ZERO
-        ));
+    fn nodes_are_grouped_by_task_with_the_executor_above_its_reviewer() {
+        let (_tmp, paths) = fixture();
+        // Registry order is dispatch order, and deliberately not the order the
+        // pane must show: task-b's reviewer went out before task-a's, and the
+        // uuid-shaped agent ids sort against both.
+        let registry = Registry::from_records(vec![
+            record(
+                "ffff0000-0000-4000-8000-000000000000",
+                Role::Executor,
+                "task-a",
+            ),
+            record(
+                "00001111-0000-4000-8000-000000000000",
+                Role::Executor,
+                "task-b",
+            ),
+            record(
+                "aaaa2222-0000-4000-8000-000000000000",
+                Role::Reviewer,
+                "task-b",
+            ),
+            record(
+                "11113333-0000-4000-8000-000000000000",
+                Role::Reviewer,
+                "task-a",
+            ),
+        ]);
+
+        let nodes = build_nodes(&registry, &paths.logs, &paths.reviews);
+        assert_eq!(
+            nodes
+                .iter()
+                .map(|node| (node.task_id.as_str(), role_label(&node.role)))
+                .collect::<Vec<_>>(),
+            [
+                ("task-a", "EXE"),
+                ("task-a", "REV"),
+                ("task-b", "EXE"),
+                ("task-b", "REV"),
+            ]
+        );
     }
 
     #[test]

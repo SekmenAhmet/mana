@@ -96,8 +96,8 @@ pub struct App {
     /// Kept in step with the session once a frame; the queue itself lives
     /// where the transport does.
     pub queued: usize,
-    /// When this session started, which drives the graph's running blink
-    /// without a render-loop clock in the tests (`graph::is_blink_visible`).
+    /// When this session started, which drives the graph's running marker
+    /// without a render-loop clock in the tests (`graph::running_frame`).
     pub started_at: Instant,
 }
 

@@ -7,10 +7,13 @@
 //! `~/.mana/projects/<project>/` -- the MCP server itself holds nothing across
 //! calls, so it can be restarted mid-session without losing a thing.
 //!
-//! - `runs/<task_id>.json` -- one record, rewritten by each executor: where its
+//! - `runs/<task_id>.jsonl` -- one line per finished executor: where its
 //!   worktree is and what came of it. This is the executor → reviewer handoff.
 //!   Recomputing it instead (branch name + path convention + `git merge-base`)
 //!   would be a second source of truth for facts the executor already knew.
+//!   Append-only, and the last line wins: a retry used to overwrite the file,
+//!   so the attempt that failed -- the only record of *why* the PM retried --
+//!   was destroyed by the attempt that followed it (#32).
 //! - `notifications.jsonl` -- append-only, one line per finished dispatch.
 //!   `cli::launch_pm`'s `NotificationTail` follows it and injects `[mana] ...`
 //!   messages into the PM session, which is how the PM learns an executor
@@ -46,6 +49,17 @@ pub struct RunRecord {
     /// One human-readable line: exit code or timeout, duration, and the
     /// matched failure signature if there was one.
     pub outcome: String,
+    /// The end of what the sub-agent printed, kept only for a failed run
+    /// (#32). `outcome` says *that* it failed; this is the only place mana
+    /// keeps *why* -- the streams the catalogue matched its failure
+    /// signatures against are dropped with the `DispatchOutcome`, and
+    /// `logs/<agent_id>.jsonl` records events, never output. Capped where it
+    /// is filled in (`mcp::failure_tail`).
+    ///
+    /// Optional rather than empty-string so a record written before this
+    /// field existed still deserializes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tail: Option<String>,
     pub finished_at: String,
 }
 
@@ -75,24 +89,29 @@ pub fn runs_dir(paths: &ProjectPaths) -> PathBuf {
 }
 
 pub fn run_path(paths: &ProjectPaths, task_id: &str) -> PathBuf {
-    runs_dir(paths).join(format!("{task_id}.json"))
+    runs_dir(paths).join(format!("{task_id}.jsonl"))
 }
 
 pub fn notifications_path(paths: &ProjectPaths) -> PathBuf {
     paths.root.join("notifications.jsonl")
 }
 
-/// Overwrites the task's run record. A retried task has one current executor,
-/// so the newest run is the only one a reviewer could be reviewing; keeping a
-/// history here would just be a second, staler copy of `subagents.jsonl`.
+/// Appends the task's newest run record. Append rather than overwrite (#32):
+/// a retry is a second attempt at the same work, and the first attempt's
+/// record is the evidence of what went wrong with it -- destroying it left the
+/// PM, `mana ps` and the user with nothing to diagnose from. Same append-only
+/// shape and the same atomicity argument as `notify` below.
 pub fn write_run(paths: &ProjectPaths, record: &RunRecord) -> Result<()> {
-    let path = run_path(paths, &record.task_id);
-    let dir = runs_dir(paths);
-    crate::project::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let line = serde_json::to_string(record)?;
-    crate::project::write(&path, line).with_context(|| format!("writing {}", path.display()))
+    crate::log::append_line(
+        &run_path(paths, &record.task_id),
+        &serde_json::to_string(record)?,
+    )
 }
 
+/// The task's *newest* run, which is the only one a reviewer could be
+/// reviewing: a retry replaces what the previous attempt left in the worktree.
+/// The earlier lines stay on disk for whoever is diagnosing the retry.
+///
 /// `Ok(None)` when no executor has finished this task yet -- the ordinary case
 /// for a reviewer dispatched too early, and not an error at this level.
 pub fn read_run(paths: &ProjectPaths, task_id: &str) -> Result<Option<RunRecord>> {
@@ -102,7 +121,13 @@ pub fn read_run(paths: &ProjectPaths, task_id: &str) -> Result<Option<RunRecord>
     }
     let contents =
         std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    let record = serde_json::from_str(&contents)
+    // Only the last line is parsed: an earlier one mana cannot read is history
+    // nothing is waiting on, and refusing the whole file over it would refuse
+    // the reviewer of a run that finished perfectly well.
+    let Some(line) = contents.lines().rfind(|line| !line.trim().is_empty()) else {
+        return Ok(None);
+    };
+    let record = serde_json::from_str(line)
         .with_context(|| format!("invalid run record {}", path.display()))?;
     Ok(Some(record))
 }
@@ -162,6 +187,7 @@ mod tests {
             base_ref: "abc123".to_string(),
             succeeded,
             outcome: "exit 0 in 12.3s".to_string(),
+            output_tail: (!succeeded).then(|| "stderr: model 'nope' does not exist".to_string()),
             finished_at: "2026-08-15T10:00:00Z".to_string(),
         }
     }
@@ -193,12 +219,30 @@ mod tests {
         assert!(read_run(&paths, "task-1").unwrap().is_none());
     }
 
+    /// The retry half of #32: the reviewer must see the newest run, and the
+    /// attempt that failed -- the reason the PM retried at all -- must still be
+    /// on disk afterwards. It used to be overwritten, so by the time anyone
+    /// asked why the first attempt failed, the answer had been deleted by the
+    /// second.
     #[test]
-    fn a_retry_replaces_the_previous_run_rather_than_appending() {
+    fn a_retry_leaves_the_previous_attempt_on_disk() {
         let (_tmp, paths) = fixture();
         write_run(&paths, &record("task-1", false)).unwrap();
         write_run(&paths, &record("task-1", true)).unwrap();
+
         assert!(read_run(&paths, "task-1").unwrap().unwrap().succeeded);
+
+        let attempts: Vec<RunRecord> = std::fs::read_to_string(run_path(&paths, "task-1"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(attempts.len(), 2);
+        assert!(!attempts[0].succeeded);
+        assert_eq!(
+            attempts[0].output_tail.as_deref(),
+            Some("stderr: model 'nope' does not exist")
+        );
     }
 
     #[test]
@@ -207,7 +251,7 @@ mod tests {
         std::fs::create_dir_all(runs_dir(&paths)).unwrap();
         std::fs::write(run_path(&paths, "task-1"), "half a json").unwrap();
         let error = format!("{:#}", read_run(&paths, "task-1").unwrap_err());
-        assert!(error.contains("task-1.json"), "{error}");
+        assert!(error.contains("task-1.jsonl"), "{error}");
     }
 
     #[test]
