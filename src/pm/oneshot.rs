@@ -232,58 +232,6 @@ impl OneshotDriver {
         })
     }
 
-    /// Queues one user turn.
-    ///
-    /// Returns as soon as the turn is queued rather than when the process that
-    /// carries it exits: a turn takes seconds to minutes, and the caller is a
-    /// render loop that must keep drawing.
-    pub fn send_user(&mut self, text: &str) -> Result<()> {
-        if self.closed.load(Ordering::SeqCst) {
-            bail!("the PM session is closed, so no turn can be sent")
-        }
-        let turns = self
-            .turns
-            .as_ref()
-            .ok_or_else(|| anyhow!("the PM session is closed, so no turn can be sent"))?;
-        turns
-            .send(text.to_string())
-            .map_err(|_| anyhow!("the PM session ended before this turn could be started"))
-    }
-
-    /// The session's event stream, borrowed so the driver stays the single
-    /// owner of its channel.
-    pub fn events(&self) -> &Receiver<PmEvent> {
-        &self.events
-    }
-
-    /// Ends the session, killing the turn in flight if there is one.
-    ///
-    /// No grace period, unlike the long-lived drivers: there is no session
-    /// state inside the process to lose. The conversation is in the CLI's own
-    /// store, so what a kill costs is the answer to one turn -- and making the
-    /// operator wait out an agent that thinks for minutes is not a trade worth
-    /// making at Ctrl+C.
-    pub fn shutdown(&mut self) -> Result<()> {
-        // Ordered: refuse new turns, stop the worker from starting queued
-        // ones, and only then kill. The other order leaves a window where the
-        // worker starts the next turn out of a queue nobody will read.
-        self.closed.store(true, Ordering::SeqCst);
-        self.turns = None;
-        let killed = self.kill_in_flight();
-        if let Some(worker) = self.worker.take() {
-            join_or_detach(worker, Instant::now() + DRAIN_GRACE);
-        }
-        // A no-op when the worker already reported the death it saw, which is
-        // the more accurate report of the two.
-        send_exit(
-            &self.sender,
-            &self.closed,
-            &self.exited,
-            if killed { None } else { Some(0) },
-        );
-        Ok(())
-    }
-
     /// Kills the running turn and everything it started. `true` if there was
     /// one to kill.
     fn kill_in_flight(&self) -> bool {
@@ -311,16 +259,54 @@ impl Drop for OneshotDriver {
 }
 
 impl PmTransport for OneshotDriver {
+    /// Queues one user turn.
+    ///
+    /// Returns as soon as the turn is queued rather than when the process that
+    /// carries it exits: a turn takes seconds to minutes, and the caller is a
+    /// render loop that must keep drawing.
     fn send_user(&mut self, text: &str) -> Result<()> {
-        OneshotDriver::send_user(self, text)
+        if self.closed.load(Ordering::SeqCst) {
+            bail!("the PM session is closed, so no turn can be sent")
+        }
+        let turns = self
+            .turns
+            .as_ref()
+            .ok_or_else(|| anyhow!("the PM session is closed, so no turn can be sent"))?;
+        turns
+            .send(text.to_string())
+            .map_err(|_| anyhow!("the PM session ended before this turn could be started"))
     }
 
     fn events(&self) -> &Receiver<PmEvent> {
-        OneshotDriver::events(self)
+        &self.events
     }
 
+    /// Ends the session, killing the turn in flight if there is one.
+    ///
+    /// No grace period, unlike the long-lived drivers: there is no session
+    /// state inside the process to lose. The conversation is in the CLI's own
+    /// store, so what a kill costs is the answer to one turn -- and making the
+    /// operator wait out an agent that thinks for minutes is not a trade worth
+    /// making at Ctrl+C.
     fn shutdown(&mut self) -> Result<()> {
-        OneshotDriver::shutdown(self)
+        // Ordered: refuse new turns, stop the worker from starting queued
+        // ones, and only then kill. The other order leaves a window where the
+        // worker starts the next turn out of a queue nobody will read.
+        self.closed.store(true, Ordering::SeqCst);
+        self.turns = None;
+        let killed = self.kill_in_flight();
+        if let Some(worker) = self.worker.take() {
+            join_or_detach(worker, Instant::now() + DRAIN_GRACE);
+        }
+        // A no-op when the worker already reported the death it saw, which is
+        // the more accurate report of the two.
+        send_exit(
+            &self.sender,
+            &self.closed,
+            &self.exited,
+            if killed { None } else { Some(0) },
+        );
+        Ok(())
     }
 }
 

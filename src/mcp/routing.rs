@@ -14,7 +14,7 @@
 use crate::catalog::{CliEntry, CostClass, FailureMeans, PoolScope};
 use crate::dispatch::failure_wire_name;
 use crate::lock::load_registry;
-use crate::log::{self, ExitEntry};
+use crate::log;
 use crate::project::ProjectPaths;
 use crate::review::{self, Attribution, Decision, Verdict};
 use crate::task::Role;
@@ -26,7 +26,6 @@ use chrono::{DateTime, TimeDelta, Utc};
 use rmcp::schemars;
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
 
 /// Applied when a failure signature matched but declared no
 /// `cooldown_minutes`, and when the log names a CLI the catalogue no longer
@@ -129,7 +128,7 @@ impl Observations {
             }
 
             let log_path = paths.logs.join(format!("{}.jsonl", record.agent_id));
-            let Some(exit) = last_exit(&log_path)? else {
+            let Some(exit) = log::read_last_exit(&log_path)? else {
                 continue;
             };
             // `failure_means` is only ever written for a failure, and every
@@ -589,18 +588,12 @@ fn render_discovery_note(entries: &[CliEntry]) -> String {
     }
 }
 
-/// The last `exited` record in an agent's log — `log`'s own reader, exposed
-/// pub(crate) so this module stops carrying a near-copy of it.
-fn last_exit(path: &Path) -> Result<Option<ExitEntry>> {
-    crate::log::read_last_exit(path)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::catalog::parse_entry;
     use crate::lock::{SubagentRecord, append_record};
-    use crate::log::{Status, append_log};
+    use crate::log::{ExitEntry, Status, append_log};
     use crate::project::resolve_project_paths;
     use crate::task::Role;
 

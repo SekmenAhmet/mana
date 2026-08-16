@@ -1201,7 +1201,11 @@ mod dispatch_tests {
         let paths = fixture.paths();
         let registry = load_registry(&paths.subagents_file).unwrap();
         assert_eq!(registry.records.len(), 1);
-        let record = registry.get(&run.outcome.agent_id).unwrap();
+        let record = registry
+            .records
+            .iter()
+            .find(|r| r.agent_id == run.outcome.agent_id)
+            .unwrap();
         assert_eq!(record.cli, "fixture");
         assert_eq!(record.model, "cheapo");
         assert_eq!(record.role, Role::Executor);

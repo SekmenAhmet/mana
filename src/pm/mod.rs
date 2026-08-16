@@ -33,7 +33,6 @@
 //! }
 //! pm.shutdown()?;
 //! ```
-#![allow(dead_code)] // Consumers land with the launch flow (2.3) and the TUI (2.4).
 
 mod acp;
 mod child;

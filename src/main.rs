@@ -16,11 +16,10 @@ mod tui;
 mod worktree;
 
 use clap::Parser;
-use cli::{Cli, Command, normalize_help_invocation};
+use cli::{Cli, Command};
 
 fn main() -> anyhow::Result<()> {
-    let args = normalize_help_invocation(std::env::args().collect());
-    let cli = Cli::parse_from(args);
+    let cli = Cli::parse();
     match cli.command {
         // The one subcommand that wraps a child process, and therefore the one
         // whose exit code is not mana's to invent: a PM that exited 7 has to

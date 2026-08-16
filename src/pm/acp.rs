@@ -60,8 +60,8 @@
 //! would put one character per line in the chat pane.
 
 use super::child::{
-    CLOSE_GRACE, DRAIN_GRACE, POLL_INTERVAL, join_or_detach, kill_group, pump_stderr, read_lines,
-    reap, set_process_group,
+    DRAIN_GRACE, PersistentChild, join_or_detach, kill_group, pump_stderr, read_lines, reap,
+    set_process_group,
 };
 use super::{PermissionChoice, PmEvent, PmTransport, Resume};
 use crate::catalog::{CliEntry, PmDriver, ToolChannel, substitute};
@@ -70,10 +70,9 @@ use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{ChildStdin, ChildStdout, Command, Stdio};
 use std::sync::mpsc::{Receiver, Sender, channel};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 /// The protocol revision mana speaks. Version 1 is the stable one; both agents
@@ -104,10 +103,9 @@ const MCP_SERVER_NAME: &str = "mana";
 /// reader thread has to answer requests mana does not serve, and an agent left
 /// waiting on a reply it will never get is an agent that hangs.
 pub struct AcpDriver {
-    child: Arc<Mutex<Child>>,
-    /// Captured at spawn: after the child is reaped the pid is meaningless,
-    /// and `kill_group` must never signal a recycled one.
-    pid: u32,
+    /// The process, its reader thread and the shutdown that ends both -- the
+    /// part the stream driver holds identically (see `PersistentChild`).
+    child: PersistentChild,
     stdin: SharedStdin,
     session_id: String,
     /// JSON-RPC request ids mana hands out. Starts after the handshake's.
@@ -118,10 +116,6 @@ pub struct AcpDriver {
     /// here.
     pending: PendingPermissions,
     events: Receiver<PmEvent>,
-    /// Taken by `shutdown`, which joins it so `Exited` is queued before it
-    /// returns.
-    reader: Option<JoinHandle<()>>,
-    close_grace: Duration,
 }
 
 /// stdin, shared with the reader thread and dropped by `shutdown`.
@@ -296,26 +290,45 @@ impl AcpDriver {
         });
 
         Ok(AcpDriver {
-            child,
-            pid,
+            child: PersistentChild::new(child, pid, reader),
             stdin,
             session_id,
             // 1 and 2 went to the handshake.
             next_request: 3,
             pending,
             events,
-            reader: Some(reader),
-            close_grace: CLOSE_GRACE,
         })
     }
 
+    fn write(&self, frame: &str) -> Result<()> {
+        let mut guard = self.stdin.lock().unwrap();
+        let stdin = guard.as_mut().ok_or_else(|| {
+            anyhow!("the PM session is closed: its stdin was shut down, so nothing can be sent")
+        })?;
+        stdin.write_all(frame.as_bytes())?;
+        stdin.write_all(b"\n")?;
+        stdin.flush()?;
+        Ok(())
+    }
+}
+
+impl Drop for AcpDriver {
+    fn drop(&mut self) {
+        // A PM that outlives mana is v1's zombie: it holds a quota slot, keeps
+        // whatever it spawned (its MCP server, for one) alive, and answers to
+        // nobody.
+        let _ = self.shutdown();
+    }
+}
+
+impl PmTransport for AcpDriver {
     /// Sends one user turn as `session/prompt`.
     ///
     /// Fire and forget: the response arrives on the reader thread, minutes
     /// later, and is what ends the turn (flushing whatever prose was still
     /// buffered and reporting the agent's token usage). Waiting for it here
     /// would freeze the interface for the whole turn.
-    pub fn send_user(&mut self, text: &str) -> Result<()> {
+    fn send_user(&mut self, text: &str) -> Result<()> {
         let id = self.next_request;
         self.next_request += 1;
         let frame = request(
@@ -346,7 +359,7 @@ impl AcpDriver {
     /// while every retry was refused with `already answered or cancelled`. The
     /// double answer this ordering could allow needs the write to both fail
     /// and have been delivered, which is the one case a blocked agent survives.
-    pub fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
+    fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
         let request_id = self
             .pending
             .lock()
@@ -366,97 +379,25 @@ impl AcpDriver {
         Ok(())
     }
 
-    /// The session's event stream. Borrowed rather than moved so the driver
-    /// stays the single owner of the process and its channel.
-    pub fn events(&self) -> &Receiver<PmEvent> {
-        &self.events
-    }
-
-    /// Ends the session: close stdin, wait, kill what is left.
-    ///
-    /// Both agents measured on 2026-08-15 exit cleanly when stdin closes, so
-    /// the polite path is the normal one and the kill is the guarantee.
-    pub fn shutdown(&mut self) -> Result<()> {
-        *self.stdin.lock().unwrap() = None;
-        let deadline = Instant::now() + self.close_grace;
-        while !self.has_exited() && Instant::now() < deadline {
-            std::thread::sleep(POLL_INTERVAL);
-        }
-        self.kill_if_alive();
-        if let Some(reader) = self.reader.take() {
-            join_or_detach(reader, Instant::now() + DRAIN_GRACE);
-        }
-        Ok(())
-    }
-
-    /// The PM's pid, for the process registry (`mana ps`/`mana kill`).
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// How long `shutdown` waits before killing. Tests shorten it.
-    pub fn set_close_grace(&mut self, grace: Duration) {
-        self.close_grace = grace;
-    }
-
-    fn write(&self, frame: &str) -> Result<()> {
-        let mut guard = self.stdin.lock().unwrap();
-        let stdin = guard.as_mut().ok_or_else(|| {
-            anyhow!("the PM session is closed: its stdin was shut down, so nothing can be sent")
-        })?;
-        stdin.write_all(frame.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
-    }
-
-    fn has_exited(&self) -> bool {
-        // An error means the child is unreachable, which is as final as an exit
-        // status for every purpose here.
-        !matches!(self.child.lock().unwrap().try_wait(), Ok(None))
-    }
-
-    fn kill_if_alive(&self) {
-        let mut child = self.child.lock().unwrap();
-        // Under the lock, and only while `try_wait` reports the child unreaped:
-        // the kernel still holds its pid, so the group id cannot yet have been
-        // recycled onto somebody else's processes.
-        if let Ok(None) = child.try_wait() {
-            kill_group(&mut child, self.pid);
-            // SIGKILL cannot be caught, so this reaps rather than waits.
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Drop for AcpDriver {
-    fn drop(&mut self) {
-        // A PM that outlives mana is v1's zombie: it holds a quota slot, keeps
-        // whatever it spawned (its MCP server, for one) alive, and answers to
-        // nobody.
-        let _ = self.shutdown();
-    }
-}
-
-impl PmTransport for AcpDriver {
-    fn send_user(&mut self, text: &str) -> Result<()> {
-        AcpDriver::send_user(self, text)
-    }
-
     fn events(&self) -> &Receiver<PmEvent> {
-        AcpDriver::events(self)
-    }
-
-    fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
-        AcpDriver::answer_permission(self, id, option_id)
+        &self.events
     }
 
     fn session_id(&self) -> Option<&str> {
         Some(&self.session_id)
     }
 
+    /// Ends the session: close stdin, wait, kill what is left.
+    ///
+    /// Both agents measured on 2026-08-15 exit cleanly when stdin closes, so
+    /// the polite path is the normal one and the kill is the guarantee. Only
+    /// the first line differs from the stream driver's shutdown -- stdin is
+    /// behind a mutex here because the reader thread writes replies through it
+    /// -- and everything after it is `PersistentChild`'s.
     fn shutdown(&mut self) -> Result<()> {
-        AcpDriver::shutdown(self)
+        *self.stdin.lock().unwrap() = None;
+        self.child.close_and_wait();
+        Ok(())
     }
 }
 
@@ -1780,6 +1721,7 @@ mod golden {
 /// `catalog/opencode.toml` / `catalog/copilot.toml` are for.
 #[cfg(all(test, unix))]
 mod process_tests {
+    use super::super::child::POLL_INTERVAL;
     use super::tests::entry;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
@@ -1985,7 +1927,7 @@ done
             fixture.dir.path().to_string_lossy().as_ref()
         );
         assert_eq!(driver.session_id, "s-stored");
-        driver.set_close_grace(Duration::from_millis(200));
+        driver.child.set_close_grace(Duration::from_millis(200));
         driver.shutdown().unwrap();
     }
 
@@ -2246,8 +2188,8 @@ done
     fn shutdown_kills_an_agent_that_ignores_the_close_and_takes_its_children_along() {
         let fixture = Fixture::new();
         let mut driver = fixture.driver("linger");
-        let pid = driver.pid() as i32;
-        driver.set_close_grace(Duration::from_millis(200));
+        let pid = driver.child.pid() as i32;
+        driver.child.set_close_grace(Duration::from_millis(200));
         driver.send_user("go quiet on me").unwrap();
         fixture.wait_for_sent(3);
 
@@ -2282,8 +2224,8 @@ done
     fn dropping_the_driver_kills_the_agent() {
         let fixture = Fixture::new();
         let mut driver = fixture.driver("linger");
-        let pid = driver.pid() as i32;
-        driver.set_close_grace(Duration::from_millis(200));
+        let pid = driver.child.pid() as i32;
+        driver.child.set_close_grace(Duration::from_millis(200));
         driver.send_user("go quiet on me").unwrap();
         fixture.wait_for_sent(3);
         drop(driver);
