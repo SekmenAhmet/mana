@@ -9,9 +9,28 @@ on:
     - cron: "0 7 * * 1" # Mondays 07:00 UTC
   workflow_dispatch:
 
+# Least privilege at the top, re-granted per job — same shape as
+# release-plz.yml. Reading the tree is all cargo-deny needs.
+permissions: {}
+
 jobs:
   deny:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
-      - uses: EmbarkStudios/cargo-deny-action@v2
+      # Pinned to a commit, not a tag: a tag is a mutable pointer the upstream
+      # owner can repoint, and nothing here would show a diff. The trailing
+      # comment is the version Renovate tracks.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          # A `schedule:` run always executes the *default* branch's workflow
+          # against the *default* branch's code, and `main` only moves at
+          # release time — so between releases the weekly audit would read a
+          # dependency tree nothing ships (main is still pre-v2: no `rmcp`, no
+          # `serde_json_path`, an older `self_update`). An advisory against a
+          # crate develop carries would pass silently, which is exactly the
+          # "silence looks like health" failure this workflow exists to catch.
+          # Any other trigger audits the ref that fired it.
+          ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
+      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2

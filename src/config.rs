@@ -93,12 +93,12 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
 
 pub fn save_config(path: &Path, config: &Config) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::project::create_dir_all(parent)?;
     }
     // Pretty-printed: config.toml is meant to be hand-readable/editable,
     // same expectation the old config.yaml carried.
     let toml = toml::to_string_pretty(config)?;
-    std::fs::write(path, toml)?;
+    crate::project::write(path, toml)?;
     Ok(())
 }
 

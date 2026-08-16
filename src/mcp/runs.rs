@@ -87,9 +87,9 @@ pub fn notifications_path(paths: &ProjectPaths) -> PathBuf {
 /// history here would just be a second, staler copy of `subagents.jsonl`.
 pub fn write_run(paths: &ProjectPaths, record: &RunRecord) -> Result<()> {
     let path = run_path(paths, &record.task_id);
-    std::fs::create_dir_all(runs_dir(paths))?;
+    crate::project::create_dir_all(&runs_dir(paths))?;
     let line = serde_json::to_string(record)?;
-    std::fs::write(&path, line).with_context(|| format!("writing {}", path.display()))
+    crate::project::write(&path, line).with_context(|| format!("writing {}", path.display()))
 }
 
 /// `Ok(None)` when no executor has finished this task yet -- the ordinary case
@@ -118,13 +118,10 @@ pub fn notify(paths: &ProjectPaths, notification: &Notification) -> Result<()> {
 
 fn append_line(path: &Path, line: &str) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::project::create_dir_all(parent)?;
     }
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .with_context(|| format!("opening {}", path.display()))?;
+    let mut file =
+        crate::project::open_append(path).with_context(|| format!("opening {}", path.display()))?;
     writeln!(file, "{line}")?;
     Ok(())
 }

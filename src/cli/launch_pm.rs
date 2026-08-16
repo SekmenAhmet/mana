@@ -660,9 +660,9 @@ fn load_state(paths: &ProjectPaths) -> ProjectState {
 
 fn save_state(paths: &ProjectPaths, state: &ProjectState) -> Result<()> {
     let path = state_path(paths);
-    std::fs::create_dir_all(&paths.root)?;
+    crate::project::create_dir_all(&paths.root)?;
     let document = toml::to_string_pretty(state).context("rendering this project's state")?;
-    std::fs::write(&path, document).with_context(|| format!("writing {}", path.display()))
+    crate::project::write(&path, document).with_context(|| format!("writing {}", path.display()))
 }
 
 /// The one turn mana writes itself: who the PM is, where its role text is, and
@@ -875,9 +875,9 @@ fn write_mcp_config(paths: &ProjectPaths, project_root: &Path) -> Result<PathBuf
         "resolving mana's own path, which is what the PM's CLI will run to reach mana's tools",
     )?;
     let path = paths.root.join(MCP_CONFIG);
-    std::fs::create_dir_all(&paths.root)?;
+    crate::project::create_dir_all(&paths.root)?;
     let document = serde_json::to_string_pretty(&mcp_config(&exe, project_root))?;
-    std::fs::write(&path, format!("{document}\n"))
+    crate::project::write(&path, format!("{document}\n"))
         .with_context(|| format!("writing {}", path.display()))?;
     Ok(path)
 }

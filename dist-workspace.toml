@@ -17,6 +17,13 @@ install-path = "CARGO_HOME"
 hosting = "github"
 # Whether to install an updater program
 install-updater = false
+# `release.yml` carries one hand-added job (`guard`, issue #80) that refuses a
+# tag whose commit is not on `main`. dist has no config for that, and without
+# this line `dist generate --check` in CI would report the job as drift and
+# fail every PR. Cost of the exception: real config drift in release.yml is no
+# longer caught automatically -- after editing this file, run `dist generate`
+# by hand and re-apply the `guard` job. See RELEASING.md.
+allow-dirty = ["ci"]
 # The generated workflow otherwise also fires on every pull request to run
 # `dist plan`. That check is worth having, but not as a second workflow named
 # "Release" appearing on every PR to develop -- CI's `deps & coverage` job runs

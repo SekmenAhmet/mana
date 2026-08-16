@@ -105,7 +105,7 @@ pub fn create(
     // and blocks `worktree add` (the directory "already exists").
     remove_worktree(project_root, &path)?;
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::project::create_dir_all(parent)?;
     }
 
     enable_worktree_config(project_root)?;

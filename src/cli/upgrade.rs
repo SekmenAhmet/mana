@@ -29,6 +29,11 @@ const BIN_NAME: &str = "mana";
 /// as "not an archive" and copies the raw bytes over the binary, silently.
 const ARCHIVE_EXT: &str = ".tar.gz";
 
+/// cargo-dist uploads one of these beside every archive, plus an aggregate
+/// `sha256.sum` (RELEASING.md). The sidecar is the one this file reads: it
+/// names exactly one archive, so there is no line to pick out of a list.
+const CHECKSUM_EXT: &str = ".sha256";
+
 /// Where the binary sits *inside* the archive.
 ///
 /// cargo-dist tarballs are not flat: `mana-<target>.tar.gz` unpacks to a
@@ -89,36 +94,227 @@ pub(crate) fn describe_update_result(status: &self_update::Status) -> String {
     }
 }
 
+/// Where the binary sits inside the archive, with `self_update`'s two
+/// placeholders resolved.
+///
+/// `{{ bin }}` is not `BIN_NAME`: it carries `std::env::consts::EXE_SUFFIX`,
+/// which is what makes the same template find `mana.exe` in the Windows
+/// archive. Substituting here rather than handing the template to
+/// `self_update` is what lets `run` extract the archive it has already
+/// verified instead of one the library downloads for itself.
+fn bin_path_in_archive(target: &str) -> String {
+    BIN_PATH_IN_ARCHIVE.replace("{{ target }}", target).replace(
+        "{{ bin }}",
+        &format!("{BIN_NAME}{}", std::env::consts::EXE_SUFFIX),
+    )
+}
+
+/// The digest an `.sha256` sidecar attests to.
+///
+/// cargo-dist writes the `sha256sum` line format -- `<hex>  <filename>` --
+/// and bare-digest sidecars exist elsewhere, so take the first token either
+/// way. The shape check is not cosmetic: it is what turns "GitHub answered
+/// with an error page / a redirect / JSON metadata" into a refusal here,
+/// rather than a digest mismatch that reads like a tampered archive.
+fn parse_checksum(contents: &str) -> anyhow::Result<String> {
+    let digest = contents
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    anyhow::ensure!(
+        digest.len() == 64 && digest.bytes().all(|b| b.is_ascii_hexdigit()),
+        "the published checksum is not a sha256 digest: {:?}",
+        contents.chars().take(120).collect::<String>()
+    );
+    Ok(digest)
+}
+
+/// Fetches one release asset into memory.
+///
+/// `Accept: application/octet-stream` is load-bearing: the GitHub backend
+/// hands out the *API* asset URL (`.../releases/assets/<id>`), which answers
+/// with JSON metadata under any other Accept. `self_update` sets this header
+/// inside its own `update()`; doing the download here means setting it here.
+/// The headers underneath it come from the backend so that a `GITHUB_TOKEN`
+/// build and the User-Agent GitHub insists on keep working.
+fn download_asset(
+    updater: &dyn self_update::update::ReleaseUpdate,
+    asset: &self_update::update::ReleaseAsset,
+    show_progress: bool,
+) -> anyhow::Result<Vec<u8>> {
+    let mut headers = updater.api_headers(&updater.auth_token())?;
+    headers.insert(
+        "accept",
+        "application/octet-stream"
+            .parse()
+            .expect("a literal, valid header value"),
+    );
+    let mut download = self_update::Download::from_url(&asset.download_url);
+    download.set_headers(headers);
+    download.show_progress(show_progress);
+    let mut bytes = Vec::new();
+    download.download_to(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Downloads the release archive, checks it against the checksum cargo-dist
+/// published beside it, and only then replaces the running binary.
+///
+/// This is `self_update`'s own `update()` unrolled, because `update()` has no
+/// seam to verify in: it downloads, extracts and replaces inside one default
+/// trait method, and the only integrity hook it offers is the `signatures`
+/// feature, which wants zipsign-signed archives cargo-dist does not produce.
+/// Unrolling it is what puts a digest between the network and `current_exe()`.
+///
+/// ponytail: a checksum from the same origin as the archive bounds a
+/// tampered *transfer*, not a tampered *release* -- an attacker who can
+/// replace the asset can replace its sidecar. Signed releases (zipsign +
+/// `self_update`'s `signatures` feature, or minisign in cargo-dist) are the
+/// upgrade path when that threat is worth paying for.
 pub fn run() -> anyhow::Result<()> {
     let target = self_update::get_target();
-    let status = self_update::backends::github::Update::configure()
+    let updater = self_update::backends::github::Update::configure()
         .repo_owner(REPO_OWNER)
         .repo_name(REPO_NAME)
         .bin_name(BIN_NAME)
         .target(target)
-        // The identifier is the whole archive name rather than the extension,
-        // so what mana asks GitHub for is exactly what the test says cargo-dist
-        // uploads -- a `.deb` or an `.msi` for the same triple could never be
-        // taken for the tarball.
-        //
-        // It cannot separate the archive from its own `.sha256` sibling:
-        // `asset_for` matches by substring, and every substring of the
-        // archive's name is also a substring of the checksum's. What separates
-        // those two is that GitHub returns release assets sorted by name
-        // (verified against ruff, ripgrep and bat), so `X.tar.gz` is found
-        // before `X.tar.gz.sha256`. If that ever stopped holding, the failure
-        // would be loud -- a 100-byte text file is not a tarball -- and never a
-        // corrupted binary.
-        .identifier(&archive_name(target))
-        .bin_path_in_archive(BIN_PATH_IN_ARCHIVE)
-        .show_download_progress(true)
-        .show_output(false)
-        .no_confirm(true)
         .current_version(CURRENT_VERSION)
-        .build()?
-        .update()?;
-    println!("{}", describe_update_result(&status));
+        .build()?;
+
+    let release = updater.get_latest_release()?;
+    // Same "is it strictly newer" rule the launch-time notice uses, so the two
+    // halves of this file can never disagree about whether an upgrade exists.
+    if notice(CURRENT_VERSION, &release.version).is_none() {
+        println!(
+            "{}",
+            describe_update_result(&self_update::Status::UpToDate(CURRENT_VERSION.to_string()))
+        );
+        return Ok(());
+    }
+
+    // Assets are looked up by exact name rather than through
+    // `Release::asset_for`, whose substring match cannot tell an archive from
+    // its own `.sha256` sibling -- every substring of the one is a substring
+    // of the other. Here both are wanted, each as itself, so the ambiguity
+    // that used to be papered over with GitHub's asset ordering is gone.
+    let archive = archive_name(target);
+    let asset = |name: &str| {
+        release
+            .assets
+            .iter()
+            .find(|asset| asset.name == name)
+            .ok_or_else(|| anyhow::anyhow!("release v{} publishes no {name}", release.version))
+    };
+    let archive_asset = asset(&archive)?;
+    let checksum_asset = asset(&format!("{archive}{CHECKSUM_EXT}"))?;
+
+    let bytes = download_asset(updater.as_ref(), archive_asset, true)?;
+    let published = parse_checksum(&String::from_utf8_lossy(&download_asset(
+        updater.as_ref(),
+        checksum_asset,
+        false,
+    )?))?;
+    let downloaded = sha256_hex(&bytes);
+    anyhow::ensure!(
+        downloaded == published,
+        "checksum mismatch for {archive}: the release publishes {published}, \
+         the download hashes to {downloaded}. Refusing to replace mana."
+    );
+
+    // Everything past this point runs on bytes already on disk and already
+    // vouched for -- no second request, so nothing can be swapped underneath
+    // the digest that was just checked.
+    let tmp = self_update::TempDir::new()?;
+    let archive_path = tmp.path().join(&archive);
+    std::fs::write(&archive_path, &bytes)?;
+    let bin_in_archive = bin_path_in_archive(target);
+    self_update::Extract::from_source(&archive_path).extract_file(tmp.path(), &bin_in_archive)?;
+    self_update::self_replace::self_replace(tmp.path().join(&bin_in_archive))?;
+
+    println!(
+        "{}",
+        describe_update_result(&self_update::Status::Updated(release.version))
+    );
     Ok(())
+}
+
+/// SHA-256 (FIPS 180-4), pinned by the standard's own vectors in the tests.
+///
+/// Hand-written because there is no hash mana can reach: `sha2` sits in
+/// Cargo.lock only as a transitive dependency of `ed25519-dalek`, which Rust
+/// does not let this crate use, and adding it as a direct dependency was not
+/// this change's to make. The algorithm is frozen and fully specified, and no
+/// secret passes through it -- there is nothing here that needs to be
+/// constant-time. Swap in `sha2::Sha256` and delete this the day the
+/// dependency is declared.
+fn sha256_hex(data: &[u8]) -> String {
+    const K: [u32; 64] = [
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4,
+        0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe,
+        0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f,
+        0x4a7484aa, 0x5cb0a9dc, 0x76f988da, 0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7,
+        0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc,
+        0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+        0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070, 0x19a4c116,
+        0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7,
+        0xc67178f2,
+    ];
+    let mut h: [u32; 8] = [
+        0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
+        0x5be0cd19,
+    ];
+
+    // Padding: the message, a 1 bit, zeros, then the length in bits as u64.
+    let mut padded = data.to_vec();
+    padded.push(0x80);
+    while padded.len() % 64 != 56 {
+        padded.push(0);
+    }
+    padded.extend_from_slice(&(data.len() as u64 * 8).to_be_bytes());
+
+    for block in padded.chunks_exact(64) {
+        let mut w = [0u32; 64];
+        for (slot, word) in w.iter_mut().zip(block.chunks_exact(4)) {
+            *slot = u32::from_be_bytes(word.try_into().expect("chunks_exact(4) yields 4 bytes"));
+        }
+        for i in 16..64 {
+            let s0 = w[i - 15].rotate_right(7) ^ w[i - 15].rotate_right(18) ^ (w[i - 15] >> 3);
+            let s1 = w[i - 2].rotate_right(17) ^ w[i - 2].rotate_right(19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16]
+                .wrapping_add(s0)
+                .wrapping_add(w[i - 7])
+                .wrapping_add(s1);
+        }
+
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut hh] = h;
+        for (k, wi) in K.iter().zip(w.iter()) {
+            let s1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let ch = (e & f) ^ (!e & g);
+            let t1 = hh
+                .wrapping_add(s1)
+                .wrapping_add(ch)
+                .wrapping_add(*k)
+                .wrapping_add(*wi);
+            let s0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let maj = (a & b) ^ (a & c) ^ (b & c);
+            let t2 = s0.wrapping_add(maj);
+            hh = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(t1);
+            d = c;
+            c = b;
+            b = a;
+            a = t1.wrapping_add(t2);
+        }
+        for (slot, value) in h.iter_mut().zip([a, b, c, d, e, f, g, hh]) {
+            *slot = slot.wrapping_add(value);
+        }
+    }
+
+    h.iter().map(|word| format!("{word:08x}")).collect()
 }
 
 /// What the launch-time check remembered last time.
@@ -178,9 +374,9 @@ fn write_cache(path: &Path, cache: &CachedCheck) {
         return;
     };
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        let _ = crate::project::create_dir_all(parent);
     }
-    let _ = std::fs::write(path, body);
+    let _ = crate::project::write(path, body);
 }
 
 /// Asks GitHub for the newest release, or gives up.
@@ -340,11 +536,11 @@ mod tests {
     /// The template resolves to the directory cargo-dist puts inside the
     /// tarball, plus the binary.
     ///
-    /// `{{ bin }}` is not `BIN_NAME`: `self_update`'s `bin_name()` appends
-    /// `std::env::consts::EXE_SUFFIX` before storing it, which is what makes
-    /// the Windows archive's `mana.exe` findable from the same template. This
-    /// test substitutes the same way, so it asserts `.../mana` on unix and
-    /// `.../mana.exe` on windows rather than pretending the two are alike.
+    /// `{{ bin }}` is not `BIN_NAME`: it carries `std::env::consts::EXE_SUFFIX`,
+    /// which is what makes the Windows archive's `mana.exe` findable from the
+    /// same template. So this asserts `.../mana` on unix and `.../mana.exe` on
+    /// windows rather than pretending the two are alike -- and it asserts the
+    /// function `run` actually extracts with, not a copy of its logic.
     #[test]
     fn bin_path_in_archive_is_the_archive_stem_plus_the_binary() {
         let exe = format!("{BIN_NAME}{}", std::env::consts::EXE_SUFFIX);
@@ -353,10 +549,64 @@ mod tests {
                 .strip_suffix(ARCHIVE_EXT)
                 .expect("every archive ends with the configured extension")
                 .to_string();
-            let rendered = BIN_PATH_IN_ARCHIVE
-                .replace("{{ target }}", &target)
-                .replace("{{ bin }}", &exe);
-            assert_eq!(rendered, format!("{stem}/{exe}"));
+            assert_eq!(bin_path_in_archive(&target), format!("{stem}/{exe}"));
+        }
+    }
+
+    /// The vectors from FIPS 180-4's own appendix, plus a multi-block input:
+    /// one block, two blocks, and the empty message, which is the case the
+    /// padding loop is easiest to get wrong on.
+    #[test]
+    fn sha256_matches_the_standards_test_vectors() {
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
+        );
+        // 1 000 000 'a' -- the appendix's long message, which is what proves
+        // the block loop and the 64-bit length field, not just one block.
+        assert_eq!(
+            sha256_hex(&vec![b'a'; 1_000_000]),
+            "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0"
+        );
+    }
+
+    #[test]
+    fn checksum_sidecar_parses_in_both_shapes_cargo_dist_and_sha256sum_write() {
+        let digest = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        assert_eq!(parse_checksum(digest).unwrap(), digest);
+        assert_eq!(
+            parse_checksum(&format!("{digest}  mana-x86_64-apple-darwin.tar.gz\n")).unwrap(),
+            digest
+        );
+        assert_eq!(
+            parse_checksum(&digest.to_ascii_uppercase()).unwrap(),
+            digest,
+            "a digest is compared lowercased, so the case it arrives in cannot fail an upgrade"
+        );
+    }
+
+    /// The refusal that matters: anything that is not a digest -- an error
+    /// page, a redirect body, a truncated file -- must stop the upgrade with
+    /// its own message instead of becoming a mismatch that reads like tamper.
+    #[test]
+    fn a_sidecar_that_is_not_a_digest_is_rejected() {
+        for body in [
+            "",
+            "\n",
+            "Not Found",
+            "<html><body>404</body></html>",
+            "e3b0c44298fc1c149afbf4c8996fb924", // half a digest
+            "z3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", // not hex
+        ] {
+            assert!(parse_checksum(body).is_err(), "accepted {body:?}");
         }
     }
 
