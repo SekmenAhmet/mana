@@ -416,10 +416,11 @@ README.
 
 ## Status and roadmap
 
-v0.1, pre-release: no tag has been pushed yet, and the license is
-deliberately undecided (`Cargo.toml` carries `publish = false` in the
-meantime; `deny.toml` skips the license gate for this crate explicitly, for
-the same reason). What is left open, mostly at the edges the design already
+v0.1, pre-release: no tag has been pushed yet. Licensed under
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option — use it,
+fork it, contribute to it. (`publish = false` stays for now: crates.io is a
+separate decision from the license.) What is left open, mostly at the edges
+the design already
 flags as unverified: Windows is covered at the unit level in CI but has no
 end-to-end run yet; copilot's model list needs re-measuring once its monthly
 quota resets (only `auto` is catalogued today); and a few ACP behaviors —
