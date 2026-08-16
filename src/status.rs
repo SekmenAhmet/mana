@@ -53,9 +53,7 @@ pub const SHORT_ID_CHARS: usize = 8;
 /// `guard` calls the pid recycled. Generous on purpose: the only legitimate
 /// sources of a gap are `ps` truncating to whole seconds and the system clock
 /// being stepped (NTP) between the dispatch and now, while wrapping the pid
-/// space takes minutes at the very least. Unix-gated with the only guard
-/// implementation that can measure an age at all.
-#[cfg(unix)]
+/// space takes minutes at the very least.
 const REUSE_TOLERANCE: TimeDelta = TimeDelta::seconds(120);
 
 /// What the operating system says about a pid, without signalling it.
@@ -296,13 +294,10 @@ pub fn all_dispatches(mana_home: &Path) -> Result<Vec<Dispatch>> {
 /// See `guard` for what each answer is worth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Guard {
-    /// Every check that could run passed. Constructed only by the unix
-    /// guard -- Windows has no check to pass, so there it is only matched.
-    #[cfg_attr(windows, allow(dead_code))]
+    /// Every check that could run passed. How many that is depends on the
+    /// platform (two on unix, one on Windows) -- see `guard`.
     Ours,
     /// A check failed outright: this pid is somebody else's process.
-    /// Unix-only for the same reason as `Ours`.
-    #[cfg_attr(windows, allow(dead_code))]
     NotOurs(String),
     /// Not a single check could run. The caller may proceed, loudly.
     Unverified(String),
@@ -325,8 +320,8 @@ pub enum Guard {
 /// (every shell is one) within `REUSE_TOLERANCE` of the dispatch's own age
 /// passes both checks. Pid recycling that fast requires wrapping the pid space
 /// in seconds, which no realistic machine does — but "unlikely" is the whole
-/// guarantee, not "impossible". On Windows neither check exists and the answer
-/// is always `Unverified`.
+/// guarantee, not "impossible". Windows has only the second check; see the
+/// `#[cfg(windows)]` twin below.
 #[cfg(unix)]
 pub fn guard(pid: u32, started_at: &str, now: DateTime<Utc>) -> Guard {
     let Ok(signed) = i32::try_from(pid) else {
@@ -349,12 +344,48 @@ pub fn guard(pid: u32, started_at: &str, now: DateTime<Utc>) -> Guard {
         ));
     }
 
+    // The group check already passed, so an age check that cannot run does not
+    // undo it.
+    age_check(pid, started_at, now, Guard::Ours)
+}
+
+/// Windows has no process group for a sub-agent to lead, so only the second of
+/// the two checks exists here — but it does exist, and a pid that fails it is
+/// refused exactly as on unix rather than downgraded to "killing anyway". That
+/// matters more here than anywhere: `tasklist` answers for *any* pid, so a
+/// stale record classifies as `Running`, and the quit-time sweep in
+/// `cli::launch_pm` reaches this path with nobody at the keyboard to veto it.
+///
+/// What it still cannot promise, and the README says so: a pid recycled onto a
+/// process of roughly the dispatch's own age passes, where unix would also have
+/// asked whether it leads its own group.
+#[cfg(windows)]
+pub fn guard(pid: u32, started_at: &str, now: DateTime<Utc>) -> Guard {
+    age_check(
+        pid,
+        started_at,
+        now,
+        // No group check ran before this one, so there is nothing left standing
+        // when the age cannot be read either -- unlike unix, this really is
+        // "not a single check could run".
+        Guard::Unverified(format!(
+            "mana could not read a creation time for pid {pid}, so it cannot check that this \
+             is still the dispatch's own process"
+        )),
+    )
+}
+
+/// The age half of `guard`, shared by both platforms because the reasoning is:
+/// a recycled pid was handed out *after* the original process died, so its
+/// process is younger than the record. `unanswerable` is what to return when
+/// the process's age cannot be read at all — the two platforms differ only in
+/// how much evidence is left standing at that point.
+fn age_check(pid: u32, started_at: &str, now: DateTime<Utc>, unanswerable: Guard) -> Guard {
     let (Some(elapsed), Some(started)) = (elapsed_secs(pid), parse_started_at(started_at)) else {
-        // The group check already passed; the age check simply could not run.
-        return Guard::Ours;
+        return unanswerable;
     };
     let record_age = (now - started).num_seconds();
-    if TimeDelta::seconds(elapsed) + REUSE_TOLERANCE < TimeDelta::seconds(record_age) {
+    if recycled_by_age(elapsed, record_age) {
         return Guard::NotOurs(format!(
             "pid {pid} has been running for {elapsed}s but the dispatch was started \
              {record_age}s ago, so this pid has been recycled onto a younger process"
@@ -363,15 +394,12 @@ pub fn guard(pid: u32, started_at: &str, now: DateTime<Utc>) -> Guard {
     Guard::Ours
 }
 
-/// Windows offers neither of the two checks: there is no process group whose
-/// leader mana could recognise, and no elapsed-time field `tasklist` will
-/// print. Saying so is the honest answer; `mana kill` prints it before it acts.
-#[cfg(windows)]
-pub fn guard(pid: u32, _started_at: &str, _now: DateTime<Utc>) -> Guard {
-    Guard::Unverified(format!(
-        "mana cannot check on Windows that pid {pid} is still this dispatch's process \
-         (no process-group check is available there)"
-    ))
+/// The refusal decision itself, with no process anywhere near it: is a process
+/// of `elapsed` seconds too young to be a dispatch recorded `record_age`
+/// seconds ago? Split out so the one branch that decides whether mana kills a
+/// bystander is testable on a host that cannot run the platform's age lookup.
+fn recycled_by_age(elapsed: i64, record_age: i64) -> bool {
+    TimeDelta::seconds(elapsed) + REUSE_TOLERANCE < TimeDelta::seconds(record_age)
 }
 
 /// How long the process behind `pid` has been running, in seconds.
@@ -410,6 +438,42 @@ fn parse_etime(text: &str) -> Option<i64> {
         _ => return None,
     };
     Some(days * 86_400 + hours * 3_600 + minutes * 60 + seconds)
+}
+
+/// The same, on Windows. Nothing here is free: `tasklist` prints no age column,
+/// `wmic` was removed in Windows 11 24H2, and a `NtQueryInformationProcess` /
+/// `GetProcessTimes` call means linking `windows-sys` for one number. Windows
+/// PowerShell ships with every supported release and is already this module's
+/// idiom for asking the OS a question (see `probe`), so the creation time the
+/// kernel keeps anyway costs a process rather than a dependency.
+///
+/// `ToUniversalTime().ToString("o")` and not the default `ToString()`: the
+/// round-trip format is culture-invariant, and a check that a bystander's fate
+/// depends on must not turn on the box's locale. `-ErrorAction Stop` makes an
+/// unknown pid — or a process whose start time is not readable — a non-zero
+/// exit rather than an empty success. `None` on anything unexpected; the caller
+/// treats an unanswerable check as a check that did not run.
+#[cfg(windows)]
+fn elapsed_secs(pid: u32) -> Option<i64> {
+    let output = std::process::Command::new("powershell")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            &format!(
+                "(Get-Process -Id {pid} -ErrorAction Stop).StartTime.ToUniversalTime()\
+                 .ToString('o')"
+            ),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let created = parse_started_at(std::str::from_utf8(&output.stdout).ok()?.trim())?;
+    // The caller's `now` would be marginally more consistent, but it is the
+    // same clock a few milliseconds earlier and the tolerance is 120 seconds.
+    Some((Utc::now() - created).num_seconds())
 }
 
 /// Left-aligns a table by column, two spaces between columns, no trailing
@@ -560,6 +624,42 @@ mod tests {
             finished_at: None,
         };
         assert!(dispatch.age(Utc::now()).is_none());
+    }
+
+    /// The refusal decision, on every platform including the one whose age
+    /// lookup this host cannot run. Both `guard`s route through it, so this is
+    /// the branch that decides whether `mana kill` signals a bystander.
+    #[test]
+    fn a_process_younger_than_its_record_by_more_than_the_tolerance_is_recycled() {
+        let slack = REUSE_TOLERANCE.num_seconds();
+        // A dispatch started an hour ago whose pid is now three seconds old.
+        assert!(recycled_by_age(3, 3600));
+        // Exactly at the tolerance is still ours: the gap is what `ps` truncates
+        // and what a stepped clock produces, not evidence of reuse.
+        assert!(!recycled_by_age(0, slack));
+        assert!(recycled_by_age(0, slack + 1));
+        // The ordinary case -- a process about as old as its record.
+        assert!(!recycled_by_age(300, 300));
+        // A process *older* than its record is never reuse (a clock stepped
+        // forward between the spawn and now produces exactly this).
+        assert!(!recycled_by_age(3600, 10));
+    }
+
+    /// The Windows age lookup reads `StartTime.ToUniversalTime().ToString("o")`
+    /// back through `parse_started_at`, so the round-trip format has to survive
+    /// it -- seven fractional digits and all. Cheap to assert here, and the
+    /// alternative is discovering it on a Windows box during an incident.
+    #[test]
+    fn the_powershell_round_trip_timestamp_parses() {
+        let parsed = parse_started_at("2026-08-16T12:34:56.7890123Z").unwrap();
+        assert_eq!(parsed.to_rfc3339(), "2026-08-16T12:34:56.789012300+00:00");
+        // The same instant with an offset, which is what `ToString("o")` emits
+        // if the DateTime's Kind is ever Local rather than Utc.
+        assert_eq!(
+            parse_started_at("2026-08-16T14:34:56.7890123+02:00").unwrap(),
+            parsed
+        );
+        assert!(parse_started_at("").is_none());
     }
 
     #[test]

@@ -135,7 +135,12 @@ impl StreamDriver {
             );
         }
 
-        let mut command = Command::new(entry.cli.bin());
+        // Resolved rather than spawned by name: see `CliMeta::resolve`.
+        let program = entry
+            .cli
+            .resolve()
+            .with_context(|| format!("failed to start {} as PM", entry.cli.name))?;
+        let mut command = Command::new(&program);
         command
             .args(&args)
             .args(extra_args)
@@ -149,9 +154,9 @@ impl StreamDriver {
 
         let mut child = command.spawn().with_context(|| {
             format!(
-                "failed to start {} as PM ('{}' -- is it installed and on PATH?)",
+                "failed to start {} as PM ({})",
                 entry.cli.name,
-                entry.cli.bin()
+                program.display()
             )
         })?;
         let pid = child.id();

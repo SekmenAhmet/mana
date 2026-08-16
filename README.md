@@ -287,11 +287,23 @@ mana kill d4ce --all          # search every project
 
 Kills the whole process group the dispatch was spawned into, so a CLI that
 backgrounded a helper takes it down too, then records the same completion a
-normal exit would. Before signalling anything, mana checks that the pid is
-still plausibly the dispatch's own: every sub-agent leads its own process
-group, and its process cannot be more than two minutes younger than its
-record. A pid that fails either check is refused outright, not silently
-downgraded to a warning — you now own a process mana did not spawn.
+normal exit would. On Windows there are no process groups to signal, so it is
+`taskkill /T` walking the process tree instead — the same call a dispatch that
+blows its timeout makes, so the two paths leave the machine in the same state.
+
+Before signalling anything, mana checks that the pid is still plausibly the
+dispatch's own: every sub-agent leads its own process group, and its process
+cannot be more than two minutes younger than its record. A pid that fails
+either check is refused outright, not silently downgraded to a warning — you
+now own a process mana did not spawn.
+
+Windows gets one of those two checks. There is no process group for a
+sub-agent to lead there, so only the age check runs (against the creation time
+`Get-Process` reports); a pid that fails it is refused exactly as on unix, and
+a pid recycled onto a process of roughly the dispatch's own age is the case
+Windows cannot catch and unix can. When even the creation time cannot be read,
+mana says so and proceeds rather than refusing — the same thing it does on
+unix when a check cannot run at all.
 
 ### `mana doctor`
 

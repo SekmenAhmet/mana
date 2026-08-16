@@ -1,5 +1,7 @@
+use anyhow::{Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 /// One CLI's catalogue entry -- the whole of what mana is allowed to know
 /// about a CLI. Every struct below carries `deny_unknown_fields` on purpose:
@@ -44,13 +46,17 @@ pub struct CliMeta {
     pub bin: String,
     pub version_args: Vec<String>,
     /// Keyed by `std::env::consts::OS` ("windows", "macos", "linux"), for the
-    /// CLIs that ship under a different binary name on some platform.
+    /// CLIs that ship under a genuinely different *name* on some platform.
+    /// Not for file extensions: which of `foo.cmd` and `foo.exe` is on a
+    /// Windows PATH depends on how the user installed the CLI, not on the OS,
+    /// so naming one here would break the other install. `resolve` answers
+    /// that question at run time instead.
     #[serde(default)]
     pub bin_overrides: BTreeMap<String, String>,
 }
 
 impl CliMeta {
-    /// The binary name to spawn on the machine we are running on. Kept here
+    /// The binary name to look for on the machine we are running on. Kept here
     /// rather than at the call sites so no caller has to remember that
     /// per-OS overrides exist.
     pub fn bin(&self) -> &str {
@@ -58,6 +64,27 @@ impl CliMeta {
             .get(std::env::consts::OS)
             .map(String::as_str)
             .unwrap_or(&self.bin)
+    }
+
+    /// The executable to actually run: `bin()` looked up on PATH.
+    ///
+    /// Every spawn *and* every "is this CLI installed?" answer goes through
+    /// this one lookup, because the two used to use different resolvers and
+    /// disagreed. `which` consults PATHEXT, so on Windows it finds both the
+    /// `claude.cmd` shim npm writes and the `claude.exe` a native installer
+    /// writes; `Command::new("claude")` appends only `.exe` and never walks
+    /// PATHEXT, so it finds the second and not the first. That is how
+    /// `mana doctor` came to report every npm-installed CLI present while
+    /// every spawn of it failed. Handing std the absolute path `which` already
+    /// returned makes one answer serve both, whichever way the CLI was
+    /// installed -- and std routes a resolved `.cmd`/`.bat` through `cmd.exe`
+    /// on its own.
+    ///
+    /// Nothing observable changes on unix, where `which` walks PATH exactly as
+    /// the kernel would.
+    pub fn resolve(&self) -> Result<PathBuf> {
+        let bin = self.bin();
+        which::which(bin).with_context(|| format!("'{bin}' is not installed or not on PATH"))
     }
 }
 

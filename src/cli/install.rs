@@ -2,6 +2,7 @@ use crate::catalog::{Catalog, CliEntry};
 use crate::config::{AgentConfig, Config, config_path, load_config, save_config};
 use crate::project::mana_home;
 use crate::subprocess::{VERSION_CHECK_TIMEOUT, capture_version_output};
+use anyhow::Context;
 use dialoguer::MultiSelect;
 
 /// The user's escape valve (design §7): a local override may add a CLI mana
@@ -28,14 +29,10 @@ fn default_selections(config: &Config, entries: &[CliEntry]) -> Vec<bool> {
 /// is frequently not the id — Antigravity's id is `agy`, and per-OS
 /// `bin_overrides` can change it again) and the flags that print a version.
 pub fn resolve_agent(entry: &CliEntry) -> anyhow::Result<AgentConfig> {
-    let bin = entry.cli.bin();
-    let path = which::which(bin).map_err(|_| {
-        anyhow::anyhow!(
-            "binary '{bin}' not found in PATH -- install {} first: {}",
-            entry.cli.name,
-            entry.install.url
-        )
-    })?;
+    let path = entry
+        .cli
+        .resolve()
+        .with_context(|| format!("install {} first: {}", entry.cli.name, entry.install.url))?;
     let version = capture_version_output(&path, &entry.cli.version_args, VERSION_CHECK_TIMEOUT)?;
     Ok(AgentConfig {
         name: entry.cli.id.clone(),
@@ -164,7 +161,12 @@ mod tests {
     fn resolve_agent_errors_on_unknown_binary_and_names_the_install_url() {
         let catalog = catalog();
         let entry = entry_with_bin(&catalog, "claude", "this-binary-does-not-exist-anywhere");
-        let message = resolve_agent(&entry).unwrap_err().to_string();
+        // `{:#}` rather than `to_string()`: the binary name now lives in the
+        // source error `CliMeta::resolve` returns, and the install URL in the
+        // context wrapped around it. `main` returns `anyhow::Result`, which
+        // Rust prints with `Debug` -- so the whole chain is what a user
+        // actually reads, and the whole chain is what this asserts on.
+        let message = format!("{:#}", resolve_agent(&entry).unwrap_err());
         assert!(
             message.contains("this-binary-does-not-exist-anywhere"),
             "{message}"

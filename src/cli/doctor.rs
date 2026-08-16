@@ -235,7 +235,9 @@ fn catalogue_section(
     for entry in options.entries {
         report.say("");
         report.say(format!("{}  {}", entry.cli.id, entry.cli.name));
-        let installed = which::which(entry.cli.bin()).ok();
+        // The same lookup every spawn path uses, so "installed" here and
+        // "spawnable" there cannot diverge -- see `CliMeta::resolve`.
+        let installed = entry.cli.resolve().ok();
         match &installed {
             Some(path) => {
                 field(

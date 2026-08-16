@@ -237,8 +237,18 @@ fn run_dispatch(plan: Plan<'_>) -> Result<DispatchOutcome> {
     let agent_id = uuid::Uuid::new_v4().to_string();
     let log_path = plan.paths.logs.join(format!("{agent_id}.jsonl"));
 
+    // Resolved here rather than inside the spawner: `which` answers the same
+    // question `mana doctor` and the PM's routing table ask, and a sub-agent
+    // that cannot be spawned must fail before a worktree and a log record
+    // exist for it. See `CliMeta::resolve`.
+    let bin = plan
+        .entry
+        .cli
+        .resolve()
+        .with_context(|| format!("cannot dispatch to {}", plan.entry.cli.name))?;
+
     let spec = SpawnSpec {
-        bin: plan.entry.cli.bin().to_string(),
+        bin,
         args,
         cwd: plan.cwd.to_path_buf(),
         prompt: prompt_delivery,

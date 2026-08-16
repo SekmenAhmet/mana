@@ -356,7 +356,7 @@ fn wait_for_death(pid: u32) -> bool {
 /// process keeps running). SIGKILL and not SIGTERM because a sub-agent with a
 /// TERM handler could otherwise ignore the operator outright.
 #[cfg(unix)]
-fn signal(pid: u32) -> Result<()> {
+pub(crate) fn signal(pid: u32) -> Result<()> {
     let signed = i32::try_from(pid).map_err(|_| anyhow::anyhow!("pid {pid} is not a valid pid"))?;
     if signed <= 0 {
         bail!("refusing to signal pid {pid}: 0 and negative pids address whole groups");
@@ -381,11 +381,13 @@ fn signal(pid: u32) -> Result<()> {
 
 /// Windows has no process group to signal, so this shells out to `taskkill`,
 /// whose `/T` walks the process tree and `/F` is the TerminateProcess this
-/// needs. Notably stronger than what a *timeout* does on Windows today
-/// (`spawn::kill_group` there kills the direct child only, and says so).
+/// needs. `spawn::kill_group` calls this same function when a dispatch blows
+/// its timeout: an operator kill and a timeout must give the same guarantee on
+/// the same platform, and the tree walk is the only thing that reaches the
+/// agent once the direct child is the `.cmd` shim's `cmd.exe`.
 /// Unmeasured on a real Windows box — v2 ships no Windows CI.
 #[cfg(windows)]
-fn signal(pid: u32) -> Result<()> {
+pub(crate) fn signal(pid: u32) -> Result<()> {
     let output = std::process::Command::new("taskkill")
         .args(["/PID", &pid.to_string(), "/T", "/F"])
         .output()

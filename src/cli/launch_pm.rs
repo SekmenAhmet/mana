@@ -53,8 +53,9 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom, Stdout};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 /// The PM role text, embedded so it ships and versions with the tools it
@@ -158,24 +159,58 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
         );
     }
 
-    enable_raw_mode()?;
-    let mut stdout = std::io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(stdout))?;
-    let outcome = run_loop(
-        &mut terminal,
-        &mut session,
-        &mut app,
-        &mut GraphCache::new(),
-        &mut CrosstermEventSource,
-        update_notice,
-    );
+    // Trapped before the terminal is touched, so there is no instant in which
+    // a `kill` can land with raw mode on and nothing installed to undo it.
+    trap_termination();
+    let mut terminal = TerminalGuard::enter()?;
+    // Caught rather than left to unwind, and `AssertUnwindSafe` says the quiet
+    // part: a panicking loop may leave this session half-updated. That is
+    // exactly the session whose sub-agents are still running, and the teardown
+    // below only reads the two things a panic cannot corrupt -- the PM handle
+    // and the project name.
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        run_loop(
+            &mut terminal.terminal,
+            &mut session,
+            &mut app,
+            &mut GraphCache::new(),
+            &mut CrosstermEventSource,
+            update_notice,
+        )
+    }));
     // Restore the terminal before anything is printed or propagated: an error
-    // rendered into the alternate screen is an error nobody ever reads.
-    disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
-    terminal.show_cursor()?;
+    // rendered into the alternate screen is an error nobody ever reads. Every
+    // other way out of the loop -- a `?` inside it, a panic unwinding through
+    // `render::draw` -- reaches the same `Drop`, which is the point of it.
+    drop(terminal);
+    match outcome {
+        Ok(outcome) => finish_session(&home, &mut session, &app, outcome),
+        Err(panic) => {
+            // The session ends the same way it would have on Ctrl+C: the PM is
+            // reaped and the sub-agents swept, because a bug in a widget is
+            // still no reason to leave a paid agent running unwatched. Then the
+            // panic carries on to the caller unchanged.
+            let _ = finish_session(&home, &mut session, &app, Ok(SessionEnd::UserQuit));
+            std::panic::resume_unwind(panic)
+        }
+    }
+}
 
+/// Everything a session owes the machine once the loop is over, whichever way
+/// it went out.
+///
+/// The outcome is carried in by value rather than propagated at the call site,
+/// and that is the whole shape of the fix: reaping the PM and sweeping the
+/// sub-agents are what mana owes processes it started, so nothing that can
+/// fail may sit above them. The `?` chain that used to restore the terminal
+/// here did exactly that -- one failed step and the outcome was dropped
+/// unread, the PM left running and the sub-agents left to burn quota (#75).
+fn finish_session(
+    home: &Path,
+    session: &mut Session,
+    app: &App,
+    outcome: Result<SessionEnd>,
+) -> Result<()> {
     let _ = session.shutdown();
     // Quitting with turns still waiting is the operator's own decision, but it
     // is one they may have forgotten they made: the queue lives in a status
@@ -192,7 +227,7 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     // ever stop it -- its observer thread died with mana, so it would run to
     // completion writing into logs nobody reads, holding a quota slot and a
     // worktree, and `mana ps` would call it running until someone noticed.
-    for line in sweep_in_flight(&home, &session.project, Utc::now()) {
+    for line in sweep_in_flight(home, &session.project, Utc::now()) {
         println!("{line}");
     }
     match outcome? {
@@ -207,6 +242,7 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
             };
             let reason = app
                 .last_raw
+                .as_deref()
                 .map(|line| format!("\nits last output was: {line}"))
                 .unwrap_or_default();
             bail!(
@@ -216,6 +252,123 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
         }
     }
 }
+
+/// The terminal state mana changes, owned by one value so that the restore is
+/// something the compiler runs rather than something `run` remembers to.
+///
+/// Raw mode and the alternate screen are the two things a crashed TUI leaves
+/// behind, and they are recoverable only by typing `reset` blind. `Drop`
+/// covers what a restore written after the loop cannot: a panic in
+/// `render::draw` or in an event handler, and every `?` between here and the
+/// end of `run` (#75). The panic hook `enter` installs covers the one thing
+/// `Drop` is too late for -- the message.
+struct TerminalGuard {
+    terminal: Terminal<CrosstermBackend<Stdout>>,
+}
+
+impl TerminalGuard {
+    /// Enters raw mode and the alternate screen, all or nothing.
+    ///
+    /// The order is the whole point: the only fallible step that changes
+    /// nothing -- building the terminal, which queries the size -- runs first,
+    /// so the guard exists before the first byte of state is touched and a
+    /// failure below unwinds through the same `Drop` a finished session does.
+    /// Entering raw mode and then failing to reach the alternate screen used
+    /// to return `Err` from a shell left in raw mode with nothing to undo it.
+    fn enter() -> Result<TerminalGuard> {
+        let mut guard = TerminalGuard {
+            terminal: Terminal::new(CrosstermBackend::new(std::io::stdout()))?,
+        };
+        enable_raw_mode()?;
+        execute!(guard.terminal.backend_mut(), EnterAlternateScreen)?;
+        // Last, and only now that there is something to undo: a panic before
+        // this line has nothing to restore and deserves the plain hook.
+        //
+        // `Drop` cannot cover the *message*, only the screen. The default hook
+        // prints at the panic site, which is before any unwinding starts --
+        // into the alternate screen, which then vanishes with the text on it.
+        // So the restore has to happen ahead of the printer, and the only way
+        // in front of it is to wrap it (#75). Chained rather than replaced:
+        // the message, the location and the backtrace note are the default
+        // hook's to format, and mana has no business rewriting them.
+        let printer = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic| {
+            restore_terminal();
+            printer(panic);
+        }));
+        Ok(guard)
+    }
+}
+
+impl Drop for TerminalGuard {
+    /// The backstop for every route a panic is not: a normal return, a `?`, an
+    /// early failure inside `enter` itself. Running after the hook has already
+    /// restored costs nothing -- see `restore_terminal`.
+    fn drop(&mut self) {
+        restore_terminal();
+    }
+}
+
+/// The three steps that give the user their shell back, in the order they need
+/// them, on the process's own stdout rather than through the guard -- the
+/// panic hook cannot borrow a value the unwinding stack still owns.
+///
+/// Best-effort and silent: never `?`, never `panic!`, since this runs while a
+/// panic may already be unwinding and a second one aborts the process outright.
+/// Every step is idempotent, which is what lets the hook and `Drop` both run.
+fn restore_terminal() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        std::io::stdout(),
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    );
+}
+
+/// Set by the termination handler, read by the run loop.
+///
+/// The flag is the entire handler, and that is a hard constraint rather than a
+/// simplification: a signal handler may only call async-signal-safe functions,
+/// which rules out allocating, locking, and every line of the teardown mana
+/// actually wants to run. So the handler records that a signal arrived and the
+/// loop does the work on its normal path, by the door Ctrl+C already uses
+/// (#34, #84).
+static TERMINATED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn on_terminate(_signal: libc::c_int) {
+    TERMINATED.store(true, Ordering::Relaxed);
+}
+
+/// Traps the two signals that end a session mana did not ask to end: `kill`,
+/// a closed terminal emulator, an ssh drop, a logout. Untrapped, every one of
+/// them killed mana with the default disposition -- terminal left in raw mode
+/// on the alternate screen, and the in-flight sub-agents left running with
+/// nothing watching them and no exit record ever written.
+///
+/// `signal` rather than `sigaction` because there is nothing to configure: one
+/// flag, read once, and the loop is on its way out. A signal landing mid-tick
+/// costs nothing either -- crossterm reports an interrupted wait as "no key",
+/// so that tick just ends early and the next one reads the flag.
+///
+/// SIGINT is deliberately not trapped: crossterm delivers Ctrl+C as a key
+/// event, and `apply_app_event` already ends the session on it.
+#[cfg(unix)]
+fn trap_termination() {
+    // SAFETY: `on_terminate` is async-signal-safe -- one relaxed store to a
+    // static, no allocation, no I/O, no locks.
+    unsafe {
+        let handler = on_terminate as *const () as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, handler);
+        libc::signal(libc::SIGHUP, handler);
+    }
+}
+
+/// Windows has neither signal. Its console-close notification arrives on a
+/// thread of the OS's own, with a deadline mana would have to race, and the
+/// `Drop` guard already covers every exit route this process controls.
+#[cfg(not(unix))]
+fn trap_termination() {}
 
 /// How loudly one line of sentinel tool activity is said.
 ///
@@ -1092,6 +1245,15 @@ fn run_loop<B: Backend>(
     loop {
         let now = Instant::now();
 
+        // A trapped SIGTERM/SIGHUP leaves by the door Ctrl+C uses, so the
+        // terminal is restored, the PM reaped and the in-flight sub-agents
+        // swept by the one piece of code that already does all three. Taken
+        // rather than read: a session that survived somebody else's signal
+        // must not inherit it.
+        if TERMINATED.swap(false, Ordering::Relaxed) {
+            return Ok(SessionEnd::UserQuit);
+        }
+
         // At most one line, in mana's own voice, and only if a newer release
         // exists. Polled here rather than awaited before the TUI because a
         // launch must not wait on the network -- and because a line printed
@@ -1295,6 +1457,40 @@ fn answer_permission(allow: bool, app: &mut App, session: &mut Session) {
 mod tests {
     use super::*;
     use crate::catalog::parse_entry;
+
+    /// The guard leaves the terminal as it found it, whichever half of its own
+    /// entry it got through.
+    ///
+    /// Both cases are real and both are checked by the same assertion. Under a
+    /// test harness with no controlling terminal -- how CI runs -- `enter`
+    /// fails on its first step and must leave nothing behind: the early-error
+    /// path #75 opened by enabling raw mode before it could fail. Run from a
+    /// real terminal it succeeds instead, and the assertion then proves `Drop`
+    /// undid both raw mode and the alternate screen.
+    #[test]
+    fn entering_the_terminal_is_all_or_nothing() {
+        drop(TerminalGuard::enter());
+
+        // `ok()` rather than `unwrap()`: on a Windows runner with no console
+        // attached the query itself fails, which is the same answer -- there
+        // was no raw mode to leave on.
+        assert_ne!(crossterm::terminal::is_raw_mode_enabled().ok(), Some(true));
+    }
+
+    /// The handler does one thing, and doing anything more inside it would be
+    /// undefined behaviour. Proved by sending mana the signal that used to
+    /// kill it outright: the process survives, and the flag the loop reads is
+    /// set.
+    #[cfg(unix)]
+    #[test]
+    fn a_trapped_termination_signal_only_sets_the_flag() {
+        trap_termination();
+        // `raise` delivers to the calling thread and returns only once the
+        // handler has run, so the flag can be taken back immediately -- and it
+        // has to be, before a run loop in a parallel test reads it as its own.
+        unsafe { libc::raise(libc::SIGTERM) };
+        assert!(TERMINATED.swap(false, Ordering::Relaxed));
+    }
 
     /// A complete entry for a CLI that does not exist, built through the real
     /// parser so it cannot drift from the schema.
@@ -2035,10 +2231,10 @@ mod smoke {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    struct Fixture {
+    pub(super) struct Fixture {
         _tmp: tempfile::TempDir,
-        home: PathBuf,
-        project: PathBuf,
+        pub(super) home: PathBuf,
+        pub(super) project: PathBuf,
         /// Where the fake PM appends every frame mana wrote to its stdin.
         received: PathBuf,
         /// Where it dumps the argv it was started with.
@@ -2047,7 +2243,7 @@ mod smoke {
     }
 
     impl Fixture {
-        fn new() -> Fixture {
+        pub(super) fn new() -> Fixture {
             let tmp = tempfile::tempdir().unwrap();
             let fixture = Fixture {
                 home: tmp.path().join("mana-home"),
@@ -3094,6 +3290,36 @@ mod teardown_tests {
         let paths = resolve_project_paths(tmp.path(), "demo");
         let notifications = std::fs::read_to_string(notifications_path(&paths)).unwrap();
         assert!(notifications.contains("agent-live"), "{notifications}");
+    }
+
+    /// A loop that ended badly owes its sub-agents exactly what a clean quit
+    /// does. The restore used to sit above this on a `?` chain, so a terminal
+    /// that refused to leave raw mode dropped the outcome, skipped the
+    /// shutdown and left the sweep unrun (#75).
+    #[test]
+    fn a_session_that_ended_in_error_still_sweeps_and_reports_why() {
+        let fixture = super::smoke::Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        let mut agent = Sleeper::new(true);
+        seed(&fixture.home, &session.project, "agent-live", agent.pid());
+        let app = App::new(&session.cli_name);
+
+        let error = finish_session(
+            &fixture.home,
+            &mut session,
+            &app,
+            Err(anyhow::anyhow!("the loop blew up")),
+        )
+        .unwrap_err();
+
+        // The loop's own error reached the caller rather than a teardown one.
+        assert!(error.to_string().contains("the loop blew up"), "{error:#}");
+        assert!(agent.died(), "the sub-agent survived a failed session");
+        assert_eq!(
+            status_of(&fixture.home, &session.project, "agent-live"),
+            DispatchStatus::Done
+        );
     }
 
     /// The guard is exactly as binding at teardown as it is at the command
