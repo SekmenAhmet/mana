@@ -383,10 +383,26 @@ impl ManaTools {
         let paths = self.paths()?;
         let task_id = validated_task_id(&params.task_id)?;
         let role = Role::from(params.role);
-        let task = read_task(&task_path(&paths, task_id)).map_err(|error| {
-            invalid(format!(
-                "unknown task {task_id:?} ({error}) -- create it with create_task first"
-            ))
+        let path = task_path(&paths, task_id);
+        let task = read_task(&path).map_err(|error| {
+            // Two states, two remedies. A file that is *there* and unreadable
+            // is not a task to create: `create_task` would mint a second id,
+            // leave the broken file where it is, and leave every `depends_on`
+            // naming the old id pointing at something no dispatch can read.
+            // `{error:#}` rather than `{error}` because the parser's own
+            // "line 3 column 8" is the only thing that says where to look.
+            if crate::task::read_failure_is_missing(&error) {
+                invalid(format!(
+                    "unknown task {task_id:?} -- create it with create_task first"
+                ))
+            } else {
+                invalid(format!(
+                    "task {task_id} exists at {} but mana cannot read it ({error:#}) -- \
+                     repair that file (a '+++'-fenced TOML block with id, title and role, \
+                     then the brief), or delete it and create a replacement with create_task",
+                    path.display()
+                ))
+            }
         })?;
 
         // Checked here and not on the dispatch thread: "the executor has not
@@ -1383,6 +1399,37 @@ mod tests {
             .unwrap_err();
         assert!(error.message.contains("unknown task"), "{}", error.message);
         assert!(error.message.contains("create_task"), "{}", error.message);
+    }
+
+    /// A task file mana cannot read is not a task that does not exist: sending
+    /// the PM to `create_task` there mints a second id and leaves the corrupt
+    /// file (and everything depending on its id) exactly as broken.
+    #[test]
+    fn launching_on_a_corrupt_task_file_says_to_repair_it_not_to_create_it() {
+        let fixture = Fixture::new();
+        let task_id = fixture.create("Real task", "# Brief\n", None);
+        let path = task_path(&fixture.paths, &task_id);
+        std::fs::write(&path, "+++\nid = \"").unwrap();
+
+        let error = fixture
+            .tools
+            .launch_subagent_impl(LaunchSubagentParams {
+                task_id: task_id.clone(),
+                role: RoleParam::Executor,
+                cli: None,
+                model: None,
+                cost_class: None,
+            })
+            .unwrap_err();
+        assert!(!error.message.contains("unknown task"), "{}", error.message);
+        // The file to open, and the parser's complaint about it -- the context
+        // chain `{error}` used to drop.
+        assert!(
+            error.message.contains(&path.display().to_string()),
+            "{}",
+            error.message
+        );
+        assert!(error.message.contains("repair"), "{}", error.message);
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::io::Read;
 use std::path::Path;
 use std::process::Stdio;
@@ -71,7 +72,11 @@ pub fn capture_output(
             Capture::Stdout => Stdio::null(),
             Capture::Both => Stdio::piped(),
         })
-        .spawn()?;
+        // Names the binary it could not start (#117): a bare
+        // "No such file or directory" from a version probe is a report
+        // nobody can act on.
+        .spawn()
+        .with_context(|| format!("spawning {}", path.display()))?;
 
     let start = Instant::now();
     loop {

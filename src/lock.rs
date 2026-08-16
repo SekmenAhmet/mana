@@ -14,9 +14,9 @@
 //! answers "what did mana ever dispatch, and with what pid".
 
 use crate::task::Role;
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::io::Write;
 use std::path::Path;
 
 /// One sub-agent dispatch. Written exactly once, right after the process is
@@ -46,6 +46,13 @@ pub struct SubagentRecord {
 pub struct Registry {
     pub records: Vec<SubagentRecord>,
     pub by_agent_id: BTreeMap<String, SubagentRecord>,
+    /// One ready-to-print message per line `load_registry` could not read,
+    /// naming the file and the 1-based line number. Data rather than an
+    /// `eprintln!` at the reader: the TUI's graph pane re-reads this file
+    /// every two seconds and would repaint the warning over its own screen
+    /// forever, while a CLI wants to say it once. Empty in every ordinary
+    /// case, so a caller that does not care can keep ignoring it.
+    pub skipped: Vec<String>,
 }
 
 impl Registry {
@@ -60,6 +67,7 @@ impl Registry {
         Registry {
             records,
             by_agent_id,
+            skipped: Vec::new(),
         }
     }
 
@@ -78,33 +86,55 @@ impl Registry {
 /// Missing file reads as an empty registry — a project with no dispatches
 /// yet never had a reason to create `subagents.jsonl` (see
 /// `project::ensure_project_structure`).
+///
+/// A line that does not parse is **skipped and reported**, never fatal. This
+/// reader used to be the one strict one in the tree (every sibling —
+/// `log::read_last_exit`, the PM driver, the graph pane — already skipped what
+/// it could not read), and strictness here is unrecoverable by construction:
+/// the file is append-only, so one truncated line took `mana ps`, `mana kill`
+/// and `mana doctor` down *permanently*, and blanked the TUI's graph pane into
+/// claiming nothing was running. A torn line is a fact about the past that
+/// says nothing about the records around it; dropping the one line loses one
+/// dispatch, while failing the read loses every dispatch and the command with
+/// it. `skipped` carries what to say about it — see the field.
 pub fn load_registry(path: &Path) -> anyhow::Result<Registry> {
     if !path.exists() {
         return Ok(Registry::default());
     }
-    let contents = std::fs::read_to_string(path)?;
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut records = Vec::new();
-    for line in contents.lines() {
+    let mut skipped = Vec::new();
+    for (index, line) in contents.lines().enumerate() {
         let line = line.trim();
         if line.is_empty() {
             continue;
         }
-        records.push(serde_json::from_str(line)?);
+        match serde_json::from_str(line) {
+            Ok(record) => records.push(record),
+            // The line number is the actionable half: the file is append-only
+            // and mana will not rewrite it, so the only repair is a human
+            // deleting that line.
+            Err(error) => skipped.push(format!(
+                "{}: line {} is not a readable dispatch record and was skipped ({error})",
+                path.display(),
+                index + 1,
+            )),
+        }
     }
-    Ok(Registry::from_records(records))
+    Ok(Registry {
+        skipped,
+        ..Registry::from_records(records)
+    })
 }
 
 /// Appends one record and nothing else — no read of the existing file, no
 /// rewrite. That's the whole fix: the v1 race lived in `load` + mutate +
-/// `save`, and there is no such sequence here.
+/// `save`, and there is no such sequence here. What it is *not* a fix for is
+/// two writers tearing a single line in half; that is `log::append_line`'s
+/// job, and this routes through it rather than opening the file itself.
 pub fn append_record(path: &Path, record: &SubagentRecord) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        crate::project::create_dir_all(parent)?;
-    }
-    let line = serde_json::to_string(record)?;
-    let mut file = crate::project::open_append(path)?;
-    writeln!(file, "{line}")?;
-    Ok(())
+    crate::log::append_line(path, &serde_json::to_string(record)?)
 }
 
 #[cfg(test)]
@@ -157,6 +187,47 @@ mod tests {
         assert_eq!(registry.get("agent-2").unwrap().pid, None);
         assert_eq!(registry.get("agent-1").unwrap().task_id, "task-1");
         assert!(registry.get("does-not-exist").is_none());
+    }
+
+    /// One torn line — what a crash mid-write, or the pre-`append_line` race,
+    /// leaves behind — must cost exactly that line. Failing the read instead
+    /// took `mana ps`, `kill` and `doctor` down for good, since nothing ever
+    /// rewrites an append-only file.
+    #[test]
+    fn a_torn_line_costs_that_line_and_is_reported_with_its_file_and_number() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("subagents.jsonl");
+        append_record(&path, &sample("agent-1", "task-1", Some(1))).unwrap();
+        std::fs::write(
+            &path,
+            format!(
+                "{}{{\"agent_id\":\"agent-2\"\n",
+                std::fs::read_to_string(&path).unwrap()
+            ),
+        )
+        .unwrap();
+        append_record(&path, &sample("agent-3", "task-3", Some(3))).unwrap();
+
+        let registry = load_registry(&path).unwrap();
+        let ids: Vec<&str> = registry
+            .records
+            .iter()
+            .map(|r| r.agent_id.as_str())
+            .collect();
+        assert_eq!(ids, ["agent-1", "agent-3"]);
+
+        assert_eq!(registry.skipped.len(), 1, "{:?}", registry.skipped);
+        let message = &registry.skipped[0];
+        assert!(message.contains("subagents.jsonl"), "{message}");
+        assert!(message.contains("line 2"), "{message}");
+    }
+
+    #[test]
+    fn a_clean_registry_reports_nothing_skipped() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("subagents.jsonl");
+        append_record(&path, &sample("agent-1", "task-1", None)).unwrap();
+        assert!(load_registry(&path).unwrap().skipped.is_empty());
     }
 
     #[test]

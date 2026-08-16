@@ -90,6 +90,15 @@ impl GraphCache {
             return;
         }
         self.next_rebuild = Some(now + GRAPH_REFRESH);
+        // `unwrap_or_default` now only swallows a file that could not be
+        // *read* (permissions, a directory in its place) -- an unreadable
+        // *line* no longer fails the load, which is what used to make one torn
+        // append blank this pane permanently and tell the user nothing was
+        // running while agents were. `registry.skipped` is deliberately not
+        // rendered here: this runs every two seconds, and the pane has no
+        // place to put a message that will still be true on the next frame.
+        // `mana ps`/`kill`/`doctor` say it once instead (see
+        // `status::dispatches_in`).
         let registry = crate::lock::load_registry(&paths.subagents_file).unwrap_or_default();
         self.nodes = build_nodes(&registry, &paths.logs, &paths.reviews);
     }
@@ -329,6 +338,32 @@ mod tests {
         // A dispatch reported in -- rebuild now, whatever the timer says.
         cache.refresh(&paths, start, true);
         assert_eq!(cache.nodes().len(), 1);
+    }
+
+    /// The pane used to go blank forever the moment one line of the registry
+    /// was torn, and blank reads as "nothing is running" — the opposite of the
+    /// truth while agents are working.
+    #[test]
+    fn a_torn_registry_line_costs_one_node_rather_than_the_whole_pane() {
+        let (_tmp, paths) = fixture();
+        crate::lock::append_record(
+            &paths.subagents_file,
+            &record("agent-1", Role::Executor, "task-a"),
+        )
+        .unwrap();
+        std::fs::write(
+            &paths.subagents_file,
+            format!(
+                "{}{{\"agent_id\":\"agent-2\"\n",
+                std::fs::read_to_string(&paths.subagents_file).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let mut cache = GraphCache::new();
+        cache.refresh(&paths, Instant::now(), true);
+        assert_eq!(cache.nodes().len(), 1);
+        assert_eq!(cache.nodes()[0].agent_id, "agent-1");
     }
 
     #[test]

@@ -1,3 +1,4 @@
+use anyhow::Context;
 use std::path::{Path, PathBuf};
 
 pub struct ProjectPaths {
@@ -45,9 +46,13 @@ pub fn resolve_project_paths(mana_home: &Path, project_name: &str) -> ProjectPat
 /// already treats a missing file as an empty registry — so there is no
 /// "empty but present" state worth writing to disk ahead of time.
 pub fn ensure_project_structure(paths: &ProjectPaths) -> anyhow::Result<()> {
-    create_dir_all(&paths.tasks)?;
-    create_dir_all(&paths.logs)?;
-    create_dir_all(&paths.reviews)?;
+    // Named one by one rather than through a loop: this is the first thing
+    // every command does, so a failure here is the first thing a user sees,
+    // and "Permission denied" with no path is the report they cannot act on
+    // (#117). The three differ only in which directory could not be made.
+    for dir in [&paths.tasks, &paths.logs, &paths.reviews] {
+        create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+    }
     Ok(())
 }
 

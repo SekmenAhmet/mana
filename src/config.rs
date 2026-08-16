@@ -1,3 +1,4 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -60,7 +61,8 @@ fn legacy_config_message(legacy: &Path) -> String {
 
 pub fn load_config(path: &Path) -> anyhow::Result<Config> {
     if path.exists() {
-        let contents = std::fs::read_to_string(path)?;
+        let contents =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         return toml::from_str(&contents).map_err(|err| {
             // A config.toml that exists but won't parse is either
             // hand-edit damage or (as seen on the dev machine this
@@ -93,12 +95,13 @@ pub fn load_config(path: &Path) -> anyhow::Result<Config> {
 
 pub fn save_config(path: &Path, config: &Config) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        crate::project::create_dir_all(parent)?;
+        crate::project::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
     // Pretty-printed: config.toml is meant to be hand-readable/editable,
     // same expectation the old config.yaml carried.
     let toml = toml::to_string_pretty(config)?;
-    crate::project::write(path, toml)?;
+    crate::project::write(path, toml).with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
