@@ -422,7 +422,7 @@ fn require_installed(entry: &CliEntry, installed: &BTreeSet<String>) -> Result<(
 /// discovery and ships no curated list: mana has nothing to check against
 /// until discovery is implemented, and refusing everything would make such a
 /// CLI undispatchable. The CLI itself still rejects a bad id.
-fn validate_model(entry: &CliEntry, model: &str) -> Result<()> {
+pub(crate) fn validate_model(entry: &CliEntry, model: &str) -> Result<()> {
     let statics = &entry.models.static_models;
     if statics.iter().any(|static_model| static_model.id == model) {
         return Ok(());

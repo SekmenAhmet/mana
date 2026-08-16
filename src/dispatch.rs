@@ -664,7 +664,9 @@ cwd_required_in_brief = false
 {subagent}
 
 [models]
-discovery_args = []
+# Discovery declared and no curated list, so any model id a test invents is
+# accepted by `routing::validate_model` -- the escape hatch that entry is for.
+discovery_args = ["--models"]
 
 [skills]
 dirs = []
