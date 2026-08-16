@@ -175,14 +175,13 @@ impl OneshotDriver {
         // Every other driver refuses a missing binary at `start`, because it
         // spawns there. This one would only find out on the first turn, and a
         // launch that reaches an interactive pane before saying "that CLI is
-        // not installed" is the worse of the two failures.
-        which::which(entry.cli.bin()).map_err(|_| {
-            anyhow!(
-                "failed to start {} as PM ('{}' -- is it installed and on PATH?)",
-                entry.cli.name,
-                entry.cli.bin()
-            )
-        })?;
+        // not installed" is the worse of the two failures. The path this
+        // resolves is the one every turn then spawns, so the check and the
+        // spawn cannot answer differently -- see `CliMeta::resolve`.
+        let program = entry
+            .cli
+            .resolve()
+            .with_context(|| format!("failed to start {} as PM", entry.cli.name))?;
 
         let (sender, events) = channel();
         let (turns, inbox) = channel();
@@ -193,7 +192,7 @@ impl OneshotDriver {
         let spawner = TurnSpawner {
             id: id.clone(),
             cli_name: entry.cli.name.clone(),
-            bin: entry.cli.bin().to_string(),
+            bin: program,
             first,
             continued,
             extra: extra_args.to_vec(),
@@ -327,7 +326,7 @@ impl PmTransport for OneshotDriver {
 struct TurnSpawner {
     id: String,
     cli_name: String,
-    bin: String,
+    bin: PathBuf,
     first: Vec<String>,
     continued: Vec<String>,
     extra: Vec<String>,
@@ -365,8 +364,9 @@ impl TurnSpawner {
         set_process_group(&mut command);
         command.spawn().with_context(|| {
             format!(
-                "failed to start {} as PM ('{}' -- is it installed and on PATH?)",
-                self.cli_name, self.bin
+                "failed to start {} as PM ({})",
+                self.cli_name,
+                self.bin.display()
             )
         })
     }

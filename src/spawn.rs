@@ -72,7 +72,9 @@ impl PromptDelivery {
 }
 
 pub struct SpawnSpec {
-    pub bin: String,
+    /// Already resolved to a path on disk by `CliMeta::resolve`, so this module
+    /// never asks PATH a question the rest of mana answered differently.
+    pub bin: PathBuf,
     pub args: Vec<String>,
     /// Where the process runs -- a task's worktree for write roles.
     pub cwd: PathBuf,
@@ -127,9 +129,13 @@ pub fn run(spec: &SpawnSpec, on_spawn: impl FnOnce(u32)) -> Result<SpawnOutcome>
     set_process_group(&mut command);
 
     let started = Instant::now();
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to spawn '{}' in {}", spec.bin, spec.cwd.display()))?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "failed to spawn '{}' in {}",
+            spec.bin.display(),
+            spec.cwd.display()
+        )
+    })?;
     let pid = child.id();
     on_spawn(pid);
 
@@ -285,15 +291,24 @@ fn kill_group(child: &mut Child, pid: u32) {
 }
 
 #[cfg(windows)]
-fn kill_group(child: &mut Child, _pid: u32) {
-    // Windows has no killpg. `Child::kill` is TerminateProcess, which ends the
-    // named process only -- anything the sub-agent spawned survives it.
-    // CREATE_NEW_PROCESS_GROUP makes a CTRL_BREAK to the group possible, but
-    // that reaches only processes sharing mana's console, which a TUI cannot
-    // guarantee, and a CLI may ignore it. Killing the tree properly needs a Job
-    // Object (`windows-sys`); until a Windows sub-agent run has actually been
-    // measured, the honest statement is: the direct child dies, its children
-    // may leak.
+fn kill_group(child: &mut Child, pid: u32) {
+    // Windows has no killpg, and CREATE_NEW_PROCESS_GROUP only makes a
+    // CTRL_BREAK possible -- which reaches processes sharing mana's console,
+    // which a TUI cannot guarantee, and which a CLI may ignore. `Child::kill`
+    // is TerminateProcess on the named process alone, and since the catalogue
+    // resolves the npm CLIs to their `.cmd` shims that named process is
+    // `cmd.exe`: the agent is its child and would survive its own timeout,
+    // still burning quota, still holding the worktree's files and the capture
+    // pipes' write ends open.
+    //
+    // `mana kill` already walks the tree here (`taskkill /T /F`), so this calls
+    // the same function rather than growing a second Windows kill: a timeout
+    // and an operator kill have to leave the machine in the same state, and a
+    // Job Object would mean a dependency for what one shell-out already does.
+    let _ = crate::cli::kill::signal(pid);
+    // Then the child by name, for the same reason as unix: if `taskkill` is
+    // missing or refuses the tree, the direct child still has to die or the
+    // `child.wait()` that follows this call never returns.
     let _ = child.kill();
 }
 
@@ -382,13 +397,79 @@ mod tests {
     }
 }
 
+/// The Windows twin of `process_tests::timeout_kills_the_whole_process_group`.
+/// Compiled on every host (`cargo check --target x86_64-pc-windows-msvc`) and
+/// run only where it can be: the guarantee it asserts is the one this platform
+/// did not have, so it is worth carrying even before a Windows runner exists.
+#[cfg(all(test, windows))]
+mod windows_process_tests {
+    use super::*;
+
+    /// Both halves of the Windows bug in one fixture. The spec's `bin` is a
+    /// `.cmd`, which is what the catalogue resolves an npm-installed CLI to and
+    /// what makes std put a `cmd.exe` between mana and the agent; the fixture
+    /// then backgrounds a grandchild, which stands for the agent itself. A
+    /// `Child::kill` on the wrapper leaves it running, and the marker file it
+    /// writes after the kill is how that leak becomes visible.
+    ///
+    /// Batch files rather than one `cmd /C` string on purpose: quoting a nested
+    /// `start "" /b cmd /c "..."` correctly is its own bug, and a file mana
+    /// writes has no quoting at all. `ping` and not `timeout`, because
+    /// `timeout` refuses to run with stdin redirected -- which is exactly how
+    /// every sub-agent is spawned (`Stdio::null`).
+    #[test]
+    fn timeout_kills_the_whole_process_tree() {
+        let tmp = tempfile::tempdir().unwrap();
+        let marker = tmp.path().join("grandchild-ran.txt");
+        let grandchild = tmp.path().join("grandchild.cmd");
+        let agent = tmp.path().join("agent.cmd");
+        std::fs::write(
+            &grandchild,
+            format!(
+                "@echo off\r\nping -n 4 127.0.0.1 >nul\r\necho alive> \"{}\"\r\n",
+                marker.display()
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &agent,
+            format!(
+                "@echo off\r\nstart \"\" /b \"{}\"\r\nping -n 60 127.0.0.1 >nul\r\n",
+                grandchild.display()
+            ),
+        )
+        .unwrap();
+
+        let spec = SpawnSpec {
+            bin: agent.clone(),
+            args: Vec::new(),
+            cwd: tmp.path().to_path_buf(),
+            prompt: PromptDelivery::Argv,
+            timeout: Duration::from_millis(800),
+        };
+        let outcome = run(&spec, |_| {}).unwrap();
+        assert!(outcome.timed_out);
+
+        // Well past the grandchild's own sleep: if the tree kill missed it, it
+        // wakes up and writes, which is the leak in file form.
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while Instant::now() < deadline {
+            assert!(
+                !marker.exists(),
+                "the grandchild survived the timeout kill and kept working"
+            );
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+}
+
 #[cfg(all(test, unix))] // every test here execs unix shell fixtures
 mod process_tests {
     use super::*;
 
     fn sh(script: &str, cwd: &std::path::Path, timeout_ms: u64) -> SpawnSpec {
         SpawnSpec {
-            bin: "sh".to_string(),
+            bin: "sh".into(),
             args: vec!["-c".to_string(), script.to_string()],
             cwd: cwd.to_path_buf(),
             prompt: PromptDelivery::Argv,
@@ -438,7 +519,7 @@ mod process_tests {
         // `cat` exits only once stdin reaches EOF, so a spawner that wrote the
         // prompt without closing the pipe would hit the timeout instead.
         let spec = SpawnSpec {
-            bin: "cat".to_string(),
+            bin: "cat".into(),
             args: Vec::new(),
             cwd: tmp.path().to_path_buf(),
             prompt: PromptDelivery::Stdin("the brief, on stdin".to_string()),

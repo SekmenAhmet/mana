@@ -676,13 +676,15 @@ fn describe(outcome: &DispatchOutcome) -> String {
     )
 }
 
-/// Which catalogued CLIs are actually on this machine. Resolved through `which`
-/// on every call rather than cached: a user installing a CLI mid-session must
-/// not have to restart the PM to use it.
+/// Which catalogued CLIs are actually on this machine. Resolved on every call
+/// rather than cached: a user installing a CLI mid-session must not have to
+/// restart the PM to use it. `CliMeta::resolve` is deliberately the same lookup
+/// the dispatcher spawns through -- a routing table that offers the PM a CLI
+/// the dispatcher then cannot start is worse than one CLI short.
 fn installed_ids(entries: &[CliEntry]) -> BTreeSet<String> {
     entries
         .iter()
-        .filter(|entry| which::which(entry.cli.bin()).is_ok())
+        .filter(|entry| entry.cli.resolve().is_ok())
         .map(|entry| entry.cli.id.clone())
         .collect()
 }

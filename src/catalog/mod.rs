@@ -565,6 +565,52 @@ url = "https://example.invalid/alpha"
         assert_eq!(entry.cli.bin(), "alpha");
     }
 
+    /// The tempting non-fix for the Windows spawn bug is `bin_overrides =
+    /// { windows = "claude.cmd" }`. It works for whoever installed from npm and
+    /// breaks whoever installed natively (`claude.exe`), because which of the
+    /// two is on PATH is a property of the install and not of the OS. The real
+    /// fix is `CliMeta::resolve`; this keeps the data side from quietly
+    /// re-acquiring an opinion that contradicts it.
+    #[test]
+    fn no_entry_papers_over_path_resolution_with_a_file_extension() {
+        for entry in Catalog::embedded().unwrap().entries() {
+            for (os, bin) in &entry.cli.bin_overrides {
+                assert!(
+                    !bin.contains('.'),
+                    "{}: [cli.bin_overrides].{os} is {bin:?} -- a file extension here pins one \
+                     install method; PATH resolution belongs in CliMeta::resolve",
+                    entry.cli.id
+                );
+            }
+        }
+    }
+
+    /// The lookup every spawn path and every "is it installed?" answer shares.
+    /// A binary that is really there resolves to an absolute path, which is
+    /// what makes the Windows case work for both install methods: `which`
+    /// consults PATHEXT, `Command::new` does not.
+    #[test]
+    fn resolve_returns_an_absolute_path_for_a_binary_that_exists() {
+        // Present on every supported host, and not something mana ships.
+        let real = if cfg!(windows) { "cmd" } else { "sh" };
+        let entry = parse_entry(&fixture_with(
+            r#"bin = "alpha""#,
+            &format!("bin = {real:?}"),
+        ))
+        .unwrap();
+        let path = entry.cli.resolve().unwrap();
+        assert!(path.is_absolute(), "{}", path.display());
+        assert!(path.exists(), "{}", path.display());
+    }
+
+    #[test]
+    fn resolve_names_the_binary_it_could_not_find() {
+        let err = parse_entry(FIXTURE).unwrap().cli.resolve().unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("alpha"), "{rendered}");
+        assert!(rendered.contains("PATH"), "{rendered}");
+    }
+
     /// Routing is "cheapest first, escalate on failure", which only works if
     /// the ordinal survives parsing.
     #[test]

@@ -46,6 +46,12 @@ id           = "claude"
 name         = "Claude Code"
 bin          = "claude"            # optional [cli.bin_overrides] per OS
 version_args = ["--version"]
+# `bin_overrides` is for a CLI that ships under a different *name* on some
+# platform, and for nothing else. In particular it is not where a Windows file
+# extension goes: this CLI is `claude.cmd` when installed from npm and
+# `claude.exe` when installed natively, so either spelling written here would
+# break the other user. mana looks the name up on PATH at spawn time instead
+# (`CliMeta::resolve`), which finds whichever one is really there.
 
 [pm]
 driver = "stream"                  # acp | stream | oneshot-continue
