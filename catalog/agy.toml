@@ -41,10 +41,11 @@ Known gaps in the data rather than in the CLI:
 '''
 
 [cli]
-id           = "agy"
-name         = "Antigravity"
-bin          = "agy"
-version_args = ["--version"]
+id            = "agy"
+name          = "Antigravity"
+bin           = "agy"
+bin_overrides = { windows = "agy.cmd" }
+version_args  = ["--version"]
 
 [pm]
 driver        = "oneshot-continue" # acp | stream | oneshot-continue
