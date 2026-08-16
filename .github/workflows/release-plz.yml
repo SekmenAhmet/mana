@@ -1,0 +1,107 @@
+# The robot that proposes releases. See RELEASING.md for the whole flow and
+# for the GitHub-side settings this workflow assumes.
+#
+# `main` only. `develop` is where work integrates and no release ever starts
+# there — release-plz opens its PR against whatever branch `actions/checkout`
+# checked out, so restricting the trigger is what restricts the branch.
+name: Release-plz
+
+on:
+  push:
+    branches: [main]
+
+# Least privilege at the top; each job asks for what it needs. The write
+# permissions travel with the App token, not with GITHUB_TOKEN.
+permissions: {}
+
+jobs:
+  # Push that merged a Release PR -> create and push the vX.Y.Z tag, which is
+  # what starts .github/workflows/release.yml (cargo-dist).
+  #
+  # Deliberately without a `concurrency` group. GitHub keeps at most one
+  # pending run per group, so a third push while one is running silently drops
+  # the second — and a release that never happens is a worse failure than two
+  # release runs, the second of which finds the tag already there and no-ops.
+  release:
+    name: release-plz release
+    if: github.repository_owner == 'SekmenAhmet'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          # release-plz derives the current version from the git tags
+          # (`git_only = true`), so a shallow clone would make every release
+          # look like the first one.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # Not GITHUB_TOKEN: a tag pushed with it does not trigger other
+      # workflows, so cargo-dist would never build a single artifact. This is
+      # the token that makes the tag -> release.yml link work at all.
+      - name: Mint an app token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+          permission-contents: write
+          # `release_always = false` makes release-plz look up the PR the
+          # merged commit came from before deciding to release.
+          permission-pull-requests: read
+
+      - name: Run release-plz release
+        uses: release-plz/action@v0.5
+        with:
+          command: release
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}
+          # No CARGO_REGISTRY_TOKEN on purpose: `publish = false` everywhere,
+          # nothing is ever uploaded to crates.io.
+
+  # Any push to main -> open or refresh the Release PR (version bump +
+  # CHANGELOG.md). Serialised so two pushes cannot race on the release branch;
+  # never cancelled, because a half-written Release PR is worse than a slow one.
+  release-pr:
+    name: release-plz PR
+    if: github.repository_owner == 'SekmenAhmet'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    concurrency:
+      group: release-plz-pr-${{ github.ref }}
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      # The other reason GITHUB_TOKEN will not do: a PR it opens does not
+      # trigger `on: pull_request` workflows, so CI's four required checks
+      # would never report and the Release PR could never be merged into
+      # protected main. That deadlock is silent — the PR just sits there.
+      - name: Mint an app token
+        id: token
+        uses: actions/create-github-app-token@v3
+        with:
+          app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
+          private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Run release-plz release-pr
+        uses: release-plz/action@v0.5
+        with:
+          command: release-pr
+        env:
+          GITHUB_TOKEN: ${{ steps.token.outputs.token }}

@@ -3,8 +3,9 @@
 //! Replaces the v1 YAML lock: a `BTreeMap<agent_uuid, LockEntry>` rewritten
 //! wholesale (read the whole map, insert one key, write the whole map back)
 //! on every single dispatch. That shape is a read-modify-write race waiting
-//! to happen the moment two `mana launch --subagent` calls land close
-//! together. mana is this file's only writer, and a dispatch record never
+//! to happen the moment two dispatches land close together (v1 invited it by
+//! having each sub-agent process write the lock itself; in v2 mana dispatches
+//! them). mana is this file's only writer, and a dispatch record never
 //! changes after it's written, so a strict-append JSONL format removes the
 //! race by construction — there is nothing to "modify", only to append.
 //!
@@ -62,10 +63,12 @@ impl Registry {
         }
     }
 
-    /// Not called from a live command yet — `mana ps`/`kill` (task 4.2) and
-    /// the MCP `list_agents` tool are the intended consumers. Proven by
-    /// this file's own round-trip test in the meantime; see `task.rs` for
-    /// the same "tested ahead of its consumer" pattern.
+    /// Still not called from a live command. `mana ps`/`kill` (task 4.2) were
+    /// the expected consumers and turned out not to be: `ps` walks every
+    /// record in append order, and `kill` resolves an *unambiguous prefix*
+    /// rather than an exact id, so neither wants a point lookup. Kept for the
+    /// exact-id readers that remain plausible (the MCP tool surface), and
+    /// proven meanwhile by this file's round-trip test and by `dispatch`'s.
     #[allow(dead_code)]
     pub fn get(&self, agent_id: &str) -> Option<&SubagentRecord> {
         self.by_agent_id.get(agent_id)

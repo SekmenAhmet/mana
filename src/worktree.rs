@@ -143,19 +143,43 @@ pub fn create(
 /// prints the manual hint; automated cleanup wires in with the router (2.x).
 #[allow(dead_code)]
 pub fn cleanup(project_root: &Path, info: &WorktreeInfo) -> anyhow::Result<()> {
-    remove_worktree(project_root, &info.path)
+    remove_at(project_root, &info.path)
+}
+
+/// The same teardown, addressed by path rather than by `WorktreeInfo`.
+///
+/// Added for `mana doctor --prune` (task 4.3), which finds leftovers by
+/// walking `worktrees_dir` and therefore knows a path and nothing else — the
+/// branch and base ref that `WorktreeInfo` also carries would have to be
+/// invented to call `cleanup`, and an invented branch name in a teardown path
+/// is exactly the kind of near-truth that deletes the wrong thing one day.
+pub fn remove_at(project_root: &Path, path: &Path) -> anyhow::Result<()> {
+    remove_worktree(project_root, path)
 }
 
 fn branch_name(task_id: &str) -> String {
     format!("mana/{task_id}")
 }
 
+/// Where every task worktree for one project lives.
+///
+/// Additive helper (task 4.3): `mana doctor` lists this directory looking for
+/// leftovers, and the layout has to be stated in exactly one place or the
+/// two will drift the first time either changes.
+pub fn worktrees_dir(mana_home: &Path, project_name: &str) -> PathBuf {
+    mana_home.join("worktrees").join(project_name)
+}
+
+/// The directory name a task's worktree takes. Public for the same reason
+/// (task 4.3): doctor has to map a directory back to the dispatch that made
+/// it, and truncating the id by hand at the call site would silently stop
+/// matching the day `TASK_DIR_CHARS` changes.
+pub fn task_dir_name(task_id: &str) -> String {
+    task_id.chars().take(TASK_DIR_CHARS).collect()
+}
+
 fn worktree_path(mana_home: &Path, project_root: &Path, task_id: &str) -> PathBuf {
-    let short: String = task_id.chars().take(TASK_DIR_CHARS).collect();
-    mana_home
-        .join("worktrees")
-        .join(project_name_from_dir(project_root))
-        .join(short)
+    worktrees_dir(mana_home, &project_name_from_dir(project_root)).join(task_dir_name(task_id))
 }
 
 /// Task ids reach this module from task files and, from phase 2 on, straight

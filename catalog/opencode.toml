@@ -48,6 +48,27 @@ the fallback where a CLI offers no mechanism -- the same position agy is in,
 for a different reason. If opencode grows a read-only agent or mode, it
 belongs in [pm].args and this note goes away.
 
+Session resume, measured 2026-08-15 with the same client loop: `initialize`
+answers agentCapabilities.loadSession = true (and sessionCapabilities
+{fork, list, resume}), and `session/load` really works -- one process created a
+session and asked the agent to remember OCTOPUS-42, a *second* process
+initialized, called session/load with that sessionId, and the agent answered
+OCTOPUS-42. The reply carries {sessionId, models}. That capability flag is what
+`mana launch opencode --continue` checks before it resumes; a CLI that does not
+advertise it is refused rather than quietly started fresh. mana stores the
+sessionId per project in ~/.mana/projects/<project>/state.toml.
+
+Project-local skills exist here and [skills].dirs deliberately does not use
+them yet. opencode's own docs (opencode.ai/docs/skills, read 2026-08-15) list
+six directories: .opencode/skills, .claude/skills and .agents/skills inside the
+project (walking up to the git worktree root), then ~/.config/opencode/skills,
+~/.claude/skills and ~/.agents/skills. So the pollution fix claude's entry got
+-- installing the PM role into the project instead of the user's global skill
+list -- is available here as `.opencode/skills`. It is left unchanged because
+it is unmeasured on this CLI: nothing has yet confirmed opencode reads a
+project-local SKILL.md that appeared before the process started, and the note
+is worth more than an untested reordering.
+
 Unverified, and each is a candidate for a check before it is relied on:
 - cwd_required_in_brief is set from the absence of evidence, not from a
   measurement: `opencode run` was only ever driven with mana's own cwd.

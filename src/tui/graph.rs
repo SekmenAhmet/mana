@@ -122,16 +122,21 @@ pub fn build_nodes(registry: &Registry, logs_dir: &Path, reviews_dir: &Path) -> 
     nodes
 }
 
-/// One node as a single line: status, role, where it ran, which task, verdict.
-pub fn node_line(node: &GraphNode, blink_visible: bool) -> String {
+/// One node's line, up to but not including its verdict: status, role, where
+/// it ran, which task.
+///
+/// The verdict is formatted separately ([`verdict_symbol`]) because the two
+/// halves are coloured apart: the body is mana's own lavender, while the ✓/✗
+/// wear the interface's only semantic colours (`theme::VERDICT_OK` /
+/// `theme::VERDICT_FAIL`).
+pub fn node_body(node: &GraphNode, blink_visible: bool) -> String {
     format!(
-        "{} [{}] {}/{} {}{}",
+        "{} [{}] {}/{} {}",
         status_symbol(&node.status, blink_visible),
         role_label(&node.role),
         node.cli,
         node.model,
         short_id(&node.task_id),
-        verdict_symbol(&node.verdict),
     )
 }
 
@@ -155,10 +160,14 @@ pub fn status_symbol(status: &Option<Status>, blink_visible: bool) -> &'static s
 
 /// Nothing at all until a reviewer has spoken: an empty column is honest,
 /// whereas a placeholder glyph reads as a verdict of its own.
-fn verdict_symbol(verdict: &Option<Decision>) -> &'static str {
+pub fn verdict_symbol(verdict: &Option<Decision>) -> &'static str {
+    // Text-presentation glyphs, not the ✅/❌ emoji: emoji are double-width
+    // (a latent column-math hazard in any TUI) and missing from plenty of
+    // monospace fonts -- the README screenshots rendered them as tofu. The
+    // pass/fail colour they used to carry moved into the theme instead.
     match verdict {
-        Some(Decision::Validated) => " \u{2705}", // ✅
-        Some(Decision::Rejected) => " \u{274c}",  // ❌
+        Some(Decision::Validated) => " \u{2713}", // ✓
+        Some(Decision::Rejected) => " \u{2717}",  // ✗
         None => "",
     }
 }
@@ -276,22 +285,25 @@ mod tests {
 
         let node = &build_nodes(&registry, &paths.logs, &paths.reviews)[0];
         assert_eq!(node.verdict, Some(Decision::Rejected));
-        assert!(node_line(node, true).ends_with("\u{274c}"));
+        // Formatted apart from the body, and rendered as its own span, so the
+        // cross wears its own semantic colour instead of the pane's.
+        assert_eq!(verdict_symbol(&node.verdict), " \u{2717}");
     }
 
     #[test]
-    fn a_node_line_names_the_role_the_pair_and_the_task() {
+    fn a_node_body_names_the_role_the_pair_and_the_task() {
         let (_tmp, paths) = fixture();
         let registry = Registry::from_records(vec![record(
             "agent-1",
             Role::Reviewer,
             "3f2a1b6c-0000-4000-8000-000000000000",
         )]);
-        let line = node_line(
+        let line = node_body(
             &build_nodes(&registry, &paths.logs, &paths.reviews)[0],
             true,
         );
         assert_eq!(line, "? [REV] claude/haiku 3f2a1b6c");
+        assert_eq!(verdict_symbol(&None), "");
     }
 
     /// The v1 defect this cache exists to fix: every frame re-read every file.

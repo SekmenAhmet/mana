@@ -63,7 +63,7 @@ use super::child::{
     CLOSE_GRACE, DRAIN_GRACE, POLL_INTERVAL, join_or_detach, kill_group, pump_stderr, read_lines,
     reap, set_process_group,
 };
-use super::{PermissionChoice, PmEvent, PmTransport};
+use super::{PermissionChoice, PmEvent, PmTransport, Resume};
 use crate::catalog::{CliEntry, PmDriver, ToolChannel, substitute};
 use anyhow::{Context, Result, anyhow, bail};
 use serde_json::{Value, json};
@@ -140,15 +140,24 @@ impl AcpDriver {
     /// directory the launch flow calls the project root. It is what
     /// `session/new` is told the session's `cwd` is, and what mana's own MCP
     /// server is pointed at.
-    pub fn start(entry: &CliEntry, extra_args: &[String]) -> Result<Self> {
+    pub fn start(
+        entry: &CliEntry,
+        extra_args: &[String],
+        resume: Option<Resume<'_>>,
+    ) -> Result<Self> {
         let cwd = std::env::current_dir()
             .context("resolving the working directory to start the PM session in")?;
-        Self::start_in(entry, extra_args, &cwd)
+        Self::start_in(entry, extra_args, &cwd, resume)
     }
 
     /// `start` with an explicit project directory, for callers (and tests)
     /// that resolve the project elsewhere than the current directory.
-    pub fn start_in(entry: &CliEntry, extra_args: &[String], project: &Path) -> Result<Self> {
+    pub fn start_in(
+        entry: &CliEntry,
+        extra_args: &[String],
+        project: &Path,
+        resume: Option<Resume<'_>>,
+    ) -> Result<Self> {
         let id = &entry.cli.id;
         // An internal guard: the factory in `pm::start` dispatches on this
         // field, so reaching here with anything else is a code bug, not a
@@ -210,16 +219,41 @@ impl AcpDriver {
         // every early return goes through `kill` first: a half-initialised
         // agent holding a quota slot is exactly the v1 zombie.
         let outcome = (|| -> Result<(String, BufReader<ChildStdout>)> {
-            handshake.call(1, "initialize", initialize_params())?;
+            let initialized = handshake.call(1, "initialize", initialize_params())?;
             let servers = mcp_servers(entry, project)?;
-            let session = handshake.call(2, "session/new", new_session_params(project, servers))?;
-            let session_id = session
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .ok_or_else(|| {
-                    anyhow!("{id}: session/new answered without a sessionId: {session}")
-                })?
-                .to_string();
+            // Resuming asks the agent to reopen a session it stored, so the
+            // method is `session/load` rather than `session/new` -- and it is
+            // only sent when the agent said it serves it. `loadSession` is the
+            // ACP capability for exactly this, advertised by both agents
+            // measured on 2026-08-15 (opencode 1.14.30, copilot 1.0.80), and a
+            // CLI that does not advertise it is refused rather than started
+            // fresh under a flag that promised otherwise.
+            let session_id = match resume {
+                Some(resume) => {
+                    let wanted = resume_session_id(entry, &initialized, resume)?.to_string();
+                    handshake.call(
+                        2,
+                        "session/load",
+                        load_session_params(&wanted, project, servers),
+                    )?;
+                    // The id mana asked for, not one read back: opencode
+                    // echoes `sessionId` in the reply and the protocol does not
+                    // require it, so trusting the request is both simpler and
+                    // more portable.
+                    wanted
+                }
+                None => {
+                    let session =
+                        handshake.call(2, "session/new", new_session_params(project, servers))?;
+                    session
+                        .get("sessionId")
+                        .and_then(Value::as_str)
+                        .ok_or_else(|| {
+                            anyhow!("{id}: session/new answered without a sessionId: {session}")
+                        })?
+                        .to_string()
+                }
+            };
             Ok((session_id, handshake.reader))
         })();
         let (session_id, reader) = match outcome {
@@ -399,6 +433,10 @@ impl PmTransport for AcpDriver {
         AcpDriver::answer_permission(self, id, option_id)
     }
 
+    fn session_id(&self) -> Option<&str> {
+        Some(&self.session_id)
+    }
+
     fn shutdown(&mut self) -> Result<()> {
         AcpDriver::shutdown(self)
     }
@@ -503,6 +541,60 @@ fn new_session_params(cwd: &Path, mcp_servers: Vec<Value>) -> Value {
     })
 }
 
+/// `session/load` carries everything `session/new` does, plus the id of the
+/// conversation to reopen. The MCP servers are sent again on purpose: a loaded
+/// session gets a *new* agent process, and mana's tools have to be attached to
+/// it exactly as they were to the first one.
+fn load_session_params(session_id: &str, cwd: &Path, mcp_servers: Vec<Value>) -> Value {
+    json!({
+        "sessionId": session_id,
+        "cwd": cwd.to_string_lossy(),
+        "mcpServers": mcp_servers,
+    })
+}
+
+/// The session `--continue` should reopen, or a refusal explaining which half
+/// is missing.
+///
+/// Two things have to be true, and they fail differently: the agent must serve
+/// `session/load` (its own `initialize` answer says so, and mana never assumes
+/// it), and mana must have recorded a session id for this project. Neither is
+/// downgraded to "start a fresh one instead": a PM that silently forgot the
+/// conversation is a PM the operator re-briefs by hand after ten minutes of
+/// wondering.
+fn resume_session_id<'a>(
+    entry: &CliEntry,
+    initialized: &Value,
+    resume: Resume<'a>,
+) -> Result<&'a str> {
+    if !loads_sessions(initialized) {
+        bail!(
+            "{} cannot resume a conversation: its ACP handshake does not advertise \
+             `loadSession`, so mana has no way to ask it for the previous session. Launch it \
+             without --continue to start a fresh one.",
+            entry.cli.name
+        );
+    }
+    resume.session_id.ok_or_else(|| {
+        anyhow!(
+            "mana has no recorded {} session for this project, so there is nothing to resume. \
+             Launch it once without --continue.",
+            entry.cli.name
+        )
+    })
+}
+
+/// Whether the agent said it serves `session/load`.
+///
+/// `agentCapabilities.loadSession` is the field the ACP spec puts it in, and
+/// both agents measured on 2026-08-15 answer `true` there. Absent reads as
+/// "no": a capability nobody advertised is one mana must not exercise.
+fn loads_sessions(initialized: &Value) -> bool {
+    initialized["agentCapabilities"]["loadSession"]
+        .as_bool()
+        .unwrap_or(false)
+}
+
 /// The `mcpServers` entry that hands the PM mana's four orchestration tools.
 ///
 /// This is the ACP-native equivalent of the config file the argv-based CLIs
@@ -580,6 +672,16 @@ struct TurnState {
     buffer: String,
     pending: PendingPermissions,
     next_permission: u64,
+    /// The human name of every tool call still in flight, by `toolCallId`.
+    ///
+    /// ACP names a call in its `tool_call` frame and is free to leave the
+    /// field out of the updates that follow -- opencode sends the `completed`
+    /// frame with no `title` at all (kept in the golden). Carrying the name
+    /// forward is what lets the finished line say `⚙ mana_list_agents ✓`
+    /// instead of quoting `call_00_EqxLWddzxkxCTr9VzOas3550` at somebody.
+    /// Entries are dropped when the call ends, so this holds what is running
+    /// and not a session's history.
+    tool_names: HashMap<String, String>,
 }
 
 impl TurnState {
@@ -589,6 +691,7 @@ impl TurnState {
             buffer: String::new(),
             pending,
             next_permission: 1,
+            tool_names: HashMap::new(),
         }
     }
 
@@ -698,15 +801,26 @@ fn update_events(frame: &Value, line: &str, state: &mut TurnState) -> Vec<PmEven
     match update["sessionUpdate"].as_str() {
         Some("agent_message_chunk") => chunk(update, line, Chunk::Message, state),
         Some("agent_thought_chunk") => chunk(update, line, Chunk::Thought, state),
-        Some("tool_call") => activity(state, tool_label(update, None)),
+        Some("tool_call") => {
+            let label = tool_label(update, None, state);
+            activity(state, label)
+        }
         Some("tool_call_update") => match update["status"].as_str() {
             // The interesting transitions only. A tool call reports pending →
             // in_progress → completed, and three lines per call would bury the
             // conversation it is supposed to annotate.
             Some(status @ ("completed" | "failed")) => {
-                activity(state, tool_label(update, Some(status)))
+                let label = tool_label(update, Some(status), state);
+                forget_tool(update, state);
+                activity(state, label)
             }
-            _ => Vec::new(),
+            // Nothing to show, but an intermediate frame may still be where
+            // the agent named the call (opencode renames one as it learns what
+            // it did), and that name is what the finished line will use.
+            _ => {
+                tool_name(update, state);
+                Vec::new()
+            }
         },
         // Recorded, never rendered: what a CLI counts is its own business and
         // mana only enriches its logs with it (design §4).
@@ -754,20 +868,50 @@ fn activity(state: &mut TurnState, label: String) -> Vec<PmEvent> {
     events
 }
 
-fn tool_label(update: &Value, status: Option<&str>) -> String {
-    // `title` is optional on an update frame -- and opencode sends it *empty*
-    // on the completed one (measured, and kept in the golden), which is why
-    // this filters rather than just unwraps. The id it is keyed by is always
-    // there, and an opaque id still tells the operator that two lines belong
-    // to the same call.
-    let name = [&update["title"], &update["toolCallId"]]
-        .into_iter()
-        .filter_map(Value::as_str)
-        .find(|text| !text.is_empty())
-        .unwrap_or("a tool");
+/// One line of tool activity: a glyph, the tool's own name, and where it got
+/// to. Started, finished, or failed -- three shapes, all short.
+///
+/// The wording is the operator's, not the protocol's. `[tool]
+/// call_00_wHYHJzGP5X0DJa6kZozS5109 · completed` is a line that costs a full
+/// row of the pane to say "a tool finished", and a session doing real work
+/// produced dozens of them.
+fn tool_label(update: &Value, status: Option<&str>, state: &mut TurnState) -> String {
+    let name = tool_name(update, state);
     match status {
-        Some(status) => format!("[tool] {name} · {status}"),
-        None => format!("[tool] {name}"),
+        Some("failed") => format!("⚙ {name} ✗"),
+        Some(_) => format!("⚙ {name} ✓"),
+        None => format!("⚙ {name} …"),
+    }
+}
+
+/// The name to show for a tool call, remembering it for the frames that leave
+/// it out. Never the call id: an opaque identifier is noise wearing the
+/// costume of information.
+fn tool_name(update: &Value, state: &mut TurnState) -> String {
+    let id = update["toolCallId"].as_str().unwrap_or_default();
+    // `title` is optional on an update frame, and opencode sends it *empty* on
+    // one (measured) and absent on another (in the golden), which is why this
+    // filters rather than unwraps.
+    if let Some(title) = update["title"].as_str().filter(|title| !title.is_empty()) {
+        if !id.is_empty() {
+            state.tool_names.insert(id.to_string(), title.to_string());
+        }
+        return title.to_string();
+    }
+    state
+        .tool_names
+        .get(id)
+        .cloned()
+        // A call whose name mana never saw. Anonymous beats cryptic: the line
+        // still says a tool ran, which is all the operator can act on.
+        .unwrap_or_else(|| "a tool".to_string())
+}
+
+/// Drops a finished call's remembered name, so a long session's decoder holds
+/// what is running rather than everything that ever ran.
+fn forget_tool(update: &Value, state: &mut TurnState) {
+    if let Some(id) = update["toolCallId"].as_str() {
+        state.tool_names.remove(id);
     }
 }
 
@@ -807,24 +951,27 @@ fn permission_events(
         };
     }
 
+    let description = describe_tool_call(&params["toolCall"], state);
     let mut events = state.flush();
     events.push(PmEvent::PermissionRequest {
         id: state.remember_permission(request_id),
-        description: describe_tool_call(&params["toolCall"]),
+        description,
         options,
     });
     Decoded::events(events)
 }
 
 /// What the agent wants permission for, in one line.
-fn describe_tool_call(tool_call: &Value) -> String {
-    if let Some(title) = tool_call["title"].as_str() {
-        return title.to_string();
+///
+/// The same name the activity lines use, from the same place, and with the
+/// same refusal to quote a call id: this line is a question put to a human,
+/// and `allow call_00_wHYHJzGP5X0DJa6kZozS5109?` is not a question anybody can
+/// answer.
+fn describe_tool_call(tool_call: &Value, state: &mut TurnState) -> String {
+    match tool_name(tool_call, state).as_str() {
+        "a tool" => "an unnamed tool call".to_string(),
+        name => name.to_string(),
     }
-    if let Some(id) = tool_call["toolCallId"].as_str() {
-        return format!("tool call {id}");
-    }
-    "an unnamed tool call".to_string()
 }
 
 /// A response to something mana sent. After the handshake mana sends exactly
@@ -1100,11 +1247,85 @@ url = "https://example.invalid/fake"
             events,
             vec![
                 PmEvent::Text("working on it".to_string()),
-                PmEvent::Raw("[tool] mana_list_agents".to_string()),
-                // The empty title opencode really sends falls back to the id.
-                PmEvent::Raw("[tool] c1 · completed".to_string()),
+                PmEvent::Raw("⚙ mana_list_agents …".to_string()),
+                // The empty title opencode really sends falls back to the name
+                // the call was opened under -- never to `c1`.
+                PmEvent::Raw("⚙ mana_list_agents ✓".to_string()),
             ]
         );
+    }
+
+    /// A call that fails says so, in the same shape.
+    #[test]
+    fn a_failed_tool_call_is_marked_rather_than_reported_as_done() {
+        let events = replay([
+            update_line(json!({"sessionUpdate": "tool_call", "toolCallId": "c1",
+                               "title": "bash", "status": "pending"}))
+            .as_str(),
+            update_line(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+                               "status": "failed"}),
+            )
+            .as_str(),
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                PmEvent::Raw("⚙ bash …".to_string()),
+                PmEvent::Raw("⚙ bash ✗".to_string()),
+            ]
+        );
+    }
+
+    /// An agent that renames a call as it goes (opencode does: `skill` becomes
+    /// `Loaded skill: mana-pm`) is quoted with whatever it last called it.
+    #[test]
+    fn a_call_renamed_mid_flight_is_shown_under_its_newest_name() {
+        let events = replay([
+            update_line(json!({"sessionUpdate": "tool_call", "toolCallId": "c9",
+                               "title": "skill", "status": "pending"}))
+            .as_str(),
+            update_line(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "c9",
+                               "title": "Loaded skill: mana-pm", "status": "completed"}),
+            )
+            .as_str(),
+        ]);
+        assert_eq!(
+            events,
+            vec![
+                PmEvent::Raw("⚙ skill …".to_string()),
+                PmEvent::Raw("⚙ Loaded skill: mana-pm ✓".to_string()),
+            ]
+        );
+    }
+
+    /// A call nobody ever named. Anonymous beats cryptic: the id says nothing
+    /// the glyph did not, and it costs a whole row to say it.
+    #[test]
+    fn a_call_with_no_name_anywhere_is_never_quoted_by_its_id() {
+        let events = replay([update_line(json!({"sessionUpdate": "tool_call",
+                               "toolCallId": "call_00_wHYHJzGP5X0DJa6kZozS5109"}))
+        .as_str()]);
+        assert_eq!(events, vec![PmEvent::Raw("⚙ a tool …".to_string())]);
+    }
+
+    /// The decoder must not accumulate a session's worth of tool names: a
+    /// finished call is forgotten the moment it ends.
+    #[test]
+    fn a_finished_call_is_forgotten_by_the_decoder() {
+        let mut state = state();
+        for line in [
+            update_line(json!({"sessionUpdate": "tool_call", "toolCallId": "c1",
+                               "title": "bash", "status": "pending"})),
+            update_line(
+                json!({"sessionUpdate": "tool_call_update", "toolCallId": "c1",
+                               "status": "completed"}),
+            ),
+        ] {
+            decode(&line, &mut state);
+        }
+        assert!(state.tool_names.is_empty());
     }
 
     /// Understood and deliberately dropped -- `available_commands_update` was
@@ -1330,6 +1551,7 @@ url = "https://example.invalid/fake"
             &entry("mana-no-such-binary", &["--model", "{model}"]),
             &[],
             Path::new("/"),
+            None,
         ) {
             Ok(_) => panic!("the driver started a session it should have refused"),
             Err(error) => format!("{error:#}"),
@@ -1340,11 +1562,15 @@ url = "https://example.invalid/fake"
 
     #[test]
     fn a_missing_binary_is_reported_with_the_cli_that_owns_it() {
-        let rendered =
-            match AcpDriver::start_in(&entry("mana-no-such-binary", &[]), &[], Path::new("/")) {
-                Ok(_) => panic!("the driver started a session it should have refused"),
-                Err(error) => format!("{error:#}"),
-            };
+        let rendered = match AcpDriver::start_in(
+            &entry("mana-no-such-binary", &[]),
+            &[],
+            Path::new("/"),
+            None,
+        ) {
+            Ok(_) => panic!("the driver started a session it should have refused"),
+            Err(error) => format!("{error:#}"),
+        };
         assert!(rendered.contains("Fake ACP CLI"), "{rendered}");
         assert!(rendered.contains("mana-no-such-binary"), "{rendered}");
     }
@@ -1432,12 +1658,16 @@ mod golden {
             "{raws:#?}"
         );
         assert!(raws[0].ends_with("Let me do that."), "{raws:#?}");
-        // ...and the tool call is two lines: it started, it finished. The
-        // `completed` frame's title really is empty in the recording.
-        assert_eq!(raws[1], "[tool] mana_list_agents");
-        assert_eq!(
-            raws[2],
-            "[tool] call_00_EqxLWddzxkxCTr9VzOas3550 · completed"
+        // ...and the tool call is two short lines: it started, it finished.
+        // The `completed` frame in this recording carries no title at all, and
+        // the call id it *does* carry
+        // (`call_00_EqxLWddzxkxCTr9VzOas3550`) is exactly what must never
+        // reach the pane -- so the name is the one the call was opened under.
+        assert_eq!(raws[1], "⚙ mana_list_agents …");
+        assert_eq!(raws[2], "⚙ mana_list_agents ✓");
+        assert!(
+            !raws.iter().any(|line| line.contains("call_00_")),
+            "a raw call id reached the chat pane: {raws:#?}"
         );
 
         // Two usage snapshots, in the order they were reported: the
@@ -1524,7 +1754,21 @@ while IFS= read -r line; do
   id=`printf '%s' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p'`
   case "$line" in
     *'"initialize"'*)
-      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"fake"}}}\n' "$id"
+      # Only the `loadable` agent advertises session loading, which is what
+      # decides whether mana is allowed to resume against it at all.
+      case "$mode" in
+        loadable)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"fake"}}}\n' "$id"
+          ;;
+        *)
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"fake"}}}\n' "$id"
+          ;;
+      esac
+      ;;
+    *'"session/load"'*)
+      # Deliberately answers with an empty result: the protocol does not
+      # require the id back, so mana must keep the one it asked for.
+      printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id"
       ;;
     *'"session/new"'*)
       case "$mode" in
@@ -1542,6 +1786,13 @@ while IFS= read -r line; do
         die)
           echo 'boom: the agent fell over' >&2
           exit 9
+          ;;
+        noisy)
+          # One line on stderr, one on stdout: the shape the duplicated-stderr
+          # hunt needed a ruler for.
+          echo 'warning: a single line on stderr' >&2
+          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"done"}}}}\n'
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
           ;;
         linger)
           sleep 30 &
@@ -1590,12 +1841,16 @@ done
         }
 
         fn start(&self, mode: &str) -> Result<AcpDriver> {
+            self.start_with(mode, None)
+        }
+
+        fn start_with(&self, mode: &str, resume: Option<Resume<'_>>) -> Result<AcpDriver> {
             let args = [
                 mode,
                 self.record.to_str().unwrap(),
                 self.pidfile.to_str().unwrap(),
             ];
-            AcpDriver::start_in(&entry(&self.bin, &args), &[], self.dir.path())
+            AcpDriver::start_in(&entry(&self.bin, &args), &[], self.dir.path(), resume)
         }
 
         fn driver(&self, mode: &str) -> AcpDriver {
@@ -1654,6 +1909,76 @@ done
         // SAFETY: signal 0 runs the existence/permission check only; nothing is
         // delivered and nothing is dereferenced.
         unsafe { libc::kill(pid, 0) == 0 }
+    }
+
+    /// Resuming asks for the stored session by name -- and mana keeps the id
+    /// it asked for rather than one read back, because the protocol does not
+    /// promise the reply carries it (this fake agent answers `{}`; opencode
+    /// echoes it).
+    #[test]
+    fn resuming_an_agent_that_advertises_load_session_sends_session_load() {
+        let fixture = Fixture::new();
+        let mut driver = fixture
+            .start_with(
+                "loadable",
+                Some(Resume {
+                    session_id: Some("s-stored"),
+                }),
+            )
+            .expect("the agent advertised loadSession, so the resume was allowed");
+
+        let sent = fixture.wait_for_sent(2);
+        assert_eq!(sent[1]["method"], "session/load");
+        assert_eq!(sent[1]["params"]["sessionId"], "s-stored");
+        // A loaded session gets a fresh agent process, so mana's tools have to
+        // be attached to it exactly as they are to a new one.
+        assert_eq!(sent[1]["params"]["mcpServers"][0]["name"], "mana");
+        assert_eq!(
+            sent[1]["params"]["cwd"],
+            fixture.dir.path().to_string_lossy().as_ref()
+        );
+        assert_eq!(driver.session_id, "s-stored");
+        driver.set_close_grace(Duration::from_millis(200));
+        driver.shutdown().unwrap();
+    }
+
+    /// The refusal that keeps `--continue` honest: an agent that never said it
+    /// serves `session/load` is not asked, and the launch stops rather than
+    /// opening a fresh conversation under a flag that promised the old one.
+    #[test]
+    fn an_agent_without_the_capability_is_refused_rather_than_started_fresh() {
+        let fixture = Fixture::new();
+        let rendered = match fixture.start_with(
+            "chunks",
+            Some(Resume {
+                session_id: Some("s-stored"),
+            }),
+        ) {
+            Ok(_) => panic!("mana resumed against an agent that cannot load sessions"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(rendered.contains("loadSession"), "{rendered}");
+        assert!(rendered.contains("Fake ACP CLI"), "{rendered}");
+        assert!(rendered.contains("--continue"), "{rendered}");
+
+        // Nothing was asked for: the handshake stopped after `initialize`, and
+        // no session was opened behind the refusal.
+        let sent = fixture.wait_for_sent(1);
+        assert_eq!(sent.len(), 1, "{sent:#?}");
+        assert_eq!(sent[0]["method"], "initialize");
+    }
+
+    /// The other half of the same refusal: the agent can load a session, mana
+    /// has never recorded one for this project. Also not silently downgraded.
+    #[test]
+    fn resuming_without_a_stored_session_id_says_so() {
+        let fixture = Fixture::new();
+        let rendered = match fixture.start_with("loadable", Some(Resume { session_id: None })) {
+            Ok(_) => panic!("mana resumed a session it never recorded"),
+            Err(error) => format!("{error:#}"),
+        };
+        assert!(rendered.contains("no recorded"), "{rendered}");
+        assert!(rendered.contains("--continue"), "{rendered}");
     }
 
     /// The whole round trip: the handshake mana sends, the tools it registers,
@@ -1796,6 +2121,35 @@ done
         // A turn sent to a corpse fails where the person who typed it can see.
         let error = driver.send_user("hello?").unwrap_err();
         assert!(!format!("{error:#}").is_empty());
+    }
+
+    /// One line on the PM's stderr is one line in the pane. Once.
+    ///
+    /// The v2.0 capture showed every opencode stderr line twice, and the
+    /// suspicion was a second path inside mana -- the driver pumping stderr
+    /// and something downstream echoing it again. It is not: measured on
+    /// 2026-08-15 with a bare Python ACP client (mana's TUI nowhere in the
+    /// picture, one `mana mcp-server` process), opencode wrote each of those
+    /// schema warnings to its own stderr *twice*, once per pass over the tool
+    /// schemas. The warnings themselves are gone now (`src/mcp.rs` stopped
+    /// emitting the formats that provoked them); this is the guard that keeps
+    /// the mana half honest, so a future reader never has to re-run that
+    /// experiment.
+    #[test]
+    fn one_line_on_the_agents_stderr_is_exactly_one_raw_event() {
+        let fixture = Fixture::new();
+        let mut driver = fixture.driver("noisy");
+        driver.send_user("say something").unwrap();
+        fixture.wait_for_sent(3);
+        driver.shutdown().unwrap();
+
+        let events = drain_to_exit(&driver);
+        let noise = PmEvent::Raw("warning: a single line on stderr".to_string());
+        assert_eq!(
+            events.iter().filter(|event| **event == noise).count(),
+            1,
+            "{events:#?}"
+        );
     }
 
     /// A handshake the agent refuses is reported with the agent's own words --

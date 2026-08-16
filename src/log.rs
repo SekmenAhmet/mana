@@ -25,23 +25,16 @@ pub struct LogEntry {
 /// exactly the kind of cleverness a typed field removes. Duration and token
 /// fields use the exact OTEL GenAI semantic-convention key names (see
 /// design doc §8) so a future OTEL exporter is a pipe change, not a rename;
-/// they're `Option` because this dispatcher (task 1.3) fills `exit_code`
-/// and `duration_ms` but usage/failure enrichment lands later and must be
-/// absent from the wire, not `null`, until then.
-///
-/// Not constructed by production code yet — only by this file's own tests
-/// (see `counters`) — until task 1.3 rewires the real dispatcher to write
-/// it; `#[allow(dead_code)]` matches the precedent in `task.rs` for
-/// schema/API surface proven by tests ahead of its consumer landing.
-#[allow(dead_code)]
+/// they're `Option` because the dispatcher fills `exit_code`, `duration_ms`
+/// and `failure_means` but token usage lands later and must be absent from
+/// the wire, not `null`, until then.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ExitEntry {
     pub status: Status,
     /// Always `"exited"` — kept as a plain tag (not string-packed with the
-    /// code) so anything still reading the stream generically via
-    /// `LogEntry`/`read_last_status` (file watcher, pty listener) keeps
-    /// working unchanged; serde ignores the extra typed fields it doesn't
-    /// know about.
+    /// code) so a reader that only wants "is this agent done" can go through
+    /// `read_last_status` and never learn `ExitEntry` exists; serde ignores
+    /// the extra typed fields it doesn't know about.
     pub action: String,
     pub timestamp: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -111,15 +104,11 @@ pub fn read_last_status(path: &Path) -> anyhow::Result<Option<Status>> {
 }
 
 /// Scans from the end for the last line tagged `action == "exited"` rather
-/// than trusting it's literally the last line in the file: the file watcher
-/// and the exit watcher run on separate threads (see
-/// `cli::launch_subagent::run_at`), so a trailing `file:modified:` event
-/// can in principle land after the exit record. Any line failing to parse
-/// as `ExitEntry` (or any other action) is skipped, not fatal — the file is
-/// still being written by another agent's run.
-///
-/// Only called by `counters` today (see its own `#[allow(dead_code)]` note).
-#[allow(dead_code)]
+/// than deserializing the final line outright: a log file carries two entry
+/// shapes (`LogEntry` for `started`, `ExitEntry` for the exit), so lines that
+/// are not the exit record simply fail to parse as one. Skipping them is the
+/// correct reading and not leniency — a dispatch still in flight has a
+/// `started` line and no exit yet, which is `None`, not an error.
 pub(crate) fn read_last_exit(path: &Path) -> anyhow::Result<Option<ExitEntry>> {
     if !path.exists() {
         return Ok(None);

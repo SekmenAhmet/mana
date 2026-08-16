@@ -1,0 +1,113 @@
+# release-plz — the robot half of RELEASING.md.
+#
+# It watches `main`, reads the conventional commits since the last tag, and
+# opens a Release PR that bumps the version and writes CHANGELOG.md. Merging
+# that PR is what makes it push the tag; the tag is what starts cargo-dist.
+# Nothing here builds or uploads anything: that is dist-workspace.toml's job.
+
+[workspace]
+
+# The setting the whole file turns on. mana is `publish = false` and has never
+# existed on crates.io, so the registry cannot answer "what is the current
+# version?" — git-only mode reads it from the `vX.Y.Z` tags instead. Without
+# it, release-plz asks crates.io, gets nothing, and every run looks like a
+# first release. Requires `fetch-depth: 0` in CI, which is why the workflow
+# sets it.
+git_only = true
+
+# Redundant with Cargo.toml's `publish = false`, and stated anyway: `git_only`
+# and `publish` are mutually exclusive, and the one thing that must never
+# happen by accident is a crates.io upload of a crate whose licence is still
+# undecided (see the comment in deny.toml).
+publish = false
+
+# The tag is the contract with cargo-dist: `.github/workflows/release.yml`
+# fires on `**[0-9]+.[0-9]+.[0-9]+*`, and release-plz's default name for a
+# single-crate repo is `v{{ version }}` — `v0.2.0` matches. Left at the default
+# on purpose; renaming it would silently decouple the two halves.
+git_tag_enable = true
+
+# cargo-dist creates the GitHub Release (`create-release` is on by default in
+# dist-workspace.toml) and fills its body from the CHANGELOG.md section
+# release-plz just wrote. If both tools created it, one of them would 422.
+git_release_enable = false
+
+changelog_update = true
+
+# Only release when the merged commit came from a Release PR (a branch under
+# `release-plz-`). This is what keeps the human step human: merging
+# develop → main must never, on its own, cut a release — and on a repo whose
+# `v0.1.0` tag does not exist yet, the default (`true`) would do exactly that
+# on the first push.
+release_always = false
+
+# cargo-semver-checks compares public library APIs. mana is a binary with no
+# lib target, so there is nothing for it to compare and the run is pure
+# latency.
+semver_check = false
+
+pr_labels = ["release"]
+
+# Left at the default, which is semver's pre-1.0 rule: below 1.0 a `feat:` is a
+# patch bump, because the minor position is where breaking changes go. Verified
+# against this repo's own history (release-plz 0.3.160, tag v0.1.0 + one
+# `feat:` commit -> 0.1.1). Set it to `true` if 0.x releases should read
+# 0.2.0, 0.3.0, ... instead -- more legible while the shape of v2 is still
+# moving, at the cost of saying "minor" where semver means "breaking".
+# features_always_increment_minor = true
+
+[changelog]
+header = """# Changelog
+
+Every release of mana, newest first. Written by release-plz from the
+conventional-commit messages on `main` — see RELEASING.md.
+
+"""
+
+# git-cliff (Tera 1) renders this, not release-plz's own Tera 2 templates.
+# `striptags` strips the `<!-- n -->` markers that force group order, which
+# would otherwise sort alphabetically.
+body = """
+## [{{ version }}]{% if release_link %}({{ release_link }}){% endif %} - {{ timestamp | date(format="%Y-%m-%d") }}
+{% for group, commits in commits | group_by(attribute="group") %}
+### {{ group | striptags | trim | upper_first }}
+{% for commit in commits %}
+- {% if commit.breaking %}[**breaking**] {% endif %}\
+{% if commit.scope %}*({{ commit.scope }})* {% endif %}{{ commit.message }}\
+{% endfor %}
+{% endfor %}
+"""
+
+trim = true
+
+# A breaking change is never dropped, whatever the parsers below say — the one
+# thing a changelog exists to not lose.
+protect_breaking_commits = true
+
+# Only `vX.Y.Z` tags are releases here; anything else someone pushes by hand is
+# not a version boundary.
+tag_pattern = '^v[0-9]+\.[0-9]+\.[0-9]+$'
+
+commit_parsers = [
+  # release-plz's own bump commit, and the merge commits git-flow produces on
+  # every develop → main. Neither is news.
+  { message = '^chore\(release\): prepare for', skip = true },
+  { message = '^chore\(deps', skip = true },
+  { message = '^Merge (branch|pull request|remote-tracking)', skip = true },
+  { footer = '^changelog: ?ignore', skip = true },
+
+  { message = '^feat', group = '<!-- 0 -->Added' },
+  { message = '^fix', group = '<!-- 1 -->Fixed' },
+  { message = '^perf', group = '<!-- 2 -->Performance' },
+  { message = '^refactor', group = '<!-- 3 -->Changed' },
+  { message = '^docs', group = '<!-- 4 -->Documentation' },
+  { message = '^test', group = '<!-- 5 -->Tests' },
+  { message = '^(ci|build)', group = '<!-- 6 -->Build & CI' },
+  { message = '^chore', group = '<!-- 7 -->Miscellaneous' },
+  { message = '^.*', group = '<!-- 8 -->Other' },
+]
+
+# Turns the `(#12)` GitHub appends on squash-merge into a link.
+commit_preprocessors = [
+  { pattern = '\(#([0-9]+)\)', replace = "([#${1}](https://github.com/SekmenAhmet/mana/pull/${1}))" },
+]

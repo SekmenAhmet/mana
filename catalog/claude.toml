@@ -21,6 +21,24 @@ server connects and its four tools are callable under the mcp__mana__ prefix
 without a permission prompt, while a Write attempt is refused with "requested
 permissions ... but you haven't granted it" and no file appears. The PM is
 mechanically read-only, as [pm].permission_args intends.
+
+`--continue` was measured on this machine on 2026-08-15, twice, because
+[pm].resume_args rests on it:
+
+  1. Semantics, plain print mode: `claude -p --model haiku` was asked to
+     remember PLATYPUS-7734 in a scratch directory; a second process,
+     `claude -p --continue --model haiku`, answered "PLATYPUS-7734". Context
+     survives across processes, and (like every other CLI measured here) the
+     conversation is keyed by the working directory.
+  2. The flag combination mana actually launches with:
+     `-p --input-format stream-json --output-format stream-json --verbose
+     --continue --allowedTools ...`, one user frame on stdin. Accepted, exit 0,
+     the answer was again PLATYPUS-7734, and the stream opened with
+     `{"type":"system","subtype":"hook_started","hook_name":"SessionStart:resume"}`
+     -- the CLI's own word for what it did. $0.049 for that turn.
+
+So `--continue` composes with stream-json rather than replacing it, which is
+why resume is one appended flag and not a second driver.
 '''
 
 [cli]
@@ -34,6 +52,8 @@ driver = "stream"                  # acp | stream | oneshot-continue
 args   = ["-p", "--input-format", "stream-json",
           "--output-format", "stream-json", "--verbose"]
 prompt = "stdin-jsonl"             # argv | stdin | stdin-jsonl
+# `mana launch claude --continue` -- appended after args, measured above.
+resume_args = ["--continue"]
 
 # The PM must be mechanically unable to write code (design §6). An allowlist is
 # the only enforcement this CLI offers, so it gets one: mana's four
@@ -95,7 +115,32 @@ stdout_regex     = "rate.?limit"
 cooldown_minutes = 60
 
 [skills]
-dirs = ["~/.claude/skills", "~/.agents/skills"]
+# Project-local first, and that ordering is the whole point: `~/.claude/skills`
+# is a global list (140 skills on this machine), and every earlier mana launch
+# added `mana-pm` to it for every project the user ever opens. A relative entry
+# resolves against the project root mana was launched in, so the PM role is
+# installed where it is used and nowhere else. mana deletes any `mana-pm/` it
+# finds in the other directories of this list on every launch, which is what
+# clears the global copy earlier versions left behind -- and it matters beyond
+# tidiness: with the same skill name in both places, the docs say the personal
+# one wins, so a stale global copy would shadow the fresh project one.
+#
+# Verified against the CLI's own documentation (code.claude.com/docs/en/skills,
+# read 2026-08-15): "Project | .claude/skills/<skill-name>/SKILL.md | This
+# project only", loaded from the directory Claude Code starts in and every
+# parent up to the repository root. mana starts it in the project root and
+# writes the file before spawning, which is also what the docs require ("If you
+# create a top-level skills directory that didn't exist when the session
+# started, restart Claude Code").
+#
+# And verified live the same day, because a directory the CLI ignores would
+# leave the PM with no role at all: a scratch project got
+# `.claude/skills/mana-probe-zx9/SKILL.md` and nothing else, and
+# `claude -p --model haiku --disallowedTools "Read,Glob,Grep,Bash,..."` --
+# every file tool denied, so it could not have gone looking -- answered
+# "mana-pm, mana-probe-zx9". The project skill was in its context, and the
+# second name is the stale global copy this cleanup exists to remove.
+dirs = [".claude/skills", "~/.claude/skills", "~/.agents/skills"]
 
 [install]
 url = "https://claude.com/claude-code"

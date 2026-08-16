@@ -27,7 +27,13 @@
 //! `~/.mana/projects/<project>/` fresh -- registry, logs, reviews, runs -- so
 //! this server can be restarted mid-session and the PM cannot tell.
 
-mod routing;
+// `pub(crate)` for the same reason `runs` is, one consumer later: `mana doctor`
+// (task 4.3) reports which (CLI x model) pairs are resting on a quota cooldown
+// right now, and that state is computed here, from the logs, by
+// `Observations::gather`. Recomputing it in the doctor would be a second
+// implementation of the cooldown rules, free to disagree with the one the
+// router actually routes on. Visibility only -- nothing in this module changed.
+pub(crate) mod routing;
 // `pub(crate)` for the consumer named in its own module doc: the PM driver
 // (`cli::launch_pm`) tails `notifications.jsonl` and injects each line into the
 // PM session. It reads that file back through `runs::Notification`, so the
@@ -117,10 +123,11 @@ pub fn serve(project_root: &Path) -> Result<()> {
 /// The server. Cheap to clone (the catalogue is a handful of parsed structs),
 /// which is what the SDK asks for. `in_flight` is the one piece of in-process
 /// state, and it is legitimately irrecoverable-from-disk: it exists to honour
-/// `[subagent].max_concurrent` (the PM skill promises "mana enforces per-CLI
-/// concurrency limits"), and the registry row that would prove a dispatch is
-/// live is written only *after* the spawn — by which time a second dispatch
-/// against a `max_concurrent = 1` CLI has already killed both (agy, 8s).
+/// `[subagent].max_concurrent` (the PM skill tells the PM an over-limit
+/// dispatch is refused and to re-send later), and the registry row that would
+/// prove a dispatch is live is written only *after* the spawn — by which time
+/// a second dispatch against a `max_concurrent = 1` CLI has already killed
+/// both (agy, 8s).
 #[derive(Clone)]
 pub struct ManaTools {
     project_root: PathBuf,
@@ -137,8 +144,91 @@ impl ManaTools {
             mana_home,
             catalog,
             in_flight: Arc::new(Mutex::new(HashMap::new())),
-            tool_router: Self::tool_router(),
+            tool_router: Self::portable_tool_router(),
         }
+    }
+
+    /// The generated router, with every schema made portable before a client
+    /// ever sees it.
+    ///
+    /// `#[tool_router]` builds the schemas through schemars, which stamps
+    /// Rust's integer widths on as `"format": "uint32"` / `"uint64"`. Those are
+    /// OpenAPI formats; JSON Schema defines neither, so a client that checks
+    /// what it was handed says so -- opencode logs `unknown format "uint64"
+    /// ignored in schema at path "#/$defs/Stats/properties/avg_duration_ms"`
+    /// for every one of them, twice each, and the operator reads mana's own
+    /// stream as noise it did not ask for.
+    ///
+    /// Fixed here rather than field by field (`#[schemars(with = ...)]` on
+    /// each counter) for two reasons: this covers the tools mana has not
+    /// written yet, and it needs no annotation on `routing::Stats`, which is an
+    /// internal type that happens to be serialised rather than a wire type
+    /// anybody should be decorating for a client's benefit. Nothing is lost:
+    /// `format` is an annotation, and the constraint that actually binds --
+    /// `"type": "integer"`, `"minimum": 0` -- is emitted next to it and stays.
+    fn portable_tool_router() -> ToolRouter<Self> {
+        let mut router = Self::tool_router();
+        for route in router.map.values_mut() {
+            route.attr.input_schema = portable_schema(&route.attr.input_schema);
+            route.attr.output_schema = route.attr.output_schema.as_ref().map(portable_schema);
+        }
+        router
+    }
+}
+
+/// The formats JSON Schema itself defines (2020-12 §7.3). Anything else is a
+/// vendor extension, and a client is right to say it does not know it.
+const DEFINED_FORMATS: [&str; 19] = [
+    "date-time",
+    "date",
+    "time",
+    "duration",
+    "email",
+    "idn-email",
+    "hostname",
+    "idn-hostname",
+    "ipv4",
+    "ipv6",
+    "uri",
+    "uri-reference",
+    "iri",
+    "iri-reference",
+    "uuid",
+    "uri-template",
+    "json-pointer",
+    "relative-json-pointer",
+    "regex",
+];
+
+fn portable_schema(schema: &Arc<rmcp::model::JsonObject>) -> Arc<rmcp::model::JsonObject> {
+    let mut document = serde_json::Value::Object(schema.as_ref().clone());
+    drop_undefined_formats(&mut document);
+    match document {
+        serde_json::Value::Object(object) => Arc::new(object),
+        // Built from an object one line above.
+        _ => unreachable!("a JSON object stayed an object"),
+    }
+}
+
+/// Removes every `format` annotation JSON Schema does not define, at any depth.
+///
+/// Keyed on the pair (`"format"`, a string value): in a schema, `format` always
+/// carries a string, and a *property* called `format` carries a schema object
+/// instead -- so a tool that takes a `format` parameter keeps it.
+fn drop_undefined_formats(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(object) => {
+            if let Some(serde_json::Value::String(format)) = object.get("format")
+                && !DEFINED_FORMATS.contains(&format.as_str())
+            {
+                object.remove("format");
+            }
+            for nested in object.values_mut() {
+                drop_undefined_formats(nested);
+            }
+        }
+        serde_json::Value::Array(items) => items.iter_mut().for_each(drop_undefined_formats),
+        _ => {}
     }
 }
 
@@ -876,9 +966,92 @@ mod tests {
         }
     }
 
+    /// Every schema mana serves, in both directions, walked for `format`
+    /// annotations.
+    ///
+    /// The failure this guards against is not a broken tool -- `format` is an
+    /// annotation and nothing validates on it -- but a client that reads mana's
+    /// schemas and complains about them in the operator's face. opencode logs
+    /// one line per unknown format, twice each, straight into the pane the PM
+    /// session is being read in.
+    #[test]
+    fn no_tool_schema_carries_a_format_json_schema_does_not_define() {
+        fn formats(value: &serde_json::Value, found: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(object) => {
+                    if let Some(serde_json::Value::String(format)) = object.get("format") {
+                        found.push(format.clone());
+                    }
+                    object.values().for_each(|nested| formats(nested, found));
+                }
+                serde_json::Value::Array(items) => {
+                    items.iter().for_each(|item| formats(item, found))
+                }
+                _ => {}
+            }
+        }
+
+        let mut found = Vec::new();
+        for tool in ManaTools::portable_tool_router().list_all() {
+            for schema in [Some(&tool.input_schema), tool.output_schema.as_ref()]
+                .into_iter()
+                .flatten()
+            {
+                formats(
+                    &serde_json::Value::Object(schema.as_ref().clone()),
+                    &mut found,
+                );
+            }
+        }
+        let unknown: Vec<&String> = found
+            .iter()
+            .filter(|format| !DEFINED_FORMATS.contains(&format.as_str()))
+            .collect();
+        assert!(unknown.is_empty(), "{unknown:?}");
+        // Specifically the two schemars stamps on Rust's integer widths, which
+        // is what opencode was warning about ten times a session.
+        assert!(!found.iter().any(|format| format.starts_with("uint")));
+    }
+
+    /// Dropping the annotation must not drop the constraint: the counters are
+    /// still integers, and still non-negative.
+    #[test]
+    fn the_counters_keep_their_type_and_their_lower_bound() {
+        let tool = ManaTools::portable_tool_router()
+            .list_all()
+            .into_iter()
+            .find(|tool| tool.name == "list_agents")
+            .unwrap();
+        let schema = serde_json::to_string(tool.output_schema.as_ref().unwrap()).unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&schema).unwrap();
+        let dispatched = &stats["$defs"]["Stats"]["properties"]["dispatched"];
+        assert_eq!(dispatched["type"], "integer");
+        assert_eq!(dispatched["minimum"], 0);
+        assert!(dispatched.get("format").is_none(), "{dispatched}");
+    }
+
+    /// A tool that took a parameter *called* `format` must keep it: the
+    /// stripping is keyed on schema annotations, not on the word.
+    #[test]
+    fn a_property_named_format_survives_the_stripping() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "format": {"type": "string", "format": "uint32"},
+                "when": {"type": "string", "format": "date-time"},
+            }
+        });
+        drop_undefined_formats(&mut schema);
+        assert!(schema["properties"]["format"].is_object());
+        assert_eq!(schema["properties"]["format"]["type"], "string");
+        assert!(schema["properties"]["format"].get("format").is_none());
+        // A format JSON Schema does define is left exactly where it was.
+        assert_eq!(schema["properties"]["when"]["format"], "date-time");
+    }
+
     #[test]
     fn the_tool_surface_is_exactly_the_four_documented_tools() {
-        let router = ManaTools::tool_router();
+        let router = ManaTools::portable_tool_router();
         let mut names: Vec<String> = router
             .list_all()
             .iter()
@@ -907,7 +1080,7 @@ mod tests {
     /// bound by -- a renamed field here is a silently broken PM.
     #[test]
     fn the_input_schemas_name_the_documented_parameters() {
-        let router = ManaTools::tool_router();
+        let router = ManaTools::portable_tool_router();
         let schema = |name: &str| {
             router
                 .list_all()

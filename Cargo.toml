@@ -5,13 +5,22 @@ edition = "2024"
 # Not on crates.io yet; releases ship as GitHub binaries. Flipping this
 # requires choosing a license first (deny gates on it).
 publish = false
+# Not decoration: cargo-dist refuses to generate GitHub CI without it (it needs
+# the owner/repo to build release URLs), and `self_update`'s GitHub backend
+# targets the same repo from the constants in src/cli/upgrade.rs.
+repository = "https://github.com/SekmenAhmet/mana"
+
+# `publish = false` above also hides this crate from cargo-dist's workspace
+# scan ("no packages with distable binaries") -- dist reads it as "not meant to
+# leave the machine". It is meant to leave the machine, just not via crates.io,
+# so say so explicitly. Without this line `dist plan` finds nothing to build.
+[package.metadata.dist]
+dist = true
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.29"
 crossterm = "0.28"
-portable-pty = "0.8"
-notify = "6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The `[pm.events]` map is JSONPath, because that is the one query language a
@@ -22,12 +31,38 @@ serde_json = "1"
 # Default features bring the RFC's function extensions (`match`, `search`) via
 # regex, already a direct dependency here, so they add no new audit surface.
 serde_json_path = "0.7"
-serde_yaml = "0.9"
+# The one serialization format mana reads and writes: config, catalogue, task
+# frontmatter (`+++` fences). Its predecessor `serde_yaml` is archived
+# upstream, which is half the reason; the other half is that one format means
+# one set of surprises.
 toml = "1.0"
-self_update = { version = "0.41", default-features = false, features = ["archive-tar", "compression-flate2", "rustls"] }
+# `mana upgrade` and the soft version check at launch. Every feature here is a
+# decision, so each gets a line:
+#
+# `default-features = false` -- the defaults are `["reqwest", "default-tls"]`,
+#   and native-tls means linking three different platform TLS stacks. rustls is
+#   one implementation everywhere.
+# `archive-tar` + `compression-flate2` -- must match what cargo-dist actually
+#   uploads, which dist-workspace.toml pins to `.tar.gz` on every target. Note
+#   that `self_update` silently treats an unknown extension as "not an archive"
+#   and copies the raw bytes over the binary, so this pairing is load-bearing.
+# `ureq` -- an HTTP client has to be named explicitly since 0.42, which made
+#   the client pluggable: `rustls` expands to `reqwest?/rustls` +
+#   `ureq?/rustls`, both gated on an optional dependency nothing else enables,
+#   so `default-features = false` + `rustls` alone compiles *no* client at all
+#   and every request becomes a compile error. That is the whole of the
+#   0.41 -> 0.44 break.
+#
+#   ureq rather than the default reqwest: reqwest 0.13 pulls rustls with the
+#   aws-lc-rs provider, i.e. `aws-lc-sys`, a C library needing cmake (and NASM
+#   on windows-msvc) at build time -- a build-environment requirement on the
+#   exact target cargo-dist has to cross-build. ureq's rustls uses `ring`, and
+#   drops hyper/h2/tower/reqwest from the graph entirely. mana makes one
+#   blocking GET a day and one download per `mana upgrade`; a blocking client
+#   is the right size for that.
+self_update = { version = "0.44", default-features = false, features = ["archive-tar", "compression-flate2", "rustls", "ureq"] }
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
-strip-ansi-escapes = "0.2"
 anyhow = "1"
 # The catalogue's failure signatures are regexes written by hand (in the
 # shipped files and in the user's local override), and matching them against a
@@ -59,3 +94,8 @@ libc = "0.2"
 [dev-dependencies]
 assert_cmd = "2"
 tempfile = "3"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"

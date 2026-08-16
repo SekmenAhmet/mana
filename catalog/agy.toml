@@ -98,7 +98,17 @@ Still unverified:
   cooldowns here -- removed 2026-08-15. Until a real agy quota failure is
   captured, exhaustion surfaces as a generic failure the PM escalates.
 - No agy-specific skills directory was found, so only the vendor-neutral
-  ~/.agents/skills is listed.
+  ~/.agents/skills is listed. No project-local equivalent is known either, and
+  finding one would change nothing here: this CLI never reads the file at all
+  (inline_in_activation below), so where mana writes it is academic. The one
+  concrete effect of the global directory is that `mana-pm` shows up in every
+  other tool that reads ~/.agents/skills, which is why claude's entry now
+  installs into the project and mana deletes the stale global copy it finds.
+
+`mana launch agy --continue` needs no [pm].resume_args and has none: this
+driver resumes by making the *first* turn of the session use continue_args
+instead of first_args, which is the `--continue` already written below. Its
+cwd scoping (measured above) is what makes that the right session to resume.
 '''
 
 [cli]

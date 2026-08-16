@@ -19,7 +19,7 @@ use super::child::{
     reap, set_process_group,
 };
 use super::events::EventMap;
-use super::{PmEvent, PmTransport};
+use super::{PmEvent, PmTransport, Resume};
 use crate::catalog::{CliEntry, PmDriver, PromptMode, substitute};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::Serialize;
@@ -61,13 +61,22 @@ impl StreamDriver {
     ///
     /// Runs in mana's working directory, which is the project the user invoked
     /// mana from -- exactly where a PM should be looking.
-    pub fn start(entry: &CliEntry, extra_args: &[String]) -> Result<Self> {
-        Self::start_in(entry, extra_args, None)
+    pub fn start(
+        entry: &CliEntry,
+        extra_args: &[String],
+        resume: Option<Resume<'_>>,
+    ) -> Result<Self> {
+        Self::start_in(entry, extra_args, None, resume)
     }
 
     /// `start` with an explicit working directory, for callers that resolve the
     /// project elsewhere than the current directory.
-    pub fn start_in(entry: &CliEntry, extra_args: &[String], cwd: Option<&Path>) -> Result<Self> {
+    pub fn start_in(
+        entry: &CliEntry,
+        extra_args: &[String],
+        cwd: Option<&Path>,
+        resume: Option<Resume<'_>>,
+    ) -> Result<Self> {
         let id = &entry.cli.id;
         // An internal guard: the factory in `pm::start` dispatches on this
         // field, so reaching here with anything else is a code bug, not a
@@ -99,8 +108,29 @@ impl StreamDriver {
         // ready-made in `extra_args`). Running the template through an empty
         // substitution is how a leftover `{placeholder}` becomes a startup
         // error instead of a literal argument handed to the CLI.
-        let args = substitute(&entry.pm.args, &HashMap::new())
+        let mut args = substitute(&entry.pm.args, &HashMap::new())
             .with_context(|| format!("{id}: [pm].args"))?;
+
+        // Resuming is one appended flag on this driver (measured on claude:
+        // `--continue` composes with the stream-json argv rather than replacing
+        // it). An entry with nothing to append cannot resume, and saying so
+        // beats starting a fresh conversation under a flag that promised the
+        // old one -- the user would only find out by asking the PM something it
+        // was supposed to remember.
+        if resume.is_some() {
+            if entry.pm.resume_args.is_empty() {
+                bail!(
+                    "{} cannot resume a conversation: its catalogue entry declares no \
+                     [pm].resume_args, so there is no flag to ask it with. Launch it without \
+                     --continue to start a fresh session.",
+                    entry.cli.name
+                );
+            }
+            args.extend(
+                substitute(&entry.pm.resume_args, &HashMap::new())
+                    .with_context(|| format!("{id}: [pm].resume_args"))?,
+            );
+        }
 
         let mut command = Command::new(entry.cli.bin());
         command
@@ -321,7 +351,7 @@ mod tests {
     /// `unwrap_err` would need `Debug` on a live process handle, which is not
     /// worth deriving for a type nobody prints.
     fn start_err(entry: &CliEntry) -> String {
-        match StreamDriver::start(entry, &[]) {
+        match StreamDriver::start(entry, &[], None) {
             Ok(_) => panic!("the driver started a session it should have refused"),
             Err(err) => format!("{err:#}"),
         }
@@ -342,6 +372,22 @@ mod tests {
         let rendered = start_err(&entry);
         assert!(rendered.contains("argv"), "{rendered}");
         assert!(rendered.contains("second turn"), "{rendered}");
+    }
+
+    /// `mana launch <cli> --continue` against a CLI whose entry declares no
+    /// way to continue. Refused at the launch, before a process exists: the
+    /// alternative is a fresh conversation the user believes is the old one,
+    /// and they find that out by asking the PM something it should remember.
+    #[test]
+    fn resuming_a_cli_with_no_resume_args_is_refused_before_anything_is_spawned() {
+        let entry = fixture::entry("no-such-binary", &[], "stdin-jsonl", TEXT_PATH, None);
+        let rendered = match StreamDriver::start(&entry, &[], Some(Resume::default())) {
+            Ok(_) => panic!("the driver resumed a session it could not resume"),
+            Err(err) => format!("{err:#}"),
+        };
+        assert!(rendered.contains("resume_args"), "{rendered}");
+        assert!(rendered.contains("Fake CLI"), "{rendered}");
+        assert!(rendered.contains("--continue"), "{rendered}");
     }
 
     #[test]
@@ -399,7 +445,7 @@ mod process_tests {
 
     fn driver(bin: &str, args: &[&str]) -> StreamDriver {
         let entry = fixture::entry(bin, args, "stdin-jsonl", TEXT_PATH, Some("$.usage"));
-        StreamDriver::start(&entry, &[]).unwrap()
+        StreamDriver::start(&entry, &[], None).unwrap()
     }
 
     /// A driver that gives up on the polite exit almost at once -- what the
@@ -583,13 +629,50 @@ mod process_tests {
         let bin = script(tmp.path(), "echo \"argv: $*\" >&2");
         let entry = fixture::entry(&bin, &["--from-catalogue"], "stdin-jsonl", TEXT_PATH, None);
         let extra = ["--mcp-config".to_string(), "/tmp/mana-mcp.json".to_string()];
-        let driver = StreamDriver::start(&entry, &extra).unwrap();
+        let driver = StreamDriver::start(&entry, &extra, None).unwrap();
 
         let events = drain_to_exit(&driver);
         assert_eq!(
             events.first(),
             Some(&PmEvent::Raw(
                 "argv: --from-catalogue --mcp-config /tmp/mana-mcp.json".to_string()
+            ))
+        );
+    }
+
+    /// Resuming on this driver is one flag, and where it lands matters: after
+    /// the catalogue's own argv (which is what puts claude in stream-json mode
+    /// -- the two compose, measured 2026-08-15) and before the tool channel's.
+    #[test]
+    fn resume_args_land_between_the_catalogue_args_and_the_tool_channel_flags() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(tmp.path(), "echo \"argv: $*\" >&2");
+        let entry = fixture::parse(
+            &fixture::source(&bin, &["--from-catalogue"], "stdin-jsonl", TEXT_PATH, None)
+                // The [pm] one, not [subagent]'s (which is `argv`).
+                .replace(
+                    "prompt = \"stdin-jsonl\"",
+                    "resume_args = [\"--continue\"]\nprompt = \"stdin-jsonl\"",
+                ),
+        );
+        let extra = ["--mcp-config".to_string(), "/tmp/mana-mcp.json".to_string()];
+
+        // Without --continue the flag is absent...
+        let fresh = drain_to_exit(&StreamDriver::start(&entry, &extra, None).unwrap());
+        assert_eq!(
+            fresh.first(),
+            Some(&PmEvent::Raw(
+                "argv: --from-catalogue --mcp-config /tmp/mana-mcp.json".to_string()
+            ))
+        );
+
+        // ...and with it, it is exactly one flag in exactly one place.
+        let resumed =
+            drain_to_exit(&StreamDriver::start(&entry, &extra, Some(Resume::default())).unwrap());
+        assert_eq!(
+            resumed.first(),
+            Some(&PmEvent::Raw(
+                "argv: --from-catalogue --continue --mcp-config /tmp/mana-mcp.json".to_string()
             ))
         );
     }

@@ -4,32 +4,42 @@
 
 [advisories]
 # RustSec advisories: any known vulnerability in the tree fails the check.
-# Unmaintained crates warn rather than fail — serde_yaml is knowingly still
-# here for task-file frontmatter until its replacement is decided (v2 plan).
+# Unmaintained crates warn rather than fail; the ones we knowingly carry are
+# listed below with the reason they are still here.
 version = 2
 yanked = "deny"
 # Every entry here is a known, accepted debt with an exit path — not noise to
-# silence. Remove the entry when the exit lands; deny will then flag it as
-# unused and force the cleanup.
+# silence. Remove the entry when the exit lands: an ignore whose carrier has
+# left the tree is reported by `cargo deny check advisories --show-stats` as
+# `advisory-not-detected` (a warning, not an error — hence the flag, without
+# which a stale entry sits here unnoticed).
 ignore = [
-    # serial (unmaintained) comes via portable-pty, which the v2 design
-    # deletes outright (sub-agents spawn plain processes, PM drivers are
-    # stdio). Dies with task 1.1/2.4.
-    "RUSTSEC-2017-0008",
     # paste (unmaintained) comes via ratatui 0.29; revisit at the TUI v2
     # rework (task 2.4), which bumps ratatui anyway.
     "RUSTSEC-2024-0436",
-    # number_prefix (unmaintained) via self_update -> indicatif; cosmetic
-    # progress-bar formatting, no untrusted input reaches it.
-    "RUSTSEC-2025-0119",
-    # Quadratic-time HTML attribute parsing via self_update's release-notes
-    # rendering. cargo update cannot reach a fixed version while self_update
-    # 0.41 pins it; inputs are GitHub release notes for our own repo, not
-    # arbitrary attacker HTML. Revisit on the next self_update release.
+    # RUSTSEC-2025-0119 (number_prefix, unmaintained) used to be listed here.
+    # self_update 0.44 moved to indicatif 0.18, which replaced number_prefix
+    # with unit-prefix, and the crate left the tree:
+    # `cargo deny check advisories --show-stats` reported the entry as
+    # `advisory-not-detected`, so it was removed (2026-08-15).
+    #
+    # Both entries below are quick-xml 0.38.4, reached only through
+    # self_update -> its S3 backend's bucket-listing parser. mana uses the
+    # GitHub backend, so that code never runs in this binary; the advisories
+    # fire because quick-xml is a hard dependency of self_update at 0.44,
+    # not because the parser is reachable.
+    #
+    # Exit path: quick-xml fixes both in 0.41.0, and self_update reaches it in
+    # 1.0.0 -- which also puts quick-xml behind a non-default `s3` feature, so
+    # the entries would disappear twice over. 1.0.0 is still a release
+    # candidate (1.0.0-rc.6 as of 2026-08-15) and renames a third of the API
+    # (`Status` -> `VersionStatus`, `compression-flate2` ->
+    # `compression-tar-gz`, per-backend features), so mana waits for it to be
+    # stable. Attempted and rejected at task 4.1.
+    #
+    # Quadratic-time duplicate-attribute checking in the XML reader.
     "RUSTSEC-2026-0194",
-    # Same tree and same reasoning: unbounded namespace allocation in the XML
-    # reader under self_update; our only input is our own GitHub release
-    # metadata. Revisit together with the entry above.
+    # Unbounded namespace-declaration allocation in the same reader.
     "RUSTSEC-2026-0195",
 ]
 

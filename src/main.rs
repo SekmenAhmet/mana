@@ -1,20 +1,16 @@
-mod agents;
 mod catalog;
 mod cli;
 mod config;
-mod dependencies;
 mod dispatch;
 mod lock;
 mod log;
 mod mcp;
-mod monitor;
 mod pm;
 mod project;
-mod prompts;
-mod pty;
 mod review;
 mod sentinel;
 mod spawn;
+mod status;
 mod subprocess;
 mod task;
 mod tui;
@@ -29,26 +25,14 @@ fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Install => cli::install::run()?,
         Command::Uninstall { cli } => cli::uninstall::run(&cli)?,
-        Command::Launch(args) => {
-            if let Some(subagent_cli) = &args.subagent {
-                let role = args
-                    .role
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--role is required with --subagent"))?;
-                let assign = args
-                    .assign
-                    .as_deref()
-                    .ok_or_else(|| anyhow::anyhow!("--assign is required with --subagent"))?;
-                cli::launch_subagent::run(subagent_cli, role, assign, &args.params)?;
-            } else if let Some(agent) = &args.agent {
-                cli::launch_pm::run(agent)?;
-            } else {
-                anyhow::bail!(
-                    "usage: mana launch <agent> | mana launch --subagent <cli> --role <role> --assign <task-uuid>"
-                );
-            }
-        }
-        Command::Doctor => cli::doctor::run()?,
+        Command::Launch { agent, resume } => cli::launch_pm::run(agent.as_deref(), resume)?,
+        Command::Ps { all, project } => cli::ps::run(all, project.as_deref())?,
+        Command::Kill {
+            agent_id,
+            all,
+            project,
+        } => cli::kill::run(&agent_id, all, project.as_deref())?,
+        Command::Doctor { project, prune } => cli::doctor::run(project.as_deref(), prune)?,
         Command::Upgrade => cli::upgrade::run()?,
         Command::Dev { command } => cli::dev::run(&command)?,
         Command::McpServer { project_root } => mcp::serve(&project_root)?,

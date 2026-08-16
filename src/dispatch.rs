@@ -38,11 +38,13 @@ const REVIEWER_TEMPLATE: &str = include_str!("../assets/roles/reviewer.md");
 /// concurrency slot forever. A constant rather than a catalogue field on
 /// purpose: no per-CLI measurement disagrees with it yet, and inventing
 /// `[subagent].timeout_minutes` before there is evidence to put in it would
-/// be schema for its own sake.
+/// be schema for its own sake. Stated in prose in assets/roles/executor.md
+/// ("about fifteen minutes") — change both together.
 const EXECUTOR_TIMEOUT: Duration = Duration::from_secs(15 * 60);
 
 /// Reviewing reads a diff and runs the existing tests -- it never writes the
-/// code -- so it gets two thirds of the executor's budget.
+/// code -- so it gets two thirds of the executor's budget. Stated in prose in
+/// assets/roles/reviewer.md ("about ten minutes") — change both together.
 const REVIEWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 /// What mana observed of one sub-agent run. Sub-agents speak no protocol, so

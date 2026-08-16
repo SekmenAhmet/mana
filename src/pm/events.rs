@@ -448,7 +448,7 @@ mod golden {
     /// this path is a test double except the project directory.
     #[test]
     fn a_recorded_agy_turn_executes_its_block_through_the_sentinel() {
-        use crate::sentinel::Sentinel;
+        use crate::sentinel::{Sentinel, ToolLine};
 
         let tmp = tempfile::tempdir().unwrap();
         let sentinel = Sentinel::new(
@@ -470,7 +470,13 @@ mod golden {
         // The first turn of the working run: a call, and a sentence of prose
         // that the operator sees without the block in the middle of it.
         let outcome = sentinel.handle(&answers(AGY_SESSION)[0]);
-        assert_eq!(outcome.log, ["[mana] tool: list_agents -> ok"]);
+        assert_eq!(
+            outcome.log,
+            [ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false
+            }]
+        );
         assert!(
             outcome
                 .prose
@@ -496,7 +502,13 @@ mod golden {
         // ...after which the very next turn was well-formed, across five
         // lines, and ran.
         let outcome = sentinel.handle(&guessed[2]);
-        assert_eq!(outcome.log, ["[mana] tool: list_agents -> ok"]);
+        assert_eq!(
+            outcome.log,
+            [ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false
+            }]
+        );
         assert_eq!(outcome.prose, "");
     }
 }

@@ -1,11 +1,12 @@
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
 pub mod dev;
 pub mod doctor;
 pub mod install;
+pub mod kill;
 pub mod launch_pm;
-pub mod launch_subagent;
+pub mod ps;
 pub mod uninstall;
 pub mod upgrade;
 
@@ -22,10 +23,53 @@ pub enum Command {
     Install,
     /// Remove a CLI agent
     Uninstall { cli: String },
-    /// Launch an agent in PM mode, or a sub-agent with --subagent
-    Launch(LaunchArgs),
-    /// Diagnose the configuration
-    Doctor,
+    // One argument and no roles: sub-agents are never launched from a shell.
+    // The PM dispatches them through mana's own tool channel
+    // (`launch_subagent`, design §5), which is what lets mana pick the CLI and
+    // model, own the worktree and observe the run. v1's
+    // `mana launch --subagent <cli> --role <role> --assign <uuid>` was the
+    // shell-out protocol that made all three impossible; it is gone, and this
+    // comment is not a doc comment so the rationale stays out of `--help`.
+    /// Launch a CLI agent in PM mode
+    Launch {
+        /// CLI agent to launch in PM mode (e.g. claude). Optional only with
+        /// --continue, which falls back to the last CLI launched in this
+        /// project.
+        agent: Option<String>,
+        /// Resume this project's previous PM conversation instead of starting
+        /// a fresh one
+        #[arg(long = "continue", short = 'c')]
+        resume: bool,
+    },
+    /// List the sub-agents mana has dispatched
+    Ps {
+        /// Report on every project under ~/.mana/projects, not just this one
+        #[arg(long)]
+        all: bool,
+        /// Project directory to report on (default: the working directory)
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
+    /// Kill a running sub-agent, by its agent id or an unambiguous prefix
+    Kill {
+        /// Agent id from `mana ps`, or any unambiguous prefix of one
+        agent_id: String,
+        /// Search every project under ~/.mana/projects, not just this one
+        #[arg(long)]
+        all: bool,
+        /// Project directory to search (default: the working directory)
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+    },
+    /// Diagnose the catalogue, this project and the configuration
+    Doctor {
+        /// Project directory to report on (default: the working directory)
+        #[arg(long, value_name = "PATH")]
+        project: Option<PathBuf>,
+        /// Remove worktrees left behind by dispatches that are no longer running
+        #[arg(long)]
+        prune: bool,
+    },
     /// Update mana
     Upgrade,
     /// Developer scaffolding for the v2 pipeline. Hidden because its surface
@@ -53,24 +97,6 @@ pub enum Command {
     },
 }
 
-#[derive(Args)]
-pub struct LaunchArgs {
-    /// CLI agent to launch in PM mode (e.g. claude). Absent if --subagent is used.
-    pub agent: Option<String>,
-
-    #[arg(long)]
-    pub subagent: Option<String>,
-
-    #[arg(long)]
-    pub role: Option<String>,
-
-    #[arg(long)]
-    pub assign: Option<String>,
-
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-    pub params: Vec<String>,
-}
-
 /// clap's generated `help` subcommand only understands `mana help <cmd>`.
 /// `mana help.md` also documents `mana <cmd> help` as valid — this rewrites
 /// a trailing `help` token to the front so both forms parse identically.
@@ -93,6 +119,34 @@ pub fn normalize_help_invocation(args: Vec<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn launch(args: &[&str]) -> (Option<String>, bool) {
+        match Cli::parse_from(args).command {
+            Command::Launch { agent, resume } => (agent, resume),
+            _ => panic!("not a launch"),
+        }
+    }
+
+    /// The four shapes of `mana launch`, pinned: the CLI is optional *only*
+    /// because `-c` can supply it from this project's state, and both spellings
+    /// of the flag mean the same thing.
+    #[test]
+    fn launch_takes_an_optional_cli_and_a_continue_flag() {
+        assert_eq!(
+            launch(&["mana", "launch", "claude"]),
+            (Some("claude".into()), false)
+        );
+        assert_eq!(
+            launch(&["mana", "launch", "claude", "-c"]),
+            (Some("claude".into()), true)
+        );
+        assert_eq!(
+            launch(&["mana", "launch", "--continue", "claude"]),
+            (Some("claude".into()), true)
+        );
+        assert_eq!(launch(&["mana", "launch", "-c"]), (None, true));
+        assert_eq!(launch(&["mana", "launch"]), (None, false));
+    }
 
     #[test]
     fn normalize_help_invocation_rewrites_trailing_help() {

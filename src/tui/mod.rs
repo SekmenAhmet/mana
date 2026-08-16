@@ -10,3 +10,4 @@ pub mod app;
 pub mod event;
 pub mod graph;
 pub mod render;
+pub mod theme;

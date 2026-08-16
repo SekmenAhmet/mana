@@ -99,6 +99,21 @@ pub struct Pm {
     /// that is all mana can do there.
     #[serde(default)]
     pub permission_args: Vec<String>,
+    /// Argv that resumes the CLI's previous conversation in this directory,
+    /// appended after `args` when the session is started with
+    /// `mana launch --continue`. Empty (the default, so every existing file
+    /// keeps its meaning -- schema stays 1) for a CLI with no such flag, and
+    /// `mana launch -c` then refuses rather than silently opening a fresh
+    /// session under a name that promised otherwise.
+    ///
+    /// Read by the long-lived drivers, which have exactly one argv per
+    /// session. The other two resume differently and ignore it: an
+    /// `oneshot-continue` entry already carries `continue_args`, and resuming
+    /// there means *starting* from that template rather than from
+    /// `first_args`; `acp` resumes inside the protocol (`session/load`) with a
+    /// session id mana stored, and has no argv to add a flag to.
+    #[serde(default)]
+    pub resume_args: Vec<String>,
     /// `oneshot-continue` only: the first turn of a session.
     pub first_args: Option<Vec<String>>,
     /// `oneshot-continue` only: every turn after the first.
