@@ -9,6 +9,15 @@ pub struct ProjectPaths {
 }
 
 pub fn mana_home() -> anyhow::Result<PathBuf> {
+    // The explicit override comes first: dirs 6 resolves the Windows home
+    // through the Known Folder API and ignores USERPROFILE/HOME, so an env
+    // redirect of the whole profile no longer moves ~/.mana there. MANA_HOME
+    // relocates exactly the directory mana owns — which is also the only
+    // hermetic way the CLI tests can point a spawned mana at a fixture home
+    // on every platform.
+    if let Some(dir) = std::env::var_os("MANA_HOME").filter(|v| !v.is_empty()) {
+        return Ok(PathBuf::from(dir));
+    }
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot resolve home directory"))?;
     Ok(home.join(".mana"))
 }

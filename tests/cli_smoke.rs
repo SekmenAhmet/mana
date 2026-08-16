@@ -38,8 +38,10 @@ fn ps_on_an_unknown_project_exits_zero() {
         .unwrap()
         .args(["ps", "--project"])
         .arg(&project)
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+        // MANA_HOME rather than a HOME/USERPROFILE redirect: dirs 6 resolves
+        // the Windows home through the Known Folder API and ignores the env,
+        // so only mana's own override is hermetic on every platform.
+        .env("MANA_HOME", home.path().join(".mana"))
         .output()
         .unwrap();
 
@@ -67,8 +69,10 @@ fn doctor_exits_one_when_a_registered_binary_is_gone() {
     let output = Command::cargo_bin("mana")
         .unwrap()
         .arg("doctor")
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+        // MANA_HOME rather than a HOME/USERPROFILE redirect: dirs 6 resolves
+        // the Windows home through the Known Folder API and ignores the env,
+        // so only mana's own override is hermetic on every platform.
+        .env("MANA_HOME", home.path().join(".mana"))
         .output()
         .unwrap();
 
@@ -85,8 +89,10 @@ fn doctor_exits_zero_on_a_home_with_nothing_registered() {
     let output = Command::cargo_bin("mana")
         .unwrap()
         .arg("doctor")
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+        // MANA_HOME rather than a HOME/USERPROFILE redirect: dirs 6 resolves
+        // the Windows home through the Known Folder API and ignores the env,
+        // so only mana's own override is hermetic on every platform.
+        .env("MANA_HOME", home.path().join(".mana"))
         .output()
         .unwrap();
 
@@ -107,8 +113,10 @@ fn kill_with_an_unknown_id_fails() {
         .unwrap()
         .args(["kill", "does-not-exist", "--project"])
         .arg(&project)
-        .env("HOME", home.path())
-        .env("USERPROFILE", home.path())
+        // MANA_HOME rather than a HOME/USERPROFILE redirect: dirs 6 resolves
+        // the Windows home through the Known Folder API and ignores the env,
+        // so only mana's own override is hermetic on every platform.
+        .env("MANA_HOME", home.path().join(".mana"))
         .output()
         .unwrap();
 
