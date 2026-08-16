@@ -180,16 +180,21 @@ irm https://github.com/SekmenAhmet/mana/releases/latest/download/mana-installer.
 ### First run
 
 ```sh
-mana install                 # register the catalogued CLIs found on this machine
+mana doctor                  # what mana can see on this machine
 mana launch claude           # run Claude Code as the PM, in mana's TUI
 ```
 
-`mana install` only offers CLIs the catalogue actually knows about — currently
-claude, agy, copilot, opencode. A CLI with no catalogue entry has no spawn
-flags, no failure signatures, and no PM driver, so registering it would only
-add a name to `list_agents` that every dispatch then fails on. Add support for
-another CLI by dropping an entry into `~/.mana/catalog.local.toml`.
-`mana uninstall <cli>` removes a previously registered CLI again.
+There is no registration step. mana resolves every CLI on `PATH` at the moment
+it needs it, so a CLI installed halfway through a session is usable without
+restarting anything, and mana can never believe in a binary that has since
+moved. `mana doctor` reports what that lookup currently finds.
+
+mana can only drive CLIs the catalogue knows about — currently claude, agy,
+copilot, opencode. A CLI with no entry has no spawn flags, no failure
+signatures and no PM driver, so a name alone would only be a name every
+dispatch then fails on. Add one by dropping an entry into
+`~/.mana/catalog.local.toml`; set its `bin` to an absolute path there if you
+need to pin a specific binary rather than take whatever `PATH` offers.
 
 ## Usage
 
@@ -317,13 +322,11 @@ Reports, per catalogued CLI: whether its binary is on `PATH` and its version,
 its PM driver and tool channel, its models (static or discovered live), its
 quota pools and failure signatures, any pair currently on cooldown, and every
 capability it lacks (no auto-approve flag, no allowlist, a concurrency cap).
-Then the project's dispatch counters, anything still running or stale,
-leftover worktrees, and the config file. The exit code is `1` for exactly
-three conditions — a *registered* CLI whose binary vanished, a stale
-dispatch, or a config file mana cannot read — and `0` for everything else
-(an uninstalled-but-catalogued CLI, an active cooldown, a leftover worktree
-are all reported and still exit clean), so `mana doctor | grep BROKEN` is a
-meaningful check.
+Then the project's dispatch counters, anything still running or stale, and
+leftover worktrees. The exit code is `1` for a stale dispatch and `0` for
+everything else (a catalogued CLI that is not installed, an active cooldown,
+a leftover worktree are all reported and still exit clean), so
+`mana doctor | grep BROKEN` is a meaningful check.
 
 ### `mana upgrade`
 

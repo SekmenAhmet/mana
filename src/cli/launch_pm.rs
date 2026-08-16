@@ -838,10 +838,12 @@ fn resolve_cli(paths: &ProjectPaths, agent_cli: Option<&str>, resume: bool) -> R
 
 /// What mana remembers about a project between launches.
 ///
-/// Deliberately not in `~/.mana/config.toml`: this is per-project cache, it is
-/// written by mana and read by mana, and losing it costs one extra word on a
-/// command line. Anything unreadable is therefore treated as absent rather than
-/// as an error -- a launch must not fail over a cache.
+/// Per-project cache, written by mana and read by mana: losing it costs one
+/// extra word on a command line. Anything unreadable is therefore treated as
+/// absent rather than as an error -- a launch must not fail over a cache. That
+/// rule is why mana keeps no global registry of resolved CLIs at all: a cache
+/// nobody may fail on is a cache nobody may trust, so resolution happens live
+/// (`CliMeta::resolve`) and only genuinely per-project state is stored.
 #[derive(Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct ProjectState {
     /// The CLI the last session that started successfully was run on.

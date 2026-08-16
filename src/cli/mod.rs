@@ -3,11 +3,9 @@ use std::path::PathBuf;
 
 pub mod dev;
 pub mod doctor;
-pub mod install;
 pub mod kill;
 pub mod launch_pm;
 pub mod ps;
-pub mod uninstall;
 pub mod upgrade;
 
 #[derive(Parser)]
@@ -19,10 +17,6 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Command {
-    /// Register a CLI agent
-    Install,
-    /// Remove a CLI agent
-    Uninstall { cli: String },
     // One argument and no roles: sub-agents are never launched from a shell.
     // The PM dispatches them through mana's own tool channel
     // (`launch_subagent`, design §5), which is what lets mana pick the CLI and
@@ -61,7 +55,7 @@ pub enum Command {
         #[arg(long, value_name = "PATH")]
         project: Option<PathBuf>,
     },
-    /// Diagnose the catalogue, this project and the configuration
+    /// Diagnose the catalogue and this project
     Doctor {
         /// Project directory to report on (default: the working directory)
         #[arg(long, value_name = "PATH")]
