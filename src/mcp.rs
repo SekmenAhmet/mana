@@ -41,7 +41,7 @@ pub(crate) mod routing;
 // drift apart.
 pub(crate) mod runs;
 
-use crate::catalog::{Catalog, CliEntry, CostClass};
+use crate::catalog::{Catalog, CliEntry, CostClass, FailureMeans};
 use crate::dispatch::{self, DispatchOutcome};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
@@ -60,7 +60,7 @@ use runs::{Notification, RunRecord};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 
 /// The user's catalogue escape valve (design §7). Read from the same place
 /// every other command reads it; a missing file is normal.
@@ -243,9 +243,17 @@ struct InFlightSlot {
 
 impl Drop for InFlightSlot {
     fn drop(&mut self) {
-        if let Ok(mut counts) = self.counts.lock()
-            && let Some(count) = counts.get_mut(&self.cli)
-        {
+        // Poisoning is ignored here and at the one other lock site, deliberately.
+        // A thread that panics while holding this mutex poisons it for the life
+        // of the process, so honouring the `Err` would defeat exactly the case
+        // this guard was written for: the slot would never be given back, every
+        // later `launch_subagent` on that CLI would be refused with "wait for a
+        // [mana] completion notification", and no such notification can ever
+        // arrive because there is no dispatch behind the phantom slot. Nothing
+        // is being protected by refusing: the map holds counters, and no panic
+        // can leave one half-written.
+        let mut counts = self.counts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(count) = counts.get_mut(&self.cli) {
             *count = count.saturating_sub(1);
         }
     }
@@ -435,20 +443,22 @@ impl ManaTools {
             .expect("the resolver only ever returns a catalogued id")
             .clone();
 
-        // The id the PM is handed is minted here because the dispatcher's own
-        // id does not exist until the process is spawned -- which is after this
-        // call has to have returned. The registry keeps its own; the two are
-        // joined by (task_id, role), and this is the one that appears in
-        // `notifications.jsonl` so the PM sees the id it was given.
+        // The id the PM is handed is minted here because the tool call has to
+        // return one before the process it names exists. The dispatcher is then
+        // given *this* id rather than minting a second one of its own: it is
+        // what the registry record carries, what names the log file, and what
+        // comes back in `notifications.jsonl` -- so the string the PM repeats to
+        // a human is the string `mana ps` and `mana kill` accept.
         let agent_id = uuid::Uuid::new_v4().to_string();
 
         // Reserve the concurrency slot before spawning the thread: checking
         // after would leave a window where two calls both pass the limit.
+        // Poisoning is discarded for the reason given on `InFlightSlot::drop`.
         let slot = {
             let mut counts = self
                 .in_flight
                 .lock()
-                .map_err(|_| internal_msg("concurrency state poisoned"))?;
+                .unwrap_or_else(PoisonError::into_inner);
             let count = counts.entry(entry.cli.id.clone()).or_insert(0);
             let max = entry.subagent.max_concurrent;
             if max != 0 && *count >= max {
@@ -500,10 +510,25 @@ impl ManaTools {
                     "unknown task {task_id:?} -- use the id create_task returned"
                 )));
             }
-            return Err(invalid(format!(
-                "no verdict for task {task_id} yet -- launch a reviewer on it, \
-                 or wait for the one already running to finish"
-            )));
+            // Three states, not two. "Launch a reviewer" is right for a task no
+            // reviewer has touched, and wrong -- expensively -- for one where a
+            // reviewer already ran and wrote nothing: that dispatch is paid for,
+            // and `dispatch_reviewer` deletes any verdict it finds before it
+            // starts, so an unthinking relaunch can also destroy a good verdict
+            // from an earlier attempt before spending the money.
+            return Err(invalid(match last_reviewer_outcome(&paths, task_id) {
+                Some(outcome) => format!(
+                    "a reviewer has already run on task {task_id} and left no verdict at \
+                     {} ({outcome}). It has been paid for; relaunching the same one is \
+                     likely to end the same way -- send the retry to a different model, \
+                     or read the executor's diff and decide yourself",
+                    path.display()
+                ),
+                None => format!(
+                    "no verdict for task {task_id} yet -- launch a reviewer on it, \
+                     or wait for the one already running to finish"
+                ),
+            }));
         }
         let verdict = review::read_verdict(&path).map_err(|error| {
             invalid(format!(
@@ -562,11 +587,13 @@ impl ManaTools {
             })?;
         if !record.succeeded {
             // Reviewing work that never landed costs a real dispatch and can
-            // only report the executor's own failure back.
+            // only report the executor's own failure back. What to do instead
+            // is not decided here: `record.outcome` was written by `describe`,
+            // which knew the cause, and repeating a fixed prescription on top
+            // of it would contradict it every time the cause was not the brief.
             return Err(invalid(format!(
                 "the executor for task {task_id} did not finish cleanly ({}), so \
-                 there is nothing to review -- fix the brief and relaunch the \
-                 executor",
+                 there is nothing to review",
                 record.outcome
             )));
         }
@@ -610,15 +637,20 @@ impl BackgroundDispatch {
             Role::Executor
         };
 
+        // The id the PM was handed travels down with the assignment, so the
+        // registry record, the log file, the notification and the run record
+        // all name the same dispatch.
+        let assignment = dispatch::Assignment {
+            agent_id: &self.agent_id,
+            entry: &self.entry,
+            model: &self.model,
+            task: &self.task,
+            project_root: &self.project_root,
+            mana_home: &self.mana_home,
+        };
+
         let outcome = match &self.worktree {
-            None => dispatch::dispatch_executor(
-                &self.entry,
-                &self.model,
-                &self.task,
-                &self.project_root,
-                &self.mana_home,
-            )
-            .map(|run| {
+            None => dispatch::dispatch_executor(&assignment).map(|run| {
                 let summary = describe(&run.outcome);
                 let record = RunRecord {
                     task_id: task_id.clone(),
@@ -639,16 +671,24 @@ impl BackgroundDispatch {
                     Err(error) => format!("{summary} (mana could not record the run: {error:#})"),
                 }
             }),
-            Some(worktree) => dispatch::dispatch_reviewer(
-                &self.entry,
-                &self.model,
-                &self.task,
-                &self.project_root,
-                &self.mana_home,
-                worktree,
-                None,
-            )
-            .map(|run| describe(&run.outcome)),
+            Some(worktree) => dispatch::dispatch_reviewer(&assignment, worktree, None).map(|run| {
+                let summary = describe(&run.outcome);
+                // A reviewer that exits 0 without writing its verdict is the
+                // failure `review.rs` names as the likeliest one there is, and
+                // reporting only the exit code hides it completely: the PM
+                // reads "exit 0", calls `get_review`, is told nothing has been
+                // reviewed, and buys a second identical dispatch. The verdict
+                // is the deliverable, so it is what the notification reports.
+                match review::read_verdict(&run.review_path) {
+                    Ok(_) => summary,
+                    Err(error) => format!(
+                        "{summary} -- but it left no usable verdict ({error:#}), and that \
+                         dispatch is already paid for. Relaunching the same reviewer will \
+                         most likely repeat it: send the retry to a different model, or \
+                         read the diff yourself"
+                    ),
+                }
+            }),
         };
 
         let outcome = match outcome {
@@ -671,25 +711,77 @@ impl BackgroundDispatch {
     }
 }
 
-/// One line describing a finished run: what happened, how long it took, and
-/// the failure signature if the catalogue recognised one.
+/// What the PM is told a finished dispatch did, and what to do about it.
+///
+/// The single place an outcome becomes words the PM acts on: it is the
+/// notification line, and it is also `RunRecord::outcome`, which is what
+/// `reviewable_worktree` quotes back when a reviewer is refused. The PM spends
+/// a real turn -- and a real dispatch -- on whatever this sentence tells it, so
+/// the fact comes from `dispatch::describe` and the advice from `next_step`,
+/// which reads the cause instead of assuming one.
 fn describe(outcome: &DispatchOutcome) -> String {
-    let status = if outcome.timed_out {
-        "timed out".to_string()
-    } else {
-        match outcome.exit_code {
-            Some(code) => format!("exit {code}"),
-            None => "killed by a signal".to_string(),
-        }
-    };
-    let failure = outcome
-        .failure_means
-        .map(|means| format!(", {}", dispatch::failure_wire_name(means)))
-        .unwrap_or_default();
-    format!(
-        "{status} in {:.1}s{failure}",
-        outcome.duration.as_secs_f64()
-    )
+    match next_step(outcome) {
+        Some(step) => format!("{} -- {step}", dispatch::describe(outcome)),
+        None => dispatch::describe(outcome),
+    }
+}
+
+/// The remedy that fits the cause, or `None` when the run needs no remedy.
+///
+/// "Fix the brief and relaunch the executor" used to be the answer to every
+/// failure, including the two it cannot possibly help with: no edit to a brief
+/// refills an exhausted quota pool, and none of it fits fifteen minutes of work
+/// into a budget the last attempt already blew. Following that advice costs a
+/// full paid dispatch into the same wall, and the PM will follow it -- so each
+/// cause states its own next move, and quota failures name where the live
+/// cooldown state can actually be read.
+fn next_step(outcome: &DispatchOutcome) -> Option<&'static str> {
+    if outcome.succeeded() {
+        return None;
+    }
+    if outcome.killed {
+        // Not a model failure at all, and nothing here counts against the pair.
+        return Some(
+            "an operator stopped this dispatch on purpose; nothing is wrong with the CLI \
+             or the brief. Relaunch only if the work is still wanted",
+        );
+    }
+    match (outcome.failure_means, outcome.timed_out) {
+        (Some(FailureMeans::QuotaExhausted | FailureMeans::RateLimited), _) => Some(
+            "the quota pool is out, not the brief. mana is resting this (CLI x model) \
+             pair: call list_agents and route the retry to a model with no cooldown \
+             (`mana doctor` lists them) rather than re-sending the same one",
+        ),
+        (Some(FailureMeans::AuthExpired), _) => Some(
+            "this CLI is not logged in, so no relaunch of any brief can succeed until the \
+             operator re-authenticates it (`mana doctor` says which)",
+        ),
+        (None, true) => Some(
+            "it ran out of its wall-clock budget with work still to do. Split the task into \
+             smaller ones, or route it to a faster model -- rewriting the brief alone \
+             changes nothing",
+        ),
+        // A plain non-zero exit with no signature is the one case the brief can
+        // be blamed for, and the only one this advice was ever right about.
+        (None, false) => Some("fix the brief and relaunch the executor"),
+    }
+}
+
+/// What the last reviewer dispatch on this task reported, if one ever finished.
+///
+/// Read back out of `notifications.jsonl` rather than from a record of its own:
+/// a reviewer writes no `RunRecord` (that file is the executor → reviewer
+/// handoff), and inventing a second state file to answer one question would be
+/// a second thing to keep in sync. A reviewer still running has not notified
+/// yet, so `None` correctly covers both "never launched" and "still working".
+fn last_reviewer_outcome(paths: &ProjectPaths, task_id: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(runs::notifications_path(paths)).ok()?;
+    contents
+        .lines()
+        .rev()
+        .filter_map(|line| serde_json::from_str::<Notification>(line).ok())
+        .find(|notification| notification.role == Role::Reviewer && notification.task_id == task_id)
+        .map(|notification| notification.outcome)
 }
 
 /// Which catalogued CLIs are actually on this machine. Resolved on every call
@@ -736,10 +828,6 @@ fn invalid(message: String) -> ErrorData {
 /// A failure the PM can do nothing about -- mana could not read or write its
 /// own state. Worded so the user, who sees it in the transcript, knows it is
 /// not their prompt that was wrong.
-fn internal_msg(message: &str) -> ErrorData {
-    ErrorData::internal_error(message.to_string(), None)
-}
-
 fn internal(error: &anyhow::Error, doing: &str) -> ErrorData {
     ErrorData::internal_error(format!("mana failed while {doing}: {error:#}"), None)
 }
@@ -1269,6 +1357,62 @@ mod tests {
         assert!(error.message.contains("unknown task"), "{}", error.message);
     }
 
+    /// A reviewer that ran and wrote nothing is not a task waiting for its
+    /// first reviewer, and the two need opposite advice: "launch a reviewer on
+    /// it" here is an instruction to pay a second time for a dispatch that
+    /// already happened, on a prompt that already failed.
+    #[test]
+    fn get_review_does_not_prescribe_relaunching_a_reviewer_that_already_ran() {
+        let fixture = Fixture::new();
+        let task_id = fixture.create("Some task", "brief", None);
+        ensure_project_structure(&fixture.paths).unwrap();
+
+        // An executor notification must not be mistaken for a review: the task
+        // is still waiting for its first reviewer.
+        let notify = |role: Role, outcome: &str| {
+            runs::notify(
+                &fixture.paths,
+                &Notification {
+                    ts: crate::log::now_iso8601(),
+                    task_id: task_id.clone(),
+                    role,
+                    agent_id: "agent-1".to_string(),
+                    outcome: outcome.to_string(),
+                },
+            )
+            .unwrap();
+        };
+        notify(Role::Executor, "exit 0 in 41.0s");
+        let error = fixture
+            .tools
+            .get_review_impl(TaskRef {
+                task_id: task_id.clone(),
+            })
+            .unwrap_err();
+        assert!(
+            error.message.contains("launch a reviewer on it"),
+            "{}",
+            error.message
+        );
+
+        notify(
+            Role::Reviewer,
+            "exit 0 in 312.4s -- but it left no usable verdict",
+        );
+        let error = fixture
+            .tools
+            .get_review_impl(TaskRef { task_id })
+            .unwrap_err();
+        assert!(error.message.contains("already run"), "{}", error.message);
+        // The evidence: what that paid dispatch actually reported.
+        assert!(error.message.contains("312.4s"), "{}", error.message);
+        assert!(
+            !error.message.contains("launch a reviewer on it"),
+            "{}",
+            error.message
+        );
+    }
+
     #[test]
     fn get_review_returns_the_verdict_and_who_it_counts_against() {
         let fixture = Fixture::new();
@@ -1381,6 +1525,110 @@ mod tests {
             error.message.contains("exit 2 in 3.4s"),
             "{}",
             error.message
+        );
+    }
+
+    fn outcome(
+        exit_code: Option<i32>,
+        timed_out: bool,
+        killed: bool,
+        failure_means: Option<FailureMeans>,
+    ) -> DispatchOutcome {
+        DispatchOutcome {
+            agent_id: "agent-1".to_string(),
+            exit_code,
+            timed_out,
+            killed,
+            duration: Duration::from_secs(12),
+            failure_means,
+            stdout: String::new(),
+            stderr: String::new(),
+            log_path: PathBuf::from("/tmp/logs/agent-1.jsonl"),
+            bookkeeping_error: None,
+        }
+    }
+
+    /// The sentence the PM acts on, cause by cause. Every line here is followed
+    /// by a real turn and usually by a real paid dispatch, so what matters is
+    /// not that the wording changed but that each cause gets the move that can
+    /// actually help it -- and does not get the three that cannot.
+    #[test]
+    fn each_cause_of_failure_gets_the_next_step_that_fits_it() {
+        // Nothing went wrong, so nothing is prescribed.
+        assert_eq!(
+            describe(&outcome(Some(0), false, false, None)),
+            "exit 0 in 12.0s"
+        );
+
+        let killed = describe(&outcome(None, false, true, None));
+        assert!(killed.starts_with("killed by `mana kill`"), "{killed}");
+        assert!(killed.contains("on purpose"), "{killed}");
+        assert!(!killed.contains("fix the brief"), "{killed}");
+
+        for means in [FailureMeans::RateLimited, FailureMeans::QuotaExhausted] {
+            let quota = describe(&outcome(Some(1), false, false, Some(means)));
+            assert!(quota.contains("quota pool is out"), "{quota}");
+            // Where the live state is, since the retry has to route around it.
+            assert!(quota.contains("list_agents"), "{quota}");
+            assert!(quota.contains("mana doctor"), "{quota}");
+            assert!(!quota.contains("fix the brief"), "{quota}");
+        }
+
+        let auth = describe(&outcome(
+            Some(1),
+            false,
+            false,
+            Some(FailureMeans::AuthExpired),
+        ));
+        assert!(auth.contains("not logged in"), "{auth}");
+        assert!(!auth.contains("fix the brief"), "{auth}");
+
+        let timeout = describe(&outcome(None, true, false, None));
+        assert!(timeout.starts_with("timed out in"), "{timeout}");
+        assert!(timeout.contains("Split the task"), "{timeout}");
+        assert!(!timeout.contains("fix the brief"), "{timeout}");
+
+        // The one failure a brief can be blamed for keeps the original advice.
+        let broken = describe(&outcome(Some(1), false, false, None));
+        assert!(
+            broken.contains("fix the brief and relaunch the executor"),
+            "{broken}"
+        );
+    }
+
+    /// The drop guard exists so a panicking dispatch cannot permanently eat a
+    /// concurrency slot -- but a panic *poisons* the mutex, and the guard used
+    /// to give up silently on the `Err`. The slot then had no dispatch behind
+    /// it, so the refusal it caused ("wait for a [mana] completion
+    /// notification") named a wait that could never end.
+    #[test]
+    fn a_slot_is_given_back_even_after_a_panic_poisoned_the_counts() {
+        let counts: Arc<Mutex<HashMap<String, u32>>> = Arc::new(Mutex::new(HashMap::new()));
+        counts.lock().unwrap().insert("fixture".to_string(), 1);
+
+        let poisoner = Arc::clone(&counts);
+        let panicked = std::thread::spawn(move || {
+            let _held = poisoner.lock().unwrap();
+            panic!("a dispatch thread died holding the counts");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert!(
+            counts.lock().is_err(),
+            "the fixture did not poison the lock"
+        );
+
+        drop(InFlightSlot {
+            counts: Arc::clone(&counts),
+            cli: "fixture".to_string(),
+        });
+        assert_eq!(
+            counts
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .get("fixture"),
+            Some(&0),
+            "the phantom slot survived the guard"
         );
     }
 
@@ -1794,6 +2042,27 @@ url = "https://example.invalid/fixture"
         assert_eq!(registry.records.len(), 1);
         assert_eq!(registry.records[0].task_id, task_id);
         assert_eq!(registry.records[0].model, "cheapo");
+
+        // The id handed to the PM is the id `mana ps` and `mana kill` resolve
+        // against. It used to be a second uuid that matched no dispatch at all,
+        // so a PM reporting "executor 3691ad20 is running" was giving the user
+        // a string no mana command accepts.
+        assert_eq!(registry.records[0].agent_id, launched.agent_id);
+        assert_eq!(run.agent_id, launched.agent_id);
+        assert!(
+            crate::status::dispatches_in(&repo.mana_home, "project")
+                .unwrap()
+                .iter()
+                .any(|dispatch| dispatch.record.agent_id == launched.agent_id),
+            "the id the PM was given is not one `mana ps` can find"
+        );
+        // ...and it names the log file, which is what `mana kill` appends to.
+        assert!(
+            paths
+                .logs
+                .join(format!("{}.jsonl", launched.agent_id))
+                .exists()
+        );
     }
 
     #[test]

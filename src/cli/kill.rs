@@ -21,9 +21,13 @@
 //!
 //! One consequence worth knowing: if the mana process that spawned the
 //! sub-agent is still alive, it will notice the death and append *its* own
-//! exit record and notification too. Two notifications for one dispatch, both
-//! true — "killed by `mana kill`" and then "killed by a signal in 12.3s" — is
-//! better than a kill that stayed invisible to the PM.
+//! exit record and notification too. Two notifications for one dispatch is
+//! better than a kill that stayed invisible to the PM, and they now agree:
+//! the `killed` line below is written *before* the signal precisely so the
+//! supervising dispatch finds it and reports the death as this kill rather
+//! than classifying the signal against the catalogue's failure signatures —
+//! see `dispatch::killed_by_operator`. Move that append after the signal and
+//! an operator's kill starts reading as the vendor's quota failure again.
 //!
 //! ## Two callers, one kill
 //!
@@ -283,7 +287,9 @@ fn where_it_looked(scope: &Scope) -> String {
 /// with no code and no timeout looks exactly like any other signalled run, and
 /// six months later "why did this one stop" has to be answerable from the log
 /// itself. `read_last_exit` scans backwards for `action == "exited"`, so the
-/// extra line changes nothing for any reader.
+/// extra line changes nothing for any reader — and it is what the supervising
+/// dispatch reads to tell an operator's kill apart from a vendor cutting the
+/// process off (`dispatch::killed_by_operator`).
 fn record_completion(
     paths: &ProjectPaths,
     dispatch: &Dispatch,

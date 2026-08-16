@@ -60,9 +60,14 @@ const REVIEWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub struct DispatchOutcome {
     pub agent_id: String,
     /// `None` when the process was killed by a signal -- read together with
-    /// `timed_out`.
+    /// `timed_out` and `killed`.
     pub exit_code: Option<i32>,
     pub timed_out: bool,
+    /// `true` when an operator asked for this death: `mana kill`, or the
+    /// session teardown that shares its code path. A signalled process is
+    /// otherwise indistinguishable from one the vendor cut off, and the two
+    /// deserve opposite reactions -- see `run_dispatch`.
+    pub killed: bool,
     pub duration: Duration,
     /// `Some` when one of the catalogue's ordered failure signatures matched
     /// (design §8): the routing signal that puts a pool on cooldown.
@@ -70,6 +75,13 @@ pub struct DispatchOutcome {
     pub stdout: String,
     pub stderr: String,
     pub log_path: PathBuf,
+    /// What mana failed to write down about a run that nevertheless happened,
+    /// already rendered. Carried rather than returned as an error: once the
+    /// process has been spawned the tokens are spent, and a `~/.mana` that
+    /// cannot be written to must not turn a finished, billed dispatch into
+    /// "never started" -- that report buys a second full relaunch for a local
+    /// failure no relaunch can fix.
+    pub bookkeeping_error: Option<String>,
 }
 
 impl DispatchOutcome {
@@ -96,15 +108,40 @@ pub struct ReviewerRun {
     pub review_path: PathBuf,
 }
 
-/// Dispatches `task` to an executor: a fresh worktree, the executor role
+/// Who runs what, and where -- the half of a dispatch both roles agree on.
+///
+/// A struct rather than six positional parameters, for the same reason `Plan`
+/// is one a layer down: four of these are `&str`/`&Path`, and a future edit
+/// that swapped two would compile happily and dispatch the wrong model into the
+/// wrong directory.
+pub struct Assignment<'a> {
+    /// The dispatch's id, minted by the *caller*: `launch_subagent` has to hand
+    /// the PM an id before the process it names exists, and a second id minted
+    /// down here meant the PM announcing (and `mana ps`/`mana kill` refusing) a
+    /// string that matched no dispatch. One id, minted once by whoever has to
+    /// speak about the dispatch first. It goes into the registry record and
+    /// names the log file, so it must be unique per dispatch -- a corrective
+    /// re-dispatch is a new dispatch and mints a new one.
+    pub agent_id: &'a str,
+    pub entry: &'a CliEntry,
+    pub model: &'a str,
+    pub task: &'a Task,
+    pub project_root: &'a Path,
+    pub mana_home: &'a Path,
+}
+
+/// Dispatches the task to an executor: a fresh worktree, the executor role
 /// prompt, and one process observed to completion.
-pub fn dispatch_executor(
-    entry: &CliEntry,
-    model: &str,
-    task: &Task,
-    project_root: &Path,
-    mana_home: &Path,
-) -> Result<ExecutorRun> {
+pub fn dispatch_executor(assignment: &Assignment<'_>) -> Result<ExecutorRun> {
+    let Assignment {
+        agent_id,
+        entry,
+        model,
+        task,
+        project_root,
+        mana_home,
+    } = *assignment;
+
     // The write-role gate (design §9) runs first, before mana creates or
     // writes anything: on a non-git project the user must see "run git init",
     // not whichever git call downstream happened to fail first. `create`
@@ -127,6 +164,7 @@ pub fn dispatch_executor(
     );
 
     let outcome = run_dispatch(Plan {
+        agent_id,
         entry,
         model,
         task_id,
@@ -151,14 +189,19 @@ pub fn dispatch_executor(
 /// `correction` is appended to the prompt, and exists for exactly one caller:
 /// the single corrective re-dispatch after an unusable verdict (plan 1.4).
 pub fn dispatch_reviewer(
-    entry: &CliEntry,
-    model: &str,
-    task: &Task,
-    project_root: &Path,
-    mana_home: &Path,
+    assignment: &Assignment<'_>,
     worktree: &WorktreeInfo,
     correction: Option<&str>,
 ) -> Result<ReviewerRun> {
+    let Assignment {
+        agent_id,
+        entry,
+        model,
+        task,
+        project_root,
+        mana_home,
+    } = *assignment;
+
     let paths = project_paths(project_root, mana_home)?;
     let task_id = &task.frontmatter.id;
     let review_path = paths.reviews.join(format!("{task_id}.json"));
@@ -192,6 +235,7 @@ pub fn dispatch_reviewer(
     }
 
     let outcome = run_dispatch(Plan {
+        agent_id,
         entry,
         model,
         task_id,
@@ -212,6 +256,7 @@ pub fn dispatch_reviewer(
 /// rather than eight positional parameters, since half of them are strings
 /// and swapping two would compile.
 struct Plan<'a> {
+    agent_id: &'a str,
     entry: &'a CliEntry,
     model: &'a str,
     task_id: &'a str,
@@ -234,7 +279,7 @@ fn run_dispatch(plan: Plan<'_>) -> Result<DispatchOutcome> {
     let args = build_argv(plan.entry, plan.model, &plan.prompt, plan.cwd)?;
     let prompt_delivery = PromptDelivery::from_mode(plan.entry.subagent.prompt, &plan.prompt)?;
 
-    let agent_id = uuid::Uuid::new_v4().to_string();
+    let agent_id = plan.agent_id;
     let log_path = plan.paths.logs.join(format!("{agent_id}.jsonl"));
 
     // Resolved here rather than inside the spawner: `which` answers the same
@@ -258,14 +303,14 @@ fn run_dispatch(plan: Plan<'_>) -> Result<DispatchOutcome> {
     // The registry record carries the pid, which exists only once the process
     // does -- hence writing it from `on_spawn` rather than before or after the
     // run. The callback cannot fail the spawn, so its result is carried out
-    // and checked here.
+    // and read here.
     let mut registered: Option<Result<()>> = None;
     let outcome = spawn::run(&spec, |pid| {
         registered = Some(record_start(
             plan.paths,
             &log_path,
             &SubagentRecord {
-                agent_id: agent_id.clone(),
+                agent_id: agent_id.to_string(),
                 cli: plan.entry.cli.id.clone(),
                 model: plan.model.to_string(),
                 role: plan.role.clone(),
@@ -275,12 +320,33 @@ fn run_dispatch(plan: Plan<'_>) -> Result<DispatchOutcome> {
             },
         ));
     })?;
-    if let Some(result) = registered {
-        result.context("recording the dispatch in subagents.jsonl")?;
+
+    // Past this line the process has run: it took a quota slot and it cost
+    // money, whatever mana manages to write about it. Bookkeeping failures are
+    // therefore collected and reported, never `?`-ed -- an unwritable `~/.mana`
+    // used to turn a finished executor into `never started:`, which reads to
+    // the PM as "nothing happened, dispatch it again" and pays for the same
+    // work twice over a local, deterministic failure.
+    let mut unrecorded: Vec<String> = Vec::new();
+    if let Some(Err(error)) = registered {
+        unrecorded.push(format!("registry record: {error:#}"));
     }
 
-    let failure_means = match_signatures(&signatures, &outcome);
-    append_log(
+    // `mana kill` appends a `killed` line to this agent's log *before* it
+    // signals the process group, so the marker is already on disk by the time
+    // the spawner returns. It has to be read before the signatures get a look
+    // in: a signalled run carries no exit code, so it is classified on its
+    // captured output alone, and a CLI that merely printed the words "rate
+    // limit" would have an operator's deliberate kill recorded as the vendor's
+    // quota failure -- resting the busiest pool for an hour and sending the PM
+    // to a pricier model for no reason.
+    let killed = outcome.exit_code.is_none() && !outcome.timed_out && killed_by_operator(&log_path);
+    let failure_means = if killed {
+        None
+    } else {
+        match_signatures(&signatures, &outcome)
+    };
+    if let Err(error) = append_log(
         &log_path,
         &ExitEntry {
             status: Status::Done,
@@ -299,18 +365,77 @@ fn run_dispatch(plan: Plan<'_>) -> Result<DispatchOutcome> {
             output_tokens: None,
             failure_means: failure_means.map(|means| failure_wire_name(means).to_string()),
         },
-    )?;
+    ) {
+        unrecorded.push(format!("exit record: {error:#}"));
+    }
 
     Ok(DispatchOutcome {
-        agent_id,
+        agent_id: agent_id.to_string(),
         exit_code: outcome.exit_code,
         timed_out: outcome.timed_out,
+        killed,
         duration: outcome.duration,
         failure_means,
         stdout: outcome.stdout,
         stderr: outcome.stderr,
         log_path,
+        bookkeeping_error: (!unrecorded.is_empty()).then(|| unrecorded.join("; ")),
     })
+}
+
+/// Whether an operator asked for this dispatch to die.
+///
+/// The marker is the `killed` action `cli::kill` appends to the agent's own log
+/// on the way to the signal -- the same file, because `agent_id` is now one id
+/// end to end. Read from disk rather than passed in memory because the killer
+/// is usually a *different* process (`mana kill`, or the teardown at the end of
+/// a PM session) than the one supervising the run.
+///
+/// An unreadable log answers "no": guessing "deliberate" for a death mana
+/// cannot account for would suppress a real quota signature, and that is the
+/// expensive direction to be wrong in.
+fn killed_by_operator(log_path: &Path) -> bool {
+    let Ok(contents) = std::fs::read_to_string(log_path) else {
+        return false;
+    };
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<LogEntry>(line).ok())
+        .any(|entry| entry.action == "killed")
+}
+
+/// One line of fact about a finished run: what happened, how long it took, the
+/// failure signature if the catalogue recognised one, and anything mana failed
+/// to write down about it.
+///
+/// Lives here, next to the outcome it renders, because both readers must agree:
+/// `mana dev` prints it for a human and `crate::mcp` puts it in front of the PM
+/// (with a cause-matched next step appended). Two copies of this drifted apart
+/// once already -- one of them still called an operator's kill a signal death.
+pub fn describe(outcome: &DispatchOutcome) -> String {
+    let status = if outcome.timed_out {
+        "timed out".to_string()
+    } else if outcome.killed {
+        "killed by `mana kill`".to_string()
+    } else {
+        match outcome.exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "killed by a signal".to_string(),
+        }
+    };
+    let failure = outcome
+        .failure_means
+        .map(|means| format!(", {}", failure_wire_name(means)))
+        .unwrap_or_default();
+    let unrecorded = outcome
+        .bookkeeping_error
+        .as_deref()
+        .map(|error| format!(" (it ran, but mana could not record it -- {error})"))
+        .unwrap_or_default();
+    format!(
+        "{status} in {:.1}s{failure}{unrecorded}",
+        outcome.duration.as_secs_f64()
+    )
 }
 
 /// Writes both "this agent exists" files. Together, because an agent visible
@@ -991,19 +1116,35 @@ mod dispatch_tests {
     use crate::lock::load_registry;
     use std::process::Command;
 
+    /// A fresh dispatch id, the way every caller mints one.
+    fn agent_id() -> String {
+        uuid::Uuid::new_v4().to_string()
+    }
+
+    /// One assignment against the shared fixture, on the one model these tests
+    /// care nothing about.
+    fn assign<'a>(
+        agent_id: &'a str,
+        entry: &'a CliEntry,
+        task: &'a Task,
+        fixture: &'a Fixture,
+    ) -> Assignment<'a> {
+        Assignment {
+            agent_id,
+            entry,
+            model: "cheapo",
+            task,
+            project_root: &fixture.project,
+            mana_home: &fixture.mana_home,
+        }
+    }
+
     /// Runs the executor with a fake CLI whose only distinguishing feature is
     /// its script body -- the shape every test here starts from.
     fn executor_with(fixture: &Fixture, script: &str) -> ExecutorRun {
         let bin = fixture.script("exec-cli", script);
         let entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
-        dispatch_executor(
-            &entry,
-            "cheapo",
-            &task(),
-            &fixture.project,
-            &fixture.mana_home,
-        )
-        .unwrap()
+        dispatch_executor(&assign(&agent_id(), &entry, &task(), fixture)).unwrap()
     }
 
     #[test]
@@ -1095,14 +1236,7 @@ mod dispatch_tests {
             "[[failure]]\nmeans = \"quota_exhausted\"\nexit_codes = [1]\nstdout_regex = \"402\"\ncooldown_minutes = 60\n",
         );
 
-        let run = dispatch_executor(
-            &entry,
-            "cheapo",
-            &task(),
-            &fixture.project,
-            &fixture.mana_home,
-        )
-        .unwrap();
+        let run = dispatch_executor(&assign(&agent_id(), &entry, &task(), &fixture)).unwrap();
 
         assert_eq!(run.outcome.exit_code, Some(1));
         assert!(!run.outcome.succeeded());
@@ -1120,6 +1254,101 @@ mod dispatch_tests {
         assert!(log.contains("\"exit_code\":1"), "{log}");
     }
 
+    /// The incident this guards: killing a reviewer produced "killed by a
+    /// signal in 44.4s, rate_limited" because claude's `rate.?limit` signature
+    /// matched output it had already printed. The PM believed it, told the user
+    /// the vendor had throttled them, and rerouted its retry to a pricier
+    /// model -- and the same path is one line away from a 60-minute cooldown on
+    /// the busiest pool, for a death an operator asked for.
+    #[test]
+    fn an_operators_kill_is_not_read_as_the_vendors_quota_failure() {
+        let fixture = Fixture::new();
+        let agent = agent_id();
+        let log_path = fixture.paths().logs.join(format!("{agent}.jsonl"));
+        // Exactly `mana kill`'s sequence, from inside the process it kills: the
+        // `killed` marker into the agent's own log, then the signal.
+        let bin = fixture.script(
+            "killed-cli",
+            &format!(
+                "echo 'rate limit reached'\n\
+                 printf '%s\\n' '{{\"status\":\"running\",\"action\":\"killed\",\"timestamp\":\"t\"}}' >> '{}'\n\
+                 kill -9 $$\n",
+                log_path.display()
+            ),
+        );
+        let entry = fixture_entry(
+            &bin,
+            PLAIN_SUBAGENT,
+            "[[failure]]\nmeans = \"rate_limited\"\nstdout_regex = \"rate.?limit\"\ncooldown_minutes = 60\n",
+        );
+
+        let run = dispatch_executor(&assign(&agent, &entry, &task(), &fixture)).unwrap();
+
+        assert_eq!(run.outcome.exit_code, None);
+        assert!(run.outcome.killed, "the kill marker was not read");
+        assert_eq!(
+            run.outcome.failure_means, None,
+            "an operator's kill was blamed on the vendor's quota"
+        );
+        let line = describe(&run.outcome);
+        assert!(line.starts_with("killed by `mana kill`"), "{line}");
+        assert!(!line.contains("rate_limited"), "{line}");
+        // ...and nothing in the log can put the pool on a cooldown either --
+        // `Observations::gather` reads exactly this field.
+        let log = std::fs::read_to_string(&run.outcome.log_path).unwrap();
+        assert!(!log.contains("rate_limited"), "{log}");
+    }
+
+    /// A signalled run with no kill marker is still classified: the fix must
+    /// not blind mana to a CLI the vendor really did cut off mid-run.
+    #[test]
+    fn a_signalled_run_nobody_asked_for_is_still_matched_against_the_signatures() {
+        let fixture = Fixture::new();
+        let bin = fixture.script("cut-off-cli", "echo 'rate limit reached'\nkill -9 $$\n");
+        let entry = fixture_entry(
+            &bin,
+            PLAIN_SUBAGENT,
+            "[[failure]]\nmeans = \"rate_limited\"\nstdout_regex = \"rate.?limit\"\n",
+        );
+
+        let run = dispatch_executor(&assign(&agent_id(), &entry, &task(), &fixture)).unwrap();
+
+        assert!(!run.outcome.killed);
+        assert_eq!(run.outcome.failure_means, Some(FailureMeans::RateLimited));
+        assert!(describe(&run.outcome).starts_with("killed by a signal"));
+    }
+
+    /// The run happened and was billed; `~/.mana` failing to write it down is a
+    /// separate, local fact. Reporting it as an error made the whole dispatch
+    /// read as "never started", which costs a second full relaunch.
+    #[test]
+    fn a_finished_run_is_still_a_finished_run_when_mana_cannot_record_it() {
+        let fixture = Fixture::new();
+        let paths = fixture.paths();
+        ensure_project_structure(&paths).unwrap();
+        // `subagents.jsonl` as a directory: the append fails the way an
+        // unwritable `~/.mana` does, and only that append.
+        std::fs::create_dir_all(&paths.subagents_file).unwrap();
+
+        let run = executor_with(&fixture, COMMITTING_EXECUTOR);
+
+        assert!(
+            run.outcome.succeeded(),
+            "a finished executor was turned into a failure"
+        );
+        let error = run
+            .outcome
+            .bookkeeping_error
+            .as_deref()
+            .expect("the lost registry record was never reported");
+        assert!(error.contains("registry record"), "{error}");
+        let line = describe(&run.outcome);
+        assert!(line.starts_with("exit 0 in"), "{line}");
+        assert!(line.contains("could not record"), "{line}");
+        // The work itself is intact: the whole point of not failing here.
+        assert!(run.worktree.path.join("done.txt").exists());
+    }
+
     #[test]
     fn a_failure_with_no_matching_signature_records_no_meaning() {
         let fixture = Fixture::new();
@@ -1130,14 +1359,7 @@ mod dispatch_tests {
             "[[failure]]\nmeans = \"quota_exhausted\"\nexit_codes = [1]\nstdout_regex = \"402\"\n",
         );
 
-        let run = dispatch_executor(
-            &entry,
-            "cheapo",
-            &task(),
-            &fixture.project,
-            &fixture.mana_home,
-        )
-        .unwrap();
+        let run = dispatch_executor(&assign(&agent_id(), &entry, &task(), &fixture)).unwrap();
 
         assert_eq!(run.outcome.exit_code, Some(4));
         assert_eq!(run.outcome.failure_means, None);
@@ -1154,7 +1376,15 @@ mod dispatch_tests {
         std::fs::create_dir_all(&plain).unwrap();
         let entry = fixture_entry("/bin/true", PLAIN_SUBAGENT, "");
 
-        let error = dispatch_executor(&entry, "cheapo", &task(), &plain, &mana_home).unwrap_err();
+        let error = dispatch_executor(&Assignment {
+            agent_id: &agent_id(),
+            entry: &entry,
+            model: "cheapo",
+            task: &task(),
+            project_root: &plain,
+            mana_home: &mana_home,
+        })
+        .unwrap_err();
         assert!(error.to_string().contains("git init"), "{error}");
         assert!(
             !mana_home.exists(),
@@ -1168,14 +1398,7 @@ mod dispatch_tests {
         let bin = fixture.script("exec-cli", "cat\n");
         let entry = fixture_entry(&bin, "args = []\nprompt = \"stdin\"", "");
 
-        let run = dispatch_executor(
-            &entry,
-            "cheapo",
-            &task(),
-            &fixture.project,
-            &fixture.mana_home,
-        )
-        .unwrap();
+        let run = dispatch_executor(&assign(&agent_id(), &entry, &task(), &fixture)).unwrap();
 
         assert_eq!(run.outcome.exit_code, Some(0));
         assert!(run.outcome.stdout.starts_with("You are an executor"));
@@ -1200,11 +1423,7 @@ mod dispatch_tests {
         let entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
 
         let run = dispatch_reviewer(
-            &entry,
-            "cheapo",
-            &task,
-            &fixture.project,
-            &fixture.mana_home,
+            &assign(&agent_id(), &entry, &task, &fixture),
             &executor.worktree,
             None,
         )
@@ -1251,11 +1470,7 @@ mod dispatch_tests {
         let bin = fixture.script("review-cli", "echo reviewed\n");
         let entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
         let run = dispatch_reviewer(
-            &entry,
-            "cheapo",
-            &task,
-            &fixture.project,
-            &fixture.mana_home,
+            &assign(&agent_id(), &entry, &task, &fixture),
             &executor.worktree,
             None,
         )
@@ -1277,11 +1492,7 @@ mod dispatch_tests {
         let bin = fixture.script("review-cli", "printf '%s' \"$1\"\n");
         let entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
         let run = dispatch_reviewer(
-            &entry,
-            "cheapo",
-            &task,
-            &fixture.project,
-            &fixture.mana_home,
+            &assign(&agent_id(), &entry, &task, &fixture),
             &executor.worktree,
             Some("Write ONLY the JSON object."),
         )
@@ -1313,11 +1524,7 @@ mod dispatch_tests {
         let bin = fixture.script("review-cli", "echo 'I wrote nothing'\n");
         let entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
         let run = dispatch_reviewer(
-            &entry,
-            "cheapo",
-            &task,
-            &fixture.project,
-            &fixture.mana_home,
+            &assign(&agent_id(), &entry, &task, &fixture),
             &executor.worktree,
             None,
         )

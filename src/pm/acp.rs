@@ -338,11 +338,22 @@ impl AcpDriver {
     /// The agent is blocked on this reply, so an unanswered request costs a
     /// stalled turn -- never a stalled mana: nothing in the read path waits for
     /// it, and shutdown abandons whatever is still pending.
+    ///
+    /// The id is spent only once the reply is actually out. Removing it first
+    /// read as "one answer per request" and was really "one *attempt* per
+    /// request" (#112): a stdin write that failed left the agent still blocked
+    /// on a reply -- and JSON-RPC has no timeout, as `Decoded::reply` says --
+    /// while every retry was refused with `already answered or cancelled`. The
+    /// double answer this ordering could allow needs the write to both fail
+    /// and have been delivered, which is the one case a blocked agent survives.
     pub fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
-        let request_id =
-            self.pending.lock().unwrap().remove(&id).ok_or_else(|| {
-                anyhow!("permission request {id} was already answered or cancelled")
-            })?;
+        let request_id = self
+            .pending
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| anyhow!("permission request {id} was already answered or cancelled"))?;
         let frame = serde_json::to_string(&json!({
             "jsonrpc": "2.0",
             "id": request_id,
@@ -350,7 +361,9 @@ impl AcpDriver {
         }))
         .expect("a reply built from plain JSON values");
         self.write(&frame)
-            .context("answering the PM's permission request")
+            .context("answering the PM's permission request")?;
+        self.pending.lock().unwrap().remove(&id);
+        Ok(())
     }
 
     /// The session's event stream. Borrowed rather than moved so the driver
@@ -2116,6 +2129,34 @@ done
             format!("{error:#}").contains("already answered"),
             "{error:#}"
         );
+        driver.shutdown().unwrap();
+    }
+
+    /// A reply that never left spent nothing: the agent is still blocked on it,
+    /// so the id it belongs to has to stay answerable (#112). Removing the
+    /// mapping first turned one transient stdin failure into a turn that could
+    /// never end -- every retry refused with "already answered" while the
+    /// agent, on a protocol with no timeout, waited for ever.
+    #[test]
+    fn a_permission_answer_that_never_left_leaves_its_id_answerable() {
+        let fixture = Fixture::new();
+        let mut driver = fixture.driver("ask");
+        driver.send_user("edit the readme").unwrap();
+        let PmEvent::PermissionRequest { id, .. } = next(&driver) else {
+            panic!("the agent's question never reached the interface");
+        };
+
+        // A write that cannot happen while the request is still outstanding --
+        // the shape of the transient EPIPE the fix is about, made deterministic.
+        *driver.stdin.lock().unwrap() = None;
+        let error = format!("{:#}", driver.answer_permission(id, "yes").unwrap_err());
+        assert!(error.contains("session is closed"), "{error}");
+
+        // The retry is refused by the transport, not by a mapping the first
+        // attempt already threw away.
+        let retry = format!("{:#}", driver.answer_permission(id, "yes").unwrap_err());
+        assert!(!retry.contains("already answered"), "{retry}");
+        assert!(driver.pending.lock().unwrap().contains_key(&id));
         driver.shutdown().unwrap();
     }
 

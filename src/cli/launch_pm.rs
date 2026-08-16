@@ -222,16 +222,43 @@ fn finish_session(
             first_line(&queued.text)
         );
     }
+    // Said again, out here: during the session these were lines in a chat pane
+    // that no longer exists, so a session that lost every notification read on
+    // the way out exactly like one that lost nothing (#96).
+    for line in &session.lost {
+        println!("{line}");
+    }
     // Both ways out of the loop lead here, and both mean the same thing for a
     // sub-agent: the process that dispatched it is leaving. Nothing else would
     // ever stop it -- its observer thread died with mana, so it would run to
     // completion writing into logs nobody reads, holding a quota slot and a
     // worktree, and `mana ps` would call it running until someone noticed.
-    for line in sweep_in_flight(home, &session.project, Utc::now()) {
+    let sweep = sweep_in_flight(home, &session.project, Utc::now());
+    for line in &sweep.lines {
         println!("{line}");
     }
     match outcome? {
-        SessionEnd::UserQuit => Ok(()),
+        // The contract a wrapper script can actually use: zero means the
+        // session did everything it was asked to, non-zero means it did not and
+        // the reason is above. A session that told the PM nothing, or that left
+        // paid sub-agents running, is not a clean end and used to be
+        // indistinguishable from one -- every line was a `println!` and `q`
+        // still exited 0.
+        //
+        // Only on this arm because a PM that ended the session explains those
+        // losses better than a count of them does, and that arm already fails.
+        // #95 is about which code it should fail with; if it ever grows a
+        // success case, this guard has to cover that too.
+        SessionEnd::UserQuit if session.lost.is_empty() && sweep.clean => Ok(()),
+        SessionEnd::UserQuit => bail!(
+            "this session ended with {} message(s) that never reached the PM{} -- see above",
+            session.lost.len(),
+            if sweep.clean {
+                ""
+            } else {
+                ", and sub-agents mana could not stop"
+            }
+        ),
         // A PM that died on its own took the session with it, and the only
         // explanation there is arrived on its stderr -- which is now behind a
         // screen the user cannot get back to.
@@ -454,6 +481,15 @@ struct Session {
     /// Saying so is `run`'s job -- silently not queueing would look like a
     /// queue that never fills.
     tracks_turns: bool,
+    /// Every line mana wrote about something that never reached the PM.
+    ///
+    /// The chat pane was the only place these ever went, and the pane dies with
+    /// the alternate screen: a session where nothing at all got through --
+    /// every notification, every typed turn, every permission answer -- ended
+    /// on `q` looking exactly like a clean one, exit code included (#96). Kept
+    /// so `finish_session` can say them again where they survive, and count
+    /// them into the exit status.
+    lost: Vec<String>,
 }
 
 /// One turn waiting its place.
@@ -476,6 +512,15 @@ enum Delivery {
 }
 
 impl Session {
+    /// Records something that never reached the PM, and hands the line back for
+    /// the pane. One call rather than a push next to every `app.push`, so the
+    /// words the operator reads during the session and the ones the exit
+    /// reports afterwards cannot drift apart.
+    fn record_loss(&mut self, message: String) -> String {
+        self.lost.push(message.clone());
+        message
+    }
+
     /// Everything the PM has said since the last call.
     fn drain(&mut self) -> Vec<PmEvent> {
         std::iter::from_fn(|| self.pm.events().try_recv().ok()).collect()
@@ -620,10 +665,10 @@ impl Session {
             // Almost always a PM that just died. Reported where the operator
             // is looking rather than propagated: the `Exited` event ends the
             // session a tick later with a better message than this one.
-            log.push(ToolLine {
-                text: format!("[mana] the tool results never reached the PM: {error:#}"),
-                failed: true,
-            });
+            let text = self.record_loss(format!(
+                "[mana] the tool results never reached the PM: {error:#}"
+            ));
+            log.push(ToolLine { text, failed: true });
         }
         ToolPass {
             prose: Some(outcome.prose),
@@ -754,6 +799,7 @@ fn prepare_session(
         queue: VecDeque::new(),
         turn_open: false,
         tracks_turns,
+        lost: Vec::new(),
     };
     // Through `send_internal` rather than straight down the transport, so the
     // rule holds where it matters most: this message is a briefing mana wrote,
@@ -1100,14 +1146,20 @@ fn resolve_skill_dir(path: &str, home: Option<&Path>, project_root: &Path) -> Pa
 /// them.
 ///
 /// Never fails: this runs on the way out, after the terminal has been restored,
-/// and a session that already ended cannot be failed any harder.
-fn sweep_in_flight(home: &Path, project: &str, now: DateTime<Utc>) -> Vec<String> {
+/// and a session that already ended cannot be failed any harder. It still says
+/// whether it *worked*, because "three sub-agents outlived this session and are
+/// still burning quota" is not something the exit code may hide (#96).
+fn sweep_in_flight(home: &Path, project: &str, now: DateTime<Utc>) -> Sweep {
     let dispatches = match status::dispatches_in(home, project) {
         Ok(dispatches) => dispatches,
         Err(error) => {
-            return vec![format!(
-                "mana: could not read this project's dispatches, so nothing was stopped: {error:#}"
-            )];
+            return Sweep {
+                lines: vec![format!(
+                    "mana: could not read this project's dispatches, so nothing was stopped: \
+                     {error:#}"
+                )],
+                clean: false,
+            };
         }
     };
     let paths = resolve_project_paths(home, project);
@@ -1126,6 +1178,9 @@ fn sweep_in_flight(home: &Path, project: &str, now: DateTime<Utc>) -> Vec<String
         }
     }
 
+    // A spared agent and a failed kill are the same fact for the exit code: a
+    // process mana started is still running, and the operator now owns it.
+    let clean = spared.is_empty() && failed.is_empty();
     let mut lines = Vec::new();
     if !killed.is_empty() {
         lines.push(format!(
@@ -1147,7 +1202,18 @@ fn sweep_in_flight(home: &Path, project: &str, now: DateTime<Utc>) -> Vec<String
     for reason in failed {
         lines.push(format!("mana: could not stop {reason}"));
     }
-    lines
+    Sweep { lines, clean }
+}
+
+/// What the teardown sweep leaves behind: what to print, and whether the
+/// machine was actually left as the session found it.
+struct Sweep {
+    lines: Vec<String>,
+    /// False when a sub-agent outlived the sweep -- refused by the pid guard,
+    /// failed to die, or never even enumerated because the registry would not
+    /// read. A count would say no more than the lines already do; the exit code
+    /// only needs the fact.
+    clean: bool,
 }
 
 /// Follows `notifications.jsonl` from wherever it was when the session
@@ -1386,10 +1452,9 @@ fn run_loop<B: Backend>(
                     app.release_pending();
                 }
                 if let Err(error) = sent {
-                    app.push(
-                        Source::Mana,
-                        &format!("[mana] that turn did not reach the PM: {error:#}"),
-                    );
+                    let line = session
+                        .record_loss(format!("[mana] that turn did not reach the PM: {error:#}"));
+                    app.push(Source::Mana, &line);
                 }
             }
             app.apply(&event);
@@ -1421,10 +1486,10 @@ fn run_loop<B: Backend>(
         let finished = match session.poll_notifications(now) {
             Ok(finished) => finished,
             Err(error) => {
-                app.push(
-                    Source::Mana,
-                    &format!("[mana] could not tell the PM a dispatch finished: {error:#}"),
-                );
+                let line = session.record_loss(format!(
+                    "[mana] could not tell the PM a dispatch finished: {error:#}"
+                ));
+                app.push(Source::Mana, &line);
                 Vec::new()
             }
         };
@@ -1489,10 +1554,10 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
                     Ok(Delivery::Queued) => app.push_pending(Source::User, &message),
                     Err(error) => {
                         app.push(Source::User, &message);
-                        app.push(
-                            Source::Mana,
-                            &format!("[mana] that turn did not reach the PM: {error:#}"),
-                        );
+                        let line = session.record_loss(format!(
+                            "[mana] that turn did not reach the PM: {error:#}"
+                        ));
+                        app.push(Source::Mana, &line);
                     }
                 }
             }
@@ -1535,10 +1600,12 @@ fn answer_permission(allow: bool, app: &mut App, session: &mut Session) {
     let verdict = choice.label.clone();
     match session.answer_permission(pending.id, &choice.id) {
         Ok(()) => app.push(Source::Mana, &format!("[mana] answered: {verdict}")),
-        Err(error) => app.push(
-            Source::Mana,
-            &format!("[mana] that answer did not reach the PM: {error:#}"),
-        ),
+        Err(error) => {
+            let line = session.record_loss(format!(
+                "[mana] that answer did not reach the PM: {error:#}"
+            ));
+            app.push(Source::Mana, &line);
+        }
     }
 }
 
@@ -3104,6 +3171,47 @@ mod smoke {
         assert!(lines[1].contains("did not reach the PM"), "{:?}", lines);
     }
 
+    /// The other half of the same failure (#96): the pane dies with the
+    /// alternate screen, so a delivery failure that only ever rendered there
+    /// did not survive the session that lost it. It has to reach the exit code,
+    /// which is all a script wrapping `mana launch` can see -- and pressing `q`
+    /// on a session that told the PM nothing used to be exit 0.
+    #[test]
+    fn a_lost_turn_outlives_the_session_and_takes_the_exit_code_with_it() {
+        let fixture = Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        session.shutdown().unwrap();
+        session.settle();
+
+        let mut app = App::new(&session.cli_name);
+        app.input = "are you there".to_string();
+        apply_app_event(AppEvent::Enter, &mut app, &mut session);
+        assert_eq!(session.lost.len(), 1, "{:?}", session.lost);
+
+        // `q` -- the clean way out, and still not a clean session.
+        let error = format!(
+            "{:#}",
+            finish_session(&fixture.home, &mut session, &app, Ok(SessionEnd::UserQuit))
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("1 message(s) that never reached the PM"),
+            "{error}"
+        );
+    }
+
+    /// ...and the ordinary session is untouched by that: #96 is about sessions
+    /// that lost something, not about making `q` fail.
+    #[test]
+    fn a_session_that_lost_nothing_still_ends_cleanly() {
+        let fixture = Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        let app = App::new(&session.cli_name);
+        finish_session(&fixture.home, &mut session, &app, Ok(SessionEnd::UserQuit)).unwrap();
+    }
+
     fn pending(options: Vec<crate::pm::PermissionChoice>) -> crate::tui::app::PendingPermission {
         crate::tui::app::PendingPermission {
             id: 1,
@@ -3424,12 +3532,15 @@ mod teardown_tests {
         let mut agent = Sleeper::new(true);
         seed(tmp.path(), "demo", "agent-live", agent.pid());
 
-        let lines = sweep_in_flight(tmp.path(), "demo", Utc::now());
+        let sweep = sweep_in_flight(tmp.path(), "demo", Utc::now());
+        let lines = &sweep.lines;
 
         assert!(
             agent.died(),
             "the sub-agent survived the end of the session"
         );
+        // Everything mana started was stopped, so quitting stays exit 0 (#96).
+        assert!(sweep.clean);
         assert_eq!(lines.len(), 1, "{lines:?}");
         assert!(
             lines[0].contains("killed 1 in-flight agent(s)"),
@@ -3489,9 +3600,13 @@ mod teardown_tests {
         let mut bystander = Sleeper::new(false);
         seed(tmp.path(), "demo", "agent-recycled", bystander.pid());
 
-        let lines = sweep_in_flight(tmp.path(), "demo", Utc::now());
+        let sweep = sweep_in_flight(tmp.path(), "demo", Utc::now());
+        let lines = &sweep.lines;
 
         assert!(bystander.still_running(), "a bystander was signalled");
+        // A process mana started is still running and the operator now owns it:
+        // not a clean end, whatever the pane said (#96).
+        assert!(!sweep.clean);
         assert_eq!(status::probe(bystander.pid()), Liveness::Alive);
         assert_eq!(
             status_of(tmp.path(), "demo", "agent-recycled"),
@@ -3536,7 +3651,11 @@ mod teardown_tests {
     #[test]
     fn a_session_with_nothing_in_flight_says_nothing() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(sweep_in_flight(tmp.path(), "demo", Utc::now()).is_empty());
+        assert!(
+            sweep_in_flight(tmp.path(), "demo", Utc::now())
+                .lines
+                .is_empty()
+        );
 
         // ...and neither does one whose dispatches have all finished: a
         // `done` dispatch is not swept, and nothing is recorded twice.
@@ -3561,6 +3680,8 @@ mod teardown_tests {
             },
         )
         .unwrap();
-        assert!(sweep_in_flight(tmp.path(), "demo", Utc::now()).is_empty());
+        let sweep = sweep_in_flight(tmp.path(), "demo", Utc::now());
+        assert!(sweep.lines.is_empty());
+        assert!(sweep.clean);
     }
 }

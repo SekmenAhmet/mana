@@ -99,7 +99,17 @@ fn drive(
     project_root: &Path,
     mana_home: &Path,
 ) -> Result<Driven> {
-    let executor = dispatch::dispatch_executor(entry, model, task, project_root, mana_home)?;
+    // A fresh id per dispatch: each one is a separate registry record with a
+    // log of its own, and `mana ps`/`mana kill` resolve agents by that id.
+    let executor_id = new_agent_id();
+    let executor = dispatch::dispatch_executor(&dispatch::Assignment {
+        agent_id: &executor_id,
+        entry,
+        model,
+        task,
+        project_root,
+        mana_home,
+    })?;
     if !executor.outcome.succeeded() {
         // No review: there is no reason to pay for a verdict on work that
         // never finished, and the executor's own failure is the finding.
@@ -112,12 +122,16 @@ fn drive(
         });
     }
 
+    let first_review_id = new_agent_id();
     let mut reviewer = dispatch::dispatch_reviewer(
-        entry,
-        model,
-        task,
-        project_root,
-        mana_home,
+        &dispatch::Assignment {
+            agent_id: &first_review_id,
+            entry,
+            model,
+            task,
+            project_root,
+            mana_home,
+        },
         &executor.worktree,
         None,
     )?;
@@ -130,12 +144,19 @@ fn drive(
         Err(error) => {
             retried = true;
             println!("unusable verdict ({error:#}); re-dispatching the reviewer once");
+            // A new id: the corrective run is a second dispatch with a second
+            // registry record and a log of its own, and reusing the first id
+            // would make `mana ps`/`mana kill` see one agent twice.
+            let retry_id = new_agent_id();
             reviewer = dispatch::dispatch_reviewer(
-                entry,
-                model,
-                task,
-                project_root,
-                mana_home,
+                &dispatch::Assignment {
+                    agent_id: &retry_id,
+                    entry,
+                    model,
+                    task,
+                    project_root,
+                    mana_home,
+                },
                 &executor.worktree,
                 Some(&correction(&error, &reviewer.review_path)),
             )?;
@@ -153,6 +174,13 @@ fn drive(
         verdict_error,
         retried,
     })
+}
+
+/// One dispatch id. Minted per dispatch here because `mana dev` is the whole
+/// caller: the MCP path mints its earlier, when it has to answer the PM with an
+/// id before the process exists.
+fn new_agent_id() -> String {
+    uuid::Uuid::new_v4().to_string()
 }
 
 /// The corrective sentence appended to the second reviewer prompt. It repeats
@@ -234,23 +262,13 @@ fn render_summary(driven: &Driven, project_root: &Path) -> String {
     out
 }
 
+/// The shared outcome line plus the one thing only a human at a terminal wants:
+/// the log to open. Everything else comes from `dispatch::describe`, so this
+/// summary and the PM's notification cannot disagree about what a run did.
 fn describe(outcome: &DispatchOutcome) -> String {
-    let status = if outcome.timed_out {
-        "timed out".to_string()
-    } else {
-        match outcome.exit_code {
-            Some(code) => format!("exit {code}"),
-            None => "killed by a signal".to_string(),
-        }
-    };
-    let failure = outcome
-        .failure_means
-        .map(|means| format!(", {}", dispatch::failure_wire_name(means)))
-        .unwrap_or_default();
     format!(
-        "{} in {:.1}s{failure}  log: {}",
-        status,
-        outcome.duration.as_secs_f64(),
+        "{}  log: {}",
+        dispatch::describe(outcome),
         outcome.log_path.display()
     )
 }
