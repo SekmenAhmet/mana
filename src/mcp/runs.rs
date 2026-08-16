@@ -112,11 +112,37 @@ pub fn read_run(paths: &ProjectPaths, task_id: &str) -> Result<Option<RunRecord>
 /// in was inside the write itself, which is why this goes through
 /// `log::append_line` rather than opening the file here — see that function
 /// for what makes a single append atomic and what it rests on.
+///
+/// Says so on stderr as well as returning the error, and that is not
+/// belt-and-braces: the caller this file exists for cannot use the `Result`.
+/// A dispatch is announced from a thread whose tool call returned minutes ago
+/// (`mcp::Dispatch::run`), so there is nobody left to hand a failure to and it
+/// drops it — which made *this* append, the one channel that tells the PM a
+/// dispatch finished, the only failure in the module mana never mentioned
+/// (#72). An executor that ran to completion and was billed would leave the
+/// session waiting for a completion that had already happened, with nothing
+/// anywhere to say why. Reporting once, here, covers every caller instead of
+/// the one the bug was filed against.
+///
+/// stderr because everything else under `~/.mana/projects/<p>/` shares this
+/// file's fate: whatever stopped the append stopped the logs too. On `mana
+/// mcp-server` it is the host CLI that keeps that stream, which is where an
+/// operator hunting a completion that never arrived ends up. Same convention
+/// as `status::dispatches_in`: said out loud exactly once, on stderr, so
+/// nothing on stdout changes shape.
 pub fn notify(paths: &ProjectPaths, notification: &Notification) -> Result<()> {
-    crate::log::append_line(
+    let appended = crate::log::append_line(
         &notifications_path(paths),
         &serde_json::to_string(notification)?,
-    )
+    );
+    if let Err(error) = &appended {
+        eprintln!(
+            "warning: mana could not announce that {} finished for task {} ({error:#}) -- the \
+             PM will never be told, so it may still be waiting on work that is already done",
+            notification.agent_id, notification.task_id
+        );
+    }
+    appended
 }
 
 #[cfg(test)]
@@ -211,5 +237,33 @@ mod tests {
             let notification: Notification = serde_json::from_str(line).unwrap();
             assert_eq!(notification.task_id, "task-1");
         }
+    }
+
+    /// The failure `mcp::Dispatch::run` cannot report (#72): it drops this
+    /// `Result`, so the error has to carry enough to be actionable wherever it
+    /// is finally read, and the warning has to name the dispatch nobody will
+    /// hear about. A directory in the file's place rather than a read-only
+    /// parent, because the tests run as root often enough for a `chmod` to
+    /// prove nothing.
+    #[test]
+    fn a_completion_that_cannot_be_appended_names_the_file_it_was_lost_in() {
+        let (_tmp, paths) = fixture();
+        std::fs::create_dir_all(notifications_path(&paths)).unwrap();
+
+        let error = format!(
+            "{:#}",
+            notify(
+                &paths,
+                &Notification {
+                    ts: "2026-08-15T10:00:00Z".to_string(),
+                    task_id: "task-1".to_string(),
+                    role: Role::Executor,
+                    agent_id: "agent-1".to_string(),
+                    outcome: "exit 0 in 1.0s".to_string(),
+                },
+            )
+            .unwrap_err()
+        );
+        assert!(error.contains("notifications.jsonl"), "{error}");
     }
 }
