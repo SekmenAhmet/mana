@@ -40,7 +40,7 @@
 use crate::lock::{SubagentRecord, load_registry};
 use crate::log::read_last_exit;
 use crate::project::resolve_project_paths;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, TimeDelta, Utc};
 use std::path::Path;
 
@@ -245,6 +245,15 @@ pub fn classify(
 pub fn dispatches_in(mana_home: &Path, project: &str) -> Result<Vec<Dispatch>> {
     let paths = resolve_project_paths(mana_home, project);
     let registry = load_registry(&paths.subagents_file)?;
+    // Every caller of this function is a CLI command (`ps`, `kill`, `doctor`,
+    // and the quit-time sweep), so a corrupt line gets said out loud exactly
+    // once per command, on stderr: the listing on stdout stays pipeable and
+    // the exit code stays whatever the command decided. The TUI's graph pane
+    // does not come through here — it reads the registry directly and would
+    // otherwise repaint this every two seconds over its own screen.
+    for message in &registry.skipped {
+        eprintln!("warning: {message}");
+    }
     registry
         .records
         .into_iter()
@@ -271,8 +280,12 @@ pub fn project_names(mana_home: &Path) -> Result<Vec<String>> {
     };
     let mut names = Vec::new();
     for entry in entries {
-        let entry = entry?;
-        if entry.file_type()?.is_dir() {
+        let entry = entry.with_context(|| format!("listing {}", root.display()))?;
+        if entry
+            .file_type()
+            .with_context(|| format!("reading {}", entry.path().display()))?
+            .is_dir()
+        {
             names.push(entry.file_name().to_string_lossy().into_owned());
         }
     }
@@ -346,6 +359,16 @@ pub fn guard(pid: u32, started_at: &str, now: DateTime<Utc>) -> Guard {
 
     // The group check already passed, so an age check that cannot run does not
     // undo it.
+    //
+    // ponytail: that fallback silently downgrades a two-check `Ours` to a
+    // one-check `Ours` — `elapsed_secs` shells out to `ps`, which can fail for
+    // reasons that have nothing to do with the pid (fork failure under load,
+    // a hardened container with no `ps`), and the caller cannot tell the two
+    // apart. Left as is deliberately: `Guard` is what `mana kill` branches on,
+    // and a third "verified once" arm would put a new prompt in front of every
+    // kill on any box where `ps` is unavailable — worse than the ceiling it
+    // removes. Upgrade path if it ever matters: carry the count of checks that
+    // ran alongside `Ours` and let `kill` decide whether to say so.
     age_check(pid, started_at, now, Guard::Ours)
 }
 
@@ -692,6 +715,33 @@ mod tests {
         assert_eq!(dispatches[1].project, "demo");
     }
 
+    /// `mana ps`, `mana kill` and `mana doctor` all reach the registry through
+    /// here, and all three died on the first unreadable line — including the
+    /// one command whose entire job is to diagnose that state.
+    #[test]
+    fn a_torn_registry_line_does_not_take_the_listing_down_with_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = resolve_project_paths(tmp.path(), "demo");
+        crate::lock::append_record(
+            &paths.subagents_file,
+            &record("agent-1", None, "2026-08-15T10:00:00Z"),
+        )
+        .unwrap();
+        std::fs::write(
+            &paths.subagents_file,
+            format!(
+                "{}{{\"agent_id\":\"agent-2\"\n",
+                std::fs::read_to_string(&paths.subagents_file).unwrap()
+            ),
+        )
+        .unwrap();
+
+        let dispatches = dispatches_in(tmp.path(), "demo").unwrap();
+        assert_eq!(dispatches.len(), 1);
+        assert_eq!(dispatches[0].record.agent_id, "agent-1");
+        assert!(all_dispatches(tmp.path()).is_ok());
+    }
+
     #[test]
     fn a_project_with_no_registry_file_has_no_dispatches() {
         let tmp = tempfile::tempdir().unwrap();
@@ -865,32 +915,37 @@ mod process_tests {
         }
     }
 
+    /// The other half of pid reuse: the pid *is* a group leader (a shell, a
+    /// daemon), but it cannot be ours because it started long after the
+    /// dispatch did.
+    ///
+    /// The refusal only exists when the age lookup answered, and `elapsed_secs`
+    /// shells out to `ps`, which can fail transiently — that is exactly what
+    /// happened on CI run 31952060252, where `guard` fell into its "the age
+    /// check could not run" branch and returned `Ours`. Asserting a refusal
+    /// unconditionally was therefore asserting that `ps` always works. When it
+    /// does not, this test has nothing to conclude and says so rather than
+    /// failing; `recycled_by_age`'s own test covers the decision itself on
+    /// every host, `ps` or no `ps`.
     #[test]
     fn guard_refuses_a_group_leader_younger_than_the_record() {
-        // The other half of pid reuse: the pid *is* a group leader (a shell,
-        // a daemon), but it cannot be ours because it started long after the
-        // dispatch did.
         let sleeper = Sleeper::new(true);
         let long_ago = (Utc::now() - TimeDelta::hours(3)).to_rfc3339();
         match guard(sleeper.pid(), &long_ago, Utc::now()) {
             Guard::NotOurs(reason) => assert!(reason.contains("recycled"), "{reason}"),
-            other => {
-                // Diagnostic for a CI-only failure: show exactly what the
-                // age lookup saw so the platform difference names itself.
-                let ps = std::process::Command::new("ps")
-                    .args(["-o", "etime=", "-p", &sleeper.pid().to_string()])
-                    .output();
-                panic!(
-                    "expected a refusal, got {other:?}; ps probe: {:?}; \
-                     parse_started_at: {:?}",
-                    ps.map(|o| (
-                        o.status.code(),
-                        String::from_utf8_lossy(&o.stdout).into_owned(),
-                        String::from_utf8_lossy(&o.stderr).into_owned(),
-                    )),
-                    parse_started_at(&long_ago),
+            Guard::Ours if elapsed_secs(sleeper.pid()).is_none() => {
+                eprintln!(
+                    "inconclusive: `ps` would not report an age for pid {}, so guard's age \
+                     check did not run",
+                    sleeper.pid()
                 );
             }
+            other => panic!(
+                "expected a refusal, got {other:?}; the age lookup answered {:?} and the \
+                 record parsed as {:?}",
+                elapsed_secs(sleeper.pid()),
+                parse_started_at(&long_ago),
+            ),
         }
     }
 

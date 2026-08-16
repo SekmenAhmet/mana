@@ -22,8 +22,7 @@ use crate::task::Role;
 use crate::worktree::WorktreeInfo;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// What an executor left for the reviewer that comes after it.
 ///
@@ -87,7 +86,8 @@ pub fn notifications_path(paths: &ProjectPaths) -> PathBuf {
 /// history here would just be a second, staler copy of `subagents.jsonl`.
 pub fn write_run(paths: &ProjectPaths, record: &RunRecord) -> Result<()> {
     let path = run_path(paths, &record.task_id);
-    crate::project::create_dir_all(&runs_dir(paths))?;
+    let dir = runs_dir(paths);
+    crate::project::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let line = serde_json::to_string(record)?;
     crate::project::write(&path, line).with_context(|| format!("writing {}", path.display()))
 }
@@ -108,22 +108,15 @@ pub fn read_run(paths: &ProjectPaths, task_id: &str) -> Result<Option<RunRecord>
 
 /// Appends one line and nothing else -- same reasoning as `lock::append_record`:
 /// several dispatch threads finish independently, and an append-only file has
-/// no read-modify-write window for them to race in.
+/// no read-modify-write window for them to race in. The window they *did* race
+/// in was inside the write itself, which is why this goes through
+/// `log::append_line` rather than opening the file here — see that function
+/// for what makes a single append atomic and what it rests on.
 pub fn notify(paths: &ProjectPaths, notification: &Notification) -> Result<()> {
-    append_line(
+    crate::log::append_line(
         &notifications_path(paths),
         &serde_json::to_string(notification)?,
     )
-}
-
-fn append_line(path: &Path, line: &str) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        crate::project::create_dir_all(parent)?;
-    }
-    let mut file =
-        crate::project::open_append(path).with_context(|| format!("opening {}", path.display()))?;
-    writeln!(file, "{line}")?;
-    Ok(())
 }
 
 #[cfg(test)]

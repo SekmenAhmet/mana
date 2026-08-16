@@ -7,6 +7,7 @@
 //! for exactly this (TOML where the markdown world defaults to YAML), so a
 //! reader who has seen frontmatter before does not have to be told.
 
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -70,15 +71,36 @@ pub fn render_task_file(task: &Task) -> anyhow::Result<String> {
 }
 
 pub fn read_task(path: &Path) -> anyhow::Result<Task> {
-    let contents = std::fs::read_to_string(path)?;
+    // The path travels with the error (#117), and `read_failure_is_missing`
+    // below still works through it: `anyhow`'s `downcast_ref` walks the whole
+    // chain, so wrapping the io error in context does not hide its kind.
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     parse_task_file(&contents)
+}
+
+/// Whether a `read_task` failure was "there is no such file" rather than
+/// "there is one and mana could not read it".
+///
+/// The two need different words in front of the PM, which is why the
+/// distinction is drawn here and not by an `exists()` check at each call site:
+/// an absent task is one to create, a corrupt one is a file to repair. Telling
+/// the PM to `create_task` over a corrupt file mints a *second* id, leaves the
+/// broken file in place, and leaves every task that depends on the old id
+/// pointing at something no dispatch can ever read.
+pub fn read_failure_is_missing(error: &anyhow::Error) -> bool {
+    error
+        .downcast_ref::<std::io::Error>()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
 }
 
 pub fn write_task(path: &Path, task: &Task) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        crate::project::create_dir_all(parent)?;
+        crate::project::create_dir_all(parent)
+            .with_context(|| format!("creating {}", parent.display()))?;
     }
-    crate::project::write(path, render_task_file(task)?)?;
+    crate::project::write(path, render_task_file(task)?)
+        .with_context(|| format!("writing {}", path.display()))?;
     Ok(())
 }
 
@@ -186,5 +208,20 @@ Prompt content.
         write_task(&path, &task).unwrap();
         let read_back = read_task(&path).unwrap();
         assert_eq!(read_back, task);
+    }
+
+    /// "I could not read this" must never be reported as "this does not
+    /// exist": the remedy for the second (create it) leaves the first exactly
+    /// as broken, plus one orphan id.
+    #[test]
+    fn a_corrupt_task_file_is_not_a_missing_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("nothing.md");
+        assert!(read_failure_is_missing(&read_task(&absent).unwrap_err()));
+
+        let corrupt = tmp.path().join("corrupt.md");
+        // A file truncated mid-frontmatter: present, parseable as nothing.
+        std::fs::write(&corrupt, "+++\nid = \"uuid-1\"\ntit").unwrap();
+        assert!(!read_failure_is_missing(&read_task(&corrupt).unwrap_err()));
     }
 }

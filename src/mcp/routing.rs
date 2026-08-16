@@ -132,20 +132,39 @@ impl Observations {
             let Some(exit) = last_exit(&log_path)? else {
                 continue;
             };
-            let Some(means) = exit.failure_means.as_deref().and_then(cooling_means) else {
+            // `failure_means` is only ever written for a failure, and every
+            // name in it came from `failure_wire_name` -- so a name this build
+            // cannot map is a record from another mana (or a catalogue edited
+            // since), not a clean exit. It rests the pool for the default hour:
+            // the wrong guess costs a wait, whereas letting it through costs a
+            // real paid dispatch into a quota the log says is gone. Only
+            // `auth_expired` is deliberately let through, because waiting never
+            // logs anyone back in.
+            let Some(wire) = exit.failure_means.as_deref() else {
                 continue;
             };
-            // An unparseable timestamp is a log mana cannot reason about; a
-            // cooldown that started at an unknown time is not one to enforce.
-            let Ok(failed_at) = DateTime::parse_from_rfc3339(&exit.timestamp) else {
+            if wire == failure_wire_name(FailureMeans::AuthExpired) {
                 continue;
-            };
+            }
+            let means = cooling_means(wire);
+
+            // A cooldown mana cannot date is still a cooldown. Dropping it is
+            // the failure mode that spends money, so the fallback walks to the
+            // next timestamp mana wrote itself -- the dispatch's own start,
+            // minutes before the failure at worst -- and only then to `now`.
+            // `now` is the one that cannot expire while the bad line is still
+            // the last exit; the PM can still name that pair explicitly, which
+            // bypasses cooldowns by design.
+            let failed_at = utc(&exit.timestamp)
+                .or_else(|| utc(&record.started_at))
+                .unwrap_or(now);
 
             let entry = entries.iter().find(|entry| entry.cli.id == record.cli);
-            let minutes = entry.map_or(DEFAULT_COOLDOWN_MINUTES, |entry| {
-                cooldown_minutes(entry, means)
-            });
-            let until = failed_at.with_timezone(&Utc) + TimeDelta::minutes(minutes);
+            let minutes = match (entry, means) {
+                (Some(entry), Some(means)) => cooldown_minutes(entry, means),
+                _ => DEFAULT_COOLDOWN_MINUTES,
+            };
+            let until = failed_at + TimeDelta::minutes(minutes);
             if until <= now {
                 continue;
             }
@@ -469,6 +488,15 @@ fn cooled_models(entry: &CliEntry, model: &str) -> Vec<String> {
             .collect(),
         _ => vec![model.to_string()],
     }
+}
+
+/// One of mana's own timestamps, if it is one. `None` is "mana wrote this and
+/// cannot read it back", which is a fact the caller has to decide about rather
+/// than a value to default.
+fn utc(stamp: &str) -> Option<DateTime<Utc>> {
+    DateTime::parse_from_rfc3339(stamp)
+        .ok()
+        .map(|at| at.with_timezone(&Utc))
 }
 
 fn cooling_means(wire: &str) -> Option<FailureMeans> {
@@ -1100,12 +1128,18 @@ pool_scope = "per-model""#,
         }
 
         fn exit(&self, agent_id: &str, at: DateTime<Utc>, failure_means: Option<&str>) {
+            self.exit_stamped(agent_id, &at.to_rfc3339(), failure_means);
+        }
+
+        /// The same, with the timestamp written verbatim -- the only way to
+        /// exercise a record mana cannot date.
+        fn exit_stamped(&self, agent_id: &str, timestamp: &str, failure_means: Option<&str>) {
             append_log(
                 &self.paths.logs.join(format!("{agent_id}.jsonl")),
                 &ExitEntry {
                     status: Status::Done,
                     action: "exited".to_string(),
-                    timestamp: at.to_rfc3339(),
+                    timestamp: timestamp.to_string(),
                     exit_code: Some(i32::from(failure_means.is_some())),
                     duration_ms: Some(1000),
                     input_tokens: None,
@@ -1241,6 +1275,44 @@ pool_scope = "per-model""#,
         assert!(
             observations.cooldown_until("alpha", "mini").is_none(),
             "waiting does not log anyone back in"
+        );
+    }
+
+    /// A cooldown mana cannot date is still a cooldown: dropping it is what
+    /// costs money, because the next dispatch pays to rediscover the wall.
+    #[test]
+    fn an_unparseable_exit_timestamp_does_not_clear_the_cooldown() {
+        let fixture = Fixture::new();
+        let entries = vec![per_model_entry("alpha", "")];
+        fixture.dispatch("a1", "alpha", "mini", "task-1", Role::Executor);
+        fixture.exit_stamped("a1", "yesterday afternoon", Some("quota_exhausted"));
+
+        // Half an hour after the dispatch started -- the stand-in mana falls
+        // back to, and well inside the default hour.
+        let now = utc("2026-08-15T10:30:00Z").unwrap();
+        let observations = Observations::gather(&fixture.paths, &entries, now).unwrap();
+        assert_eq!(
+            observations.cooldown_until("alpha", "mini"),
+            Some(utc("2026-08-15T11:00:00Z").unwrap()),
+            "an undated quota failure must rest the pool from the dispatch's own start"
+        );
+    }
+
+    /// A wire name from a mana that knew more failure meanings than this one.
+    /// Unrecognised is not "fine": the record only exists because a dispatch
+    /// failed, so it rests the pool for the default hour.
+    #[test]
+    fn a_failure_meaning_this_build_cannot_map_still_rests_the_pool() {
+        let fixture = Fixture::new();
+        let entries = vec![per_model_entry("alpha", "")];
+        let now = Utc::now();
+        fixture.dispatch("a1", "alpha", "mini", "task-1", Role::Executor);
+        fixture.exit("a1", now - TimeDelta::minutes(5), Some("region_blocked"));
+
+        let observations = Observations::gather(&fixture.paths, &entries, now).unwrap();
+        assert_eq!(
+            observations.cooldown_until("alpha", "mini"),
+            Some(now - TimeDelta::minutes(5) + TimeDelta::minutes(DEFAULT_COOLDOWN_MINUTES))
         );
     }
 

@@ -577,8 +577,15 @@ impl Session {
     /// operator is waiting for rather than plumbing they have to scroll past.
     fn poll_notifications(&mut self, now: Instant) -> Result<Vec<String>> {
         let mut sent = Vec::new();
-        for notification in self.notifications.poll(now) {
-            let message = notification_message(&notification);
+        for event in self.notifications.poll(now) {
+            // A gap goes out on the same channel as a completion, and that is
+            // the point: "a dispatch finished and mana cannot tell you which"
+            // is a fact the PM has to plan around exactly like the completion
+            // it replaces. Both are one line the operator sees too.
+            let message = match event {
+                TailEvent::Finished(notification) => notification_message(&notification),
+                TailEvent::Gap(message) => message,
+            };
             self.send_internal(&message)?;
             sent.push(message);
         }
@@ -1151,13 +1158,40 @@ fn sweep_in_flight(home: &Path, project: &str, now: DateTime<Utc>) -> Vec<String
 /// replaying it would have the PM chasing tasks somebody closed last week.
 struct NotificationTail {
     path: PathBuf,
-    offset: u64,
+    /// How far into the file this session has read. `None` until mana has
+    /// managed to measure the file at all: a tail that does not know where the
+    /// history ends must not guess zero, because zero means "replay every
+    /// completion this project ever had" (#87).
+    offset: Option<u64>,
     next_poll: Instant,
+}
+
+/// One thing a poll found.
+///
+/// A gap travels with the completions rather than being dropped because it is
+/// news the PM has to act on: mana knows a dispatch finished and cannot say
+/// which. Silently losing it leaves the PM waiting forever on work that is
+/// already done and billed; silently replaying the file to find it again would
+/// buy dozens of turns about tasks closed last week. Saying so is the only
+/// honest third option.
+enum TailEvent {
+    Finished(Notification),
+    Gap(String),
 }
 
 impl NotificationTail {
     fn new(path: PathBuf) -> Self {
-        let offset = std::fs::metadata(&path).map(|meta| meta.len()).unwrap_or(0);
+        let offset = match std::fs::metadata(&path) {
+            Ok(meta) => Some(meta.len()),
+            // Not there yet is the ordinary launch: the first dispatch creates
+            // it, and everything in it will belong to this session.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Some(0),
+            // Anything else (a permission, a racing rotation) and mana does not
+            // know how much history is already in the file. It settles on the
+            // end at the first read that works, rather than take "could not
+            // measure" for "empty" and replay the lot.
+            Err(_) => None,
+        };
         NotificationTail {
             path,
             offset,
@@ -1165,7 +1199,7 @@ impl NotificationTail {
         }
     }
 
-    fn poll(&mut self, now: Instant) -> Vec<Notification> {
+    fn poll(&mut self, now: Instant) -> Vec<TailEvent> {
         if now < self.next_poll {
             return Vec::new();
         }
@@ -1179,19 +1213,38 @@ impl NotificationTail {
     /// file independently, so a read can land mid-write. Everything after the
     /// last newline is left for the next poll, and the offset advances by the
     /// bytes actually consumed -- a partial line is never parsed and never
-    /// skipped. Every failure returns "nothing new": a notification is a
-    /// convenience, and losing the file must not take the session down.
-    fn read_new(&mut self) -> Vec<Notification> {
+    /// skipped. A failure to open or read returns "nothing new": a notification
+    /// is a convenience, and losing the file must not take the session down.
+    /// A file that *shrank*, or a line that will not parse, is different -- the
+    /// offset has already moved past a dispatch nobody will ever hear about, so
+    /// those come back as `Gap` rather than as silence.
+    fn read_new(&mut self) -> Vec<TailEvent> {
         let Ok(mut file) = std::fs::File::open(&self.path) else {
             return Vec::new();
         };
         let length = file.metadata().map(|meta| meta.len()).unwrap_or(0);
-        if length < self.offset {
-            // Truncated or replaced under us: start over rather than seek past
-            // the end and read nothing forever.
-            self.offset = 0;
+        let Some(offset) = self.offset else {
+            // The first measurement mana could take: this session starts here.
+            self.offset = Some(length);
+            return Vec::new();
+        };
+        if length < offset {
+            // Truncated, rotated or restored under us. Rereading from zero was
+            // v2's answer and it is the expensive one: the offset is the only
+            // thing that says which lines are old, so a replay injects every
+            // completion this project ever had as a paid PM turn (#87).
+            self.offset = Some(length);
+            return vec![TailEvent::Gap(format!(
+                "[mana] {} shrank from {offset} to {length} bytes -- it was truncated, rotated \
+                 or restored under this session. mana follows it by byte offset, so it can no \
+                 longer tell which completions are new, and it will not replay the file: that \
+                 would announce dispatches from earlier sessions as fresh work. It resumed at \
+                 the new end. Any dispatch that finished up to now will never be announced -- \
+                 do not wait on one: read its verdict with get_review, or launch it again.",
+                self.path.display(),
+            ))];
         }
-        if length == self.offset || file.seek(SeekFrom::Start(self.offset)).is_err() {
+        if length == offset || file.seek(SeekFrom::Start(offset)).is_err() {
             return Vec::new();
         }
         let mut bytes = Vec::new();
@@ -1202,11 +1255,47 @@ impl NotificationTail {
             return Vec::new();
         };
         let complete = &bytes[..=last_newline];
-        self.offset += complete.len() as u64;
-        String::from_utf8_lossy(complete)
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        self.offset = Some(offset + complete.len() as u64);
+        let mut events = Vec::new();
+        let mut unreadable = Vec::new();
+        for line in String::from_utf8_lossy(complete).lines() {
+            // A blank line is padding, not a lost dispatch: nothing was ever
+            // written there, so there is nothing to report.
+            if line.trim().is_empty() {
+                continue;
+            }
+            match serde_json::from_str(line) {
+                Ok(notification) => events.push(TailEvent::Finished(notification)),
+                // An interleaved write, or a mana of another version. The
+                // dispatch is over and this was its only announcement (#88).
+                Err(error) => unreadable.push((truncated(line), error)),
+            }
+        }
+        // One turn however many lines were lost: a file that came back as
+        // garbage would otherwise bill a PM turn per line. The raw text of the
+        // first goes with it, because it usually still names the task and a PM
+        // that can read the id can act on it.
+        if let Some((line, error)) = unreadable.first() {
+            events.push(TailEvent::Gap(format!(
+                "[mana] {} completion line(s) in {} could not be read ({error}), so mana cannot \
+                 say which dispatches finished. The first, verbatim: {line}. Do not keep waiting \
+                 on a dispatch it may name -- that work is already done: read its verdict with \
+                 get_review, or launch it again.",
+                unreadable.len(),
+                self.path.display(),
+            )));
+        }
+        events
+    }
+}
+
+/// A raw line, kept short enough to be one turn rather than a page: the PM
+/// needs the task id it probably carries, not the whole record.
+fn truncated(line: &str) -> String {
+    const LIMIT: usize = 200;
+    match line.char_indices().nth(LIMIT) {
+        Some((cut, _)) => format!("{}...", &line[..cut]),
+        None => line.to_string(),
     }
 }
 
@@ -2112,6 +2201,28 @@ url = "https://example.invalid/fixture"
         writeln!(file, "{}", serde_json::to_string(notification).unwrap()).unwrap();
     }
 
+    /// The task ids a read announced as finished, and the gaps it had to own
+    /// up to -- every test below cares about exactly one of the two.
+    fn finished(events: &[TailEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TailEvent::Finished(notification) => Some(notification.task_id.as_str()),
+                TailEvent::Gap(_) => None,
+            })
+            .collect()
+    }
+
+    fn gaps(events: &[TailEvent]) -> Vec<&str> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                TailEvent::Gap(message) => Some(message.as_str()),
+                TailEvent::Finished(_) => None,
+            })
+            .collect()
+    }
+
     #[test]
     fn the_tail_reports_only_lines_appended_after_it_started() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2124,10 +2235,28 @@ url = "https://example.invalid/fixture"
 
         append(&path, &notification(Role::Executor, "new-task", "exit 0"));
         let seen = tail.read_new();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].task_id, "new-task");
+        assert_eq!(finished(&seen), ["new-task"]);
         // ...and nothing is reported twice.
         assert!(tail.read_new().is_empty());
+    }
+
+    /// The same guarantee when mana could not measure the file at construction
+    /// time: unknown history is not empty history.
+    #[test]
+    fn a_tail_that_never_measured_the_file_starts_at_its_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("notifications.jsonl");
+        append(&path, &notification(Role::Executor, "old-task", "exit 0"));
+
+        let mut tail = NotificationTail {
+            path: path.clone(),
+            offset: None,
+            next_poll: Instant::now(),
+        };
+        assert!(tail.read_new().is_empty(), "history must not be replayed");
+
+        append(&path, &notification(Role::Executor, "new-task", "exit 0"));
+        assert_eq!(finished(&tail.read_new()), ["new-task"]);
     }
 
     #[test]
@@ -2158,39 +2287,66 @@ url = "https://example.invalid/fixture"
             .open(&path)
             .unwrap();
         writeln!(file, "{rest}").unwrap();
-        assert_eq!(tail.read_new()[0].task_id, "task-1");
+        assert_eq!(finished(&tail.read_new()), ["task-1"]);
     }
 
+    /// The offset has already moved past it, so a line mana cannot parse is a
+    /// dispatch nobody will ever hear about again -- it is reported, raw line
+    /// included, not dropped (#88).
     #[test]
-    fn a_line_that_is_not_a_notification_is_skipped_rather_than_fatal() {
+    fn a_line_that_is_not_a_notification_is_reported_rather_than_dropped() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("notifications.jsonl");
         std::fs::write(&path, "").unwrap();
         let mut tail = NotificationTail::new(path.clone());
 
-        std::fs::write(&path, "{\"half\": \"a record\"}\n").unwrap();
+        std::fs::write(&path, "{\"half\": \"a record\", \"task_id\": \"task-9\"}\n").unwrap();
         append(&path, &notification(Role::Executor, "task-1", "exit 0"));
         let seen = tail.read_new();
-        assert_eq!(seen.len(), 1);
-        assert_eq!(seen[0].task_id, "task-1");
+        assert_eq!(finished(&seen), ["task-1"]);
+        let gaps = gaps(&seen);
+        assert_eq!(gaps.len(), 1, "{gaps:?}");
+        // The file to look in, and the line itself -- which still names the
+        // task the PM was waiting on.
+        assert!(gaps[0].contains("notifications.jsonl"), "{}", gaps[0]);
+        assert!(gaps[0].contains("task-9"), "{}", gaps[0]);
+        assert!(gaps[0].contains("get_review"), "{}", gaps[0]);
+        // One line: it goes into the chat pane as it stands.
+        assert!(!gaps[0].contains('\n'), "{}", gaps[0]);
     }
 
-    /// A file replaced (rather than appended to) leaves the offset past the
-    /// end; reading nothing forever after that would be the worst outcome.
+    /// Truncate, rotate or restore the file mid-session and v2 replayed it
+    /// from zero -- every completion this project ever had, injected as a paid
+    /// PM turn about work closed weeks ago (#87). The tail resumes at the new
+    /// end and says what it can no longer see instead.
     #[test]
-    fn a_truncated_file_is_read_from_the_start_again() {
+    fn a_truncated_file_is_reported_rather_than_replayed() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("notifications.jsonl");
-        append(&path, &notification(Role::Executor, "task-1", "exit 0"));
+        let old = notification(Role::Executor, "old-task", "exit 0");
+        append(&path, &old);
+        append(&path, &notification(Role::Executor, "older-task", "exit 0"));
         let mut tail = NotificationTail::new(path.clone());
 
         // Noticed at the next read, which is the only moment mana looks: the
-        // file is shorter than where the tail had got to.
-        std::fs::write(&path, "").unwrap();
-        assert!(tail.read_new().is_empty());
+        // file is shorter than where the tail had got to. One historical line
+        // survives the rewrite, so a replay would show up as `old-task`.
+        std::fs::write(&path, format!("{}\n", serde_json::to_string(&old).unwrap())).unwrap();
+        let seen = tail.read_new();
+        assert!(
+            finished(&seen).is_empty(),
+            "history was replayed: {:?}",
+            finished(&seen)
+        );
+        let gaps = gaps(&seen);
+        assert_eq!(gaps.len(), 1);
+        assert!(gaps[0].contains("notifications.jsonl"), "{}", gaps[0]);
+        assert!(gaps[0].contains("get_review"), "{}", gaps[0]);
+        assert!(!gaps[0].contains('\n'), "{}", gaps[0]);
 
+        // ...and the tail is live again from there.
         append(&path, &notification(Role::Reviewer, "task-2", "exit 0"));
-        assert_eq!(tail.read_new()[0].task_id, "task-2");
+        assert_eq!(finished(&tail.read_new()), ["task-2"]);
     }
 
     #[test]
