@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 
 /// Default budget for `capture_version_output`: long enough for a real CLI
 /// to answer `--version`, short enough that a hung/unresponsive binary
-/// doesn't block `mana doctor`/`mana install` indefinitely.
+/// doesn't block `mana doctor` indefinitely.
 pub const VERSION_CHECK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Spawns `path` with `version_args`, waits up to `timeout` for it to exit,

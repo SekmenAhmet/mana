@@ -1,6 +1,5 @@
 mod catalog;
 mod cli;
-mod config;
 mod dispatch;
 mod lock;
 mod log;
@@ -23,8 +22,6 @@ fn main() -> anyhow::Result<()> {
     let args = normalize_help_invocation(std::env::args().collect());
     let cli = Cli::parse_from(args);
     match cli.command {
-        Command::Install => cli::install::run()?,
-        Command::Uninstall { cli } => cli::uninstall::run(&cli)?,
         Command::Launch { agent, resume } => cli::launch_pm::run(agent.as_deref(), resume)?,
         Command::Ps { all, project } => cli::ps::run(all, project.as_deref())?,
         Command::Kill {

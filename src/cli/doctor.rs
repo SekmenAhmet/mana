@@ -30,7 +30,6 @@
 
 use crate::catalog::{Catalog, CliEntry, CostClass, PmDriver, PoolScope, QuotaKind, ToolChannel};
 use crate::cli::ps;
-use crate::config::{AgentConfig, Config, config_path, load_config, save_config};
 use crate::log;
 use crate::mcp::routing::Observations;
 use crate::project::{ProjectPaths, mana_home, project_name_from_dir, resolve_project_paths};
@@ -60,19 +59,6 @@ const MODELS_SHOWN: usize = 6;
 
 /// How much of an entry's `notes` the capability hint keeps.
 const NOTE_HINT_CHARS: usize = 100;
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum DoctorIssue {
-    MissingBinary {
-        agent: String,
-        path: String,
-    },
-    OutdatedVersion {
-        agent: String,
-        registered: String,
-        current: String,
-    },
-}
 
 /// What the whole report came to: the lines to print, and the subset of
 /// findings that make the exit code 1.
@@ -206,7 +192,6 @@ pub fn diagnose(options: &Options<'_>) -> Result<Report> {
         project_section(options, paths, name, observations.as_ref(), &mut report)?;
         worktree_section(options, root, name, &mut report)?;
     }
-    config_section(options, &mut report);
     Ok(report)
 }
 
@@ -746,139 +731,6 @@ fn dir_age(path: &Path, now: DateTime<Utc>) -> Option<TimeDelta> {
     Some(now - modified)
 }
 
-// -- config ------------------------------------------------------------------
-
-fn config_section(options: &Options<'_>, report: &mut Report) {
-    let path = config_path(options.mana_home);
-    report.say("");
-    report.say(format!("config -- {}", path.display()));
-
-    let mut config = match load_config(&path) {
-        Ok(config) => config,
-        // v1's leftover `config.yaml`, a hand-edit that no longer parses, a
-        // foreign schema: all three mean mana has no registrations it can act
-        // on, and all three are printed here rather than aborting the report.
-        Err(error) => {
-            report.broken(format!("  BROKEN: {error}"));
-            return;
-        }
-    };
-    if config.models.is_empty() {
-        report.say("  nothing registered -- run `mana install`");
-        return;
-    }
-
-    let issues = diagnose_config(&config);
-    let mut rows = vec![vec![
-        "AGENT".to_string(),
-        "VERSION".into(),
-        "PATH".into(),
-        "STATE".into(),
-    ]];
-    for (name, agent) in &config.models {
-        let state = issues
-            .iter()
-            .find_map(|issue| match issue {
-                DoctorIssue::MissingBinary { agent, .. } if agent == name => {
-                    Some("BINARY MISSING".to_string())
-                }
-                DoctorIssue::OutdatedVersion { agent, current, .. } if agent == name => {
-                    Some(format!("version updated to {current}"))
-                }
-                _ => None,
-            })
-            .unwrap_or_else(|| "ok".to_string());
-        rows.push(vec![
-            name.clone(),
-            agent.version.clone(),
-            agent.path.clone(),
-            state,
-        ]);
-    }
-    for line in status::render_table(&rows) {
-        report.say(format!("  {line}"));
-    }
-
-    let mut changed = false;
-    for issue in &issues {
-        match issue {
-            DoctorIssue::MissingBinary { agent, path } => {
-                report.broken(format!(
-                    "  BROKEN: {agent}'s binary is gone ({path}) -- every dispatch to it fails \
-                     at spawn. {}",
-                    repair_suggestion(issue).unwrap_or_default()
-                ));
-            }
-            // The safe automatic half: mana already knows the right value, so
-            // there is nothing to ask, and a stale version in the config would
-            // only mislead the next reader.
-            DoctorIssue::OutdatedVersion { .. } => changed |= apply_fix(&mut config, issue),
-        }
-    }
-    if changed && let Err(error) = save_config(&path, &config) {
-        report.say(format!("  could not save the refreshed versions: {error}"));
-    }
-}
-
-/// The config-file checks, unchanged from v1 because the question is unchanged:
-/// does the binary this entry names still exist, and does it still print the
-/// version the entry recorded.
-pub fn diagnose_config(config: &Config) -> Vec<DoctorIssue> {
-    let mut issues = Vec::new();
-    for (name, agent) in &config.models {
-        if !Path::new(&agent.path).exists() {
-            issues.push(DoctorIssue::MissingBinary {
-                agent: name.clone(),
-                path: agent.path.clone(),
-            });
-            continue;
-        }
-        if let Ok(current) = current_version(agent)
-            && current != agent.version
-        {
-            issues.push(DoctorIssue::OutdatedVersion {
-                agent: name.clone(),
-                registered: agent.version.clone(),
-                current,
-            });
-        }
-    }
-    issues
-}
-
-fn current_version(agent: &AgentConfig) -> anyhow::Result<String> {
-    capture_version_output(
-        Path::new(&agent.path),
-        &agent.version_args,
-        VERSION_CHECK_TIMEOUT,
-    )
-}
-
-/// Refreshes an outdated version in place. Returns whether anything changed.
-fn apply_fix(config: &mut Config, issue: &DoctorIssue) -> bool {
-    match issue {
-        DoctorIssue::OutdatedVersion { agent, current, .. } => match config.models.get_mut(agent) {
-            Some(entry) => {
-                entry.version = current.clone();
-                true
-            }
-            None => false,
-        },
-        DoctorIssue::MissingBinary { .. } => false,
-    }
-}
-
-/// A missing binary has no safe automatic fix -- mana does not know where the
-/// right one is -- so doctor suggests the repair instead of guessing at one.
-fn repair_suggestion(issue: &DoctorIssue) -> Option<String> {
-    match issue {
-        DoctorIssue::MissingBinary { agent, .. } => Some(format!(
-            "Run `mana install` to re-register '{agent}', or `mana uninstall {agent}` to drop it."
-        )),
-        DoctorIssue::OutdatedVersion { .. } => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1176,144 +1028,6 @@ cooldown_minutes = 30
         let text = joined(&diagnose(&options(tmp.path(), &entries)).unwrap());
         assert!(!text.contains("project '"), "{text}");
         assert!(!text.contains("worktrees --"), "{text}");
-    }
-
-    #[test]
-    fn a_registered_agent_whose_binary_vanished_is_broken() {
-        let tmp = tempfile::tempdir().unwrap();
-        let mut config = Config::default();
-        config.models.insert(
-            "alpha".to_string(),
-            AgentConfig {
-                name: "alpha".into(),
-                version: "1.0".into(),
-                path: "/nonexistent/path/alpha".into(),
-                version_args: vec!["--version".into()],
-            },
-        );
-        save_config(&config_path(tmp.path()), &config).unwrap();
-
-        let entries = entries();
-        let report = diagnose(&options(tmp.path(), &entries)).unwrap();
-        let text = joined(&report);
-        assert!(text.contains("BINARY MISSING"), "{text}");
-        assert!(text.contains("/nonexistent/path/alpha"), "{text}");
-        assert!(text.contains("mana install"), "{text}");
-        assert_eq!(report.exit_code(), 1, "{text}");
-        assert_eq!(report.broken.len(), 1);
-    }
-
-    #[test]
-    fn a_leftover_v1_yaml_config_is_broken_and_the_report_still_prints() {
-        let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(tmp.path()).unwrap();
-        std::fs::write(
-            config_path(tmp.path()).with_extension("yaml"),
-            "models:\n  claude:\n    name: claude\n",
-        )
-        .unwrap();
-
-        let entries = entries();
-        let report = diagnose(&options(tmp.path(), &entries)).unwrap();
-        let text = joined(&report);
-        assert!(text.contains("config.yaml"), "{text}");
-        assert_eq!(report.exit_code(), 1, "{text}");
-        // The catalogue section still ran: an unreadable config must not cost
-        // the user the rest of the diagnosis.
-        assert!(text.contains("catalogue --"), "{text}");
-    }
-
-    #[test]
-    fn an_empty_config_is_reported_and_is_not_broken() {
-        let tmp = tempfile::tempdir().unwrap();
-        let entries = entries();
-        let report = diagnose(&options(tmp.path(), &entries)).unwrap();
-        assert!(joined(&report).contains("nothing registered"));
-        assert_eq!(report.exit_code(), 0);
-    }
-
-    #[test]
-    fn diagnose_config_flags_a_missing_binary() {
-        let mut config = Config::default();
-        config.models.insert(
-            "claude".to_string(),
-            AgentConfig {
-                name: "claude".into(),
-                version: "1.0".into(),
-                path: "/nonexistent/path/claude".into(),
-                version_args: vec!["--version".into()],
-            },
-        );
-        assert_eq!(
-            diagnose_config(&config),
-            vec![DoctorIssue::MissingBinary {
-                agent: "claude".to_string(),
-                path: "/nonexistent/path/claude".to_string(),
-            }]
-        );
-    }
-
-    #[test]
-    fn diagnose_config_reports_no_issues_for_an_empty_config() {
-        assert!(diagnose_config(&Config::default()).is_empty());
-    }
-
-    #[test]
-    fn apply_fix_updates_an_outdated_version_in_place() {
-        let mut config = Config::default();
-        config.models.insert(
-            "claude".to_string(),
-            AgentConfig {
-                name: "claude".into(),
-                version: "1.0.0".into(),
-                path: "/bin/claude".into(),
-                version_args: vec!["--version".into()],
-            },
-        );
-        assert!(apply_fix(
-            &mut config,
-            &DoctorIssue::OutdatedVersion {
-                agent: "claude".to_string(),
-                registered: "1.0.0".to_string(),
-                current: "2.0.0".to_string(),
-            }
-        ));
-        assert_eq!(config.models.get("claude").unwrap().version, "2.0.0");
-    }
-
-    #[test]
-    fn apply_fix_is_a_noop_for_a_missing_binary() {
-        let mut config = Config::default();
-        assert!(!apply_fix(
-            &mut config,
-            &DoctorIssue::MissingBinary {
-                agent: "claude".to_string(),
-                path: "/nonexistent".to_string(),
-            }
-        ));
-    }
-
-    #[test]
-    fn repair_suggestion_offers_install_or_uninstall_for_a_missing_binary() {
-        let suggestion = repair_suggestion(&DoctorIssue::MissingBinary {
-            agent: "claude".to_string(),
-            path: "/nonexistent".to_string(),
-        })
-        .unwrap();
-        assert!(suggestion.contains("mana install"));
-        assert!(suggestion.contains("mana uninstall claude"));
-    }
-
-    #[test]
-    fn repair_suggestion_is_none_for_an_outdated_version() {
-        assert!(
-            repair_suggestion(&DoctorIssue::OutdatedVersion {
-                agent: "claude".to_string(),
-                registered: "1.0.0".to_string(),
-                current: "2.0.0".to_string(),
-            })
-            .is_none()
-        );
     }
 
     #[test]
