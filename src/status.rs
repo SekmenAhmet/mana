@@ -404,7 +404,25 @@ pub fn guard(pid: u32, started_at: &str, now: DateTime<Utc>) -> Guard {
 /// the process's age cannot be read at all — the two platforms differ only in
 /// how much evidence is left standing at that point.
 fn age_check(pid: u32, started_at: &str, now: DateTime<Utc>, unanswerable: Guard) -> Guard {
-    let (Some(elapsed), Some(started)) = (elapsed_secs(pid), parse_started_at(started_at)) else {
+    age_check_with(elapsed_secs(pid), pid, started_at, now, unanswerable)
+}
+
+/// The same, with the age handed in rather than looked up.
+///
+/// The seam exists because the lookup shells out to `ps`, which can fail for
+/// reasons that have nothing to do with the pid -- and a test that re-runs `ps`
+/// to find out what the first call saw is racing the same failure it is trying
+/// to describe. That is not hypothetical: it is what made
+/// `guard_refuses_a_group_leader_younger_than_the_record` flaky on Linux twice.
+/// Handing the age in makes both branches decidable without a syscall.
+fn age_check_with(
+    elapsed: Option<i64>,
+    pid: u32,
+    started_at: &str,
+    now: DateTime<Utc>,
+    unanswerable: Guard,
+) -> Guard {
+    let (Some(elapsed), Some(started)) = (elapsed, parse_started_at(started_at)) else {
         return unanswerable;
     };
     let record_age = (now - started).num_seconds();
@@ -805,6 +823,39 @@ mod tests {
         ]);
         assert_eq!(rendered[1], "dddd");
     }
+    #[test]
+    fn guard_refuses_a_group_leader_younger_than_the_record() {
+        // The age is handed in rather than looked up, and that is the whole
+        // point: this test used to spawn a real process, let `guard` shell out
+        // to `ps`, and then run `ps` a second time to work out what the first
+        // call had seen. The two calls can disagree -- a transient `ps` failure
+        // is exactly the flake this test hit on Linux twice -- so the second
+        // probe was racing the condition it was meant to report. A process one
+        // second old cannot be a dispatch recorded three hours ago, whatever
+        // `ps` is doing at the time.
+        let long_ago = (Utc::now() - TimeDelta::hours(3)).to_rfc3339();
+        match age_check_with(Some(1), 4242, &long_ago, Utc::now(), Guard::Ours) {
+            Guard::NotOurs(reason) => assert!(reason.contains("recycled"), "{reason}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
+    }
+
+    /// The other half of the same seam: when the age cannot be read at all,
+    /// each platform falls back to what it still has standing -- unix has
+    /// already passed the process-group check, Windows has nothing.
+    #[test]
+    fn an_unreadable_age_falls_back_to_what_the_platform_still_knows() {
+        let long_ago = (Utc::now() - TimeDelta::hours(3)).to_rfc3339();
+        assert_eq!(
+            age_check_with(None, 4242, &long_ago, Utc::now(), Guard::Ours),
+            Guard::Ours
+        );
+        let unverified = Guard::Unverified("no creation time".to_string());
+        assert_eq!(
+            age_check_with(None, 4242, &long_ago, Utc::now(), unverified.clone()),
+            unverified
+        );
+    }
 }
 
 #[cfg(all(test, unix))] // every test here spawns and inspects real processes
@@ -927,27 +978,6 @@ mod process_tests {
     /// does not, this test has nothing to conclude and says so rather than
     /// failing; `recycled_by_age`'s own test covers the decision itself on
     /// every host, `ps` or no `ps`.
-    #[test]
-    fn guard_refuses_a_group_leader_younger_than_the_record() {
-        let sleeper = Sleeper::new(true);
-        let long_ago = (Utc::now() - TimeDelta::hours(3)).to_rfc3339();
-        match guard(sleeper.pid(), &long_ago, Utc::now()) {
-            Guard::NotOurs(reason) => assert!(reason.contains("recycled"), "{reason}"),
-            Guard::Ours if elapsed_secs(sleeper.pid()).is_none() => {
-                eprintln!(
-                    "inconclusive: `ps` would not report an age for pid {}, so guard's age \
-                     check did not run",
-                    sleeper.pid()
-                );
-            }
-            other => panic!(
-                "expected a refusal, got {other:?}; the age lookup answered {:?} and the \
-                 record parsed as {:?}",
-                elapsed_secs(sleeper.pid()),
-                parse_started_at(&long_ago),
-            ),
-        }
-    }
 
     #[test]
     fn guard_tolerates_a_record_dated_a_moment_in_the_future() {
