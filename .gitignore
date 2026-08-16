@@ -2,3 +2,7 @@
 
 # hone's per-project learned-filter state is machine-local, not source
 .hone/
+
+# mana writes its own PM skill into the project it is launched in, so running
+# mana on mana regenerates this one. The source of truth is assets/, not here.
+/.claude/skills/mana-pm/

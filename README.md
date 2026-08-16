@@ -435,8 +435,11 @@ README.
 
 v0.1, pre-release: no tag has been pushed yet. Licensed under
 [MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option — use it,
-fork it, contribute to it. (`publish = false` stays for now: crates.io is a
-separate decision from the license.) What is left open, mostly at the edges
+fork it, contribute to it: [CONTRIBUTING.md](CONTRIBUTING.md) is short, and the
+conventions ship as skills under `.claude/skills/`, so an agent you point at
+this repository can open a conforming pull request without being briefed.
+(`publish = false` stays for now: crates.io is a separate decision from the
+license.) What is left open, mostly at the edges
 the design already
 flags as unverified: Windows is covered at the unit level in CI but has no
 end-to-end run yet; copilot's model list needs re-measuring once its monthly
