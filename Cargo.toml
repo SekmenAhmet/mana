@@ -74,7 +74,7 @@ anyhow = "1"
 regex = "1"
 dirs = "6"
 which = "8"
-dialoguer = "0.11"
+dialoguer = "0.12"
 # The MCP server the PM talks to (`mana mcp-server`, design §5). `rmcp` is the
 # official SDK under the modelcontextprotocol org; the alternative
 # (`rust-mcp-sdk`) is a third-party stack with ~1% of the downloads and a
