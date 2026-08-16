@@ -40,10 +40,12 @@
 //!   reason. `start` also refuses upfront when the binary is not on `PATH`, so
 //!   the common case fails the launch instead of the session.
 //!
-//! When a `[[failure]]` signature matcher lands (it is specified for the
-//! sub-agent observer, not for this driver), a quota-shaped exit should become
-//! a `Raw` plus a cooldown rather than a session death. Nothing here needs to
-//! change for that except the one comparison in `run_turns`.
+//! The `[[failure]]` signature matcher exists (`dispatch::match_signatures`)
+//! but is wired to sub-agent dispatches only -- it was specified for the
+//! observer, not for this driver, and nothing here consults it. Pointed at a
+//! PM turn it would make a quota-shaped exit a `Raw` plus a cooldown rather
+//! than a session death; nothing else here needs to change for that except the
+//! one comparison in `run_turns`.
 //!
 //! ## One process at a time
 //!

@@ -185,9 +185,13 @@ pub fn probe(pid: u32) -> Liveness {
 /// the "no tasks match" line tasklist prints instead is prose, and prose in
 /// any language contains no `"1234"`.
 ///
-/// Unmeasured on a real Windows box (v2 ships no Windows CI). Every failure
-/// reads as `Unknown`, so the worst case is a `mana ps` that says it does not
-/// know — never one that claims a dead agent is running.
+/// CI builds and lints this on `windows-latest`, but nothing there runs it:
+/// `probe_refuses_pid_zero_rather_than_signalling_our_own_group` returns before
+/// the `tasklist` call and every test that spawns a real process is in
+/// `process_tests`, which is `#[cfg(all(test, unix))]`. So the parsing below is
+/// unmeasured. Every failure reads as `Unknown`, so the worst case is a
+/// `mana ps` that says it does not know — never one that claims a dead agent is
+/// running.
 #[cfg(windows)]
 pub fn probe(pid: u32) -> Liveness {
     if pid == 0 {

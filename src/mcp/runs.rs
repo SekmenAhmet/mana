@@ -12,10 +12,11 @@
 //!   Recomputing it instead (branch name + path convention + `git merge-base`)
 //!   would be a second source of truth for facts the executor already knew.
 //! - `notifications.jsonl` -- append-only, one line per finished dispatch.
-//!   The PM driver (task 2.3) tails this file and injects `[mana] ...` messages
-//!   into the PM session, which is how the PM learns an executor finished
-//!   without polling. Nothing here reads it back; that consumer does not exist
-//!   yet, and the file has to exist before it can.
+//!   `cli::launch_pm`'s `NotificationTail` follows it and injects `[mana] ...`
+//!   messages into the PM session, which is how the PM learns an executor
+//!   finished without polling. Nothing in *this* module reads it back -- the
+//!   reader lives there, and deserializes through `Notification` below so the
+//!   field names stay one contract rather than two structs free to drift.
 
 use crate::project::ProjectPaths;
 use crate::task::Role;

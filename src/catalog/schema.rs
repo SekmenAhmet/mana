@@ -327,7 +327,11 @@ pub enum FailureMeans {
 pub struct Failure {
     pub means: FailureMeans,
     pub exit_codes: Option<Vec<i32>>,
-    /// Opaque strings for now; matching lands with the sub-agent observer.
+    /// Opaque strings here: `dispatch::compile_signatures` turns them into
+    /// regexes when a dispatch starts, so an unusable pattern fails that
+    /// dispatch rather than the catalogue load. Nothing validates them at
+    /// parse time -- `Catalog::load` only checks that a signature declares at
+    /// least one constraint.
     pub stderr_regex: Option<String>,
     pub stdout_regex: Option<String>,
     /// How long to rest the pool once this signature matches.

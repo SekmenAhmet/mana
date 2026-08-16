@@ -66,11 +66,33 @@ result frames of that session reported 18,245 / 23,296 / 28,835 / 34,765. That
 is the right number for a "session so far" readout and the wrong one to add up.
 
 Print mode denies tool permission requests instead of prompting -- there is no
-human to ask, so `run_command` and `view_file` both came back "User denied
-permission" (and a read under the CLI's own config directory was refused by a
-hardcoded protection rule before the policy was even consulted). That is what
-mechanically keeps this PM from writing code, and it is also why the role text
-has to be inlined -- see [skills] below.
+human to ask, so `run_command`, `grep_search` and `view_file` all came back
+"User denied permission" (and a read under the CLI's own config directory was
+refused by a hardcoded protection rule before the policy was even consulted).
+That is what mechanically keeps this PM from writing code, and it is also why
+the role text has to be inlined -- see [skills] below.
+
+Degraded: the denial is not confined to writes. Reads, tree searches and shell
+are refused the same way, which is everything a PM would use to check
+repository state before writing a brief. Confirmed in black-box QA 2026-08-16,
+where the agy PM said so itself -- "I can't read files from this CLI, so paste
+or describe it and I'll write the brief". A PM on agy works from what the user
+pastes into the chat and nothing else; briefs it writes about existing code are
+only as accurate as that paste. No read-only-approve mode was found on this
+CLI; the only permission flag it has is the all-or-nothing
+`--dangerously-skip-permissions`, which a PM must never be given.
+
+The sentinel channel cannot tell a block the PM meant from one it merely
+quoted (probed 2026-08-16). mana executes every top-level ```mana fence in the
+turn's text; a `mana` fence nested inside another fence is left as prose, but
+text copied verbatim out of a file, an issue or a pasted log carries no such
+wrapper. Asked to quote such a block "as documentation", this PM refused on its
+own reasoning -- "a ```mana block in my output is a live tool call" -- so the
+defence held, but it rests on the skill text, exactly like the no-code rule
+above. The surface is small today: agy is the only sentinel CLI, and it cannot
+read files, so the only text it can quote is what the user pasted in. If it
+ever needs hardening: a per-turn nonce the PM must include, or honouring blocks
+only in a turn that quoted no user-supplied text.
 
 Two parallel dispatches died within 8 seconds, so max_concurrent is 1. The same
 limit is a hazard the PM role cannot see: while agy is the PM, a turn of its own

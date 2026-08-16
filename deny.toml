@@ -3,9 +3,11 @@
 # it blocks what should never ship, whatever the version.
 
 [advisories]
-# RustSec advisories: any known vulnerability in the tree fails the check.
-# Unmaintained crates warn rather than fail; the ones we knowingly carry are
-# listed below with the reason they are still here.
+# RustSec advisories. `version = 2` dropped the per-kind severity knobs: every
+# advisory in the tree fails the check, unmaintained and unsound exactly like a
+# vulnerability. `ignore` below is the only way past one -- which is why an
+# unmaintained crate we knowingly carry has to be listed there, with the reason
+# it is still here, rather than left to warn.
 version = 2
 yanked = "deny"
 # Every entry here is a known, accepted debt with an exit path — not noise to

@@ -51,10 +51,12 @@ const REVIEWER_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 /// this *is* the whole report: everything here is measured from outside the
 /// process.
 ///
-/// `agent_id` and the two captured streams have no live reader yet -- they
-/// are for `mana ps` (task 4.2) and for the usage enrichment that reads a
-/// CLI's structured output -- and are proven by this module's tests in the
-/// meantime, the same way `task.rs` carries schema ahead of its consumer.
+/// `agent_id` and the two captured streams have no reader outside this
+/// module's tests. `mana ps` was the expected one and turned out not to be:
+/// it landed reading the registry and the per-agent JSONL, which outlive the
+/// process, while these die with the `DispatchOutcome`. The one consumer still
+/// plausible is the usage enrichment that would parse a CLI's structured
+/// output; until it exists, the tests are the whole justification.
 #[allow(dead_code)]
 #[derive(Debug)]
 pub struct DispatchOutcome {

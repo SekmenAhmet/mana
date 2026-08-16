@@ -182,10 +182,10 @@ fn worktree_path(mana_home: &Path, project_root: &Path, task_id: &str) -> PathBu
     worktrees_dir(mana_home, &project_name_from_dir(project_root)).join(task_dir_name(task_id))
 }
 
-/// Task ids reach this module from task files and, from phase 2 on, straight
-/// from the PM over MCP — untrusted enough that a `..` or a separator would
-/// otherwise build a path outside the worktree root and a branch name outside
-/// the `mana/` namespace.
+/// Task ids reach this module from task files and, since the MCP server
+/// landed, straight from the PM over MCP — untrusted enough that a `..` or a
+/// separator would otherwise build a path outside the worktree root and a
+/// branch name outside the `mana/` namespace.
 fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
     let acceptable = !task_id.is_empty()
         && task_id

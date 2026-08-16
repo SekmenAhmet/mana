@@ -63,8 +63,7 @@ pub struct ExitEntry {
     pub output_tokens: Option<u64>,
     /// `Some("quota_exhausted")` etc. once the catalogue's ordered failure
     /// signatures (design doc §8) match this run's exit code/stderr/stdout.
-    /// The dispatcher populates this in task 1.3; `counters` already knows
-    /// how to read it.
+    /// `dispatch::run_dispatch` writes it; `counters` below reads it back.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_means: Option<String>,
 }
@@ -163,8 +162,10 @@ pub(crate) fn read_last_exit(path: &Path) -> anyhow::Result<Option<ExitEntry>> {
 /// duration. Deliberately not a synthesized score: design doc §8 is
 /// explicit that with dozens of cells and few tasks, a score can't stay
 /// calibrated, but "4 of 6" lets the PM discount a small sample itself.
-/// `validated`/`rejected` are left out rather than stubbed — they only
-/// exist once reviewer verdicts land in task 1.4.
+/// `validated`/`rejected` are not here: a verdict is a file under `reviews/`,
+/// not a line in an agent's log, so the readers that want it (`mcp::routing`,
+/// `doctor`'s verdicts section) go straight to those files rather than through
+/// this counter.
 #[allow(dead_code)]
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct Counts {
@@ -180,9 +181,9 @@ pub struct Counts {
 /// counter; only `quota_failures` and the duration average need an actual
 /// exit record to say anything.
 ///
-/// Not wired into a live command yet (that's the TUI/MCP `list_agents`
-/// surface, later tasks) — exercised directly by this file's tests for now.
-#[allow(dead_code)]
+/// Live through `mcp::routing::Observations::gather`, which layers reviewer
+/// verdicts on top of these counts and serves both the `list_agents` MCP tool
+/// and `mana doctor`'s counters section — the one place the arithmetic lives.
 pub fn counters(
     logs_dir: &Path,
     registry: &Registry,
