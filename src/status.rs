@@ -53,7 +53,9 @@ pub const SHORT_ID_CHARS: usize = 8;
 /// `guard` calls the pid recycled. Generous on purpose: the only legitimate
 /// sources of a gap are `ps` truncating to whole seconds and the system clock
 /// being stepped (NTP) between the dispatch and now, while wrapping the pid
-/// space takes minutes at the very least.
+/// space takes minutes at the very least. Unix-gated with the only guard
+/// implementation that can measure an age at all.
+#[cfg(unix)]
 const REUSE_TOLERANCE: TimeDelta = TimeDelta::seconds(120);
 
 /// What the operating system says about a pid, without signalling it.
@@ -294,9 +296,13 @@ pub fn all_dispatches(mana_home: &Path) -> Result<Vec<Dispatch>> {
 /// See `guard` for what each answer is worth.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Guard {
-    /// Every check that could run passed.
+    /// Every check that could run passed. Constructed only by the unix
+    /// guard -- Windows has no check to pass, so there it is only matched.
+    #[cfg_attr(windows, allow(dead_code))]
     Ours,
     /// A check failed outright: this pid is somebody else's process.
+    /// Unix-only for the same reason as `Ours`.
+    #[cfg_attr(windows, allow(dead_code))]
     NotOurs(String),
     /// Not a single check could run. The caller may proceed, loudly.
     Unverified(String),
