@@ -220,16 +220,20 @@ impl PersistentChild {
 
     /// The PM's pid. Test-only: nothing in mana registers a PM the way it
     /// registers a sub-agent, so the only callers are the process tests that
-    /// check what a shutdown killed.
-    #[cfg(test)]
+    /// check what a shutdown killed. Gated `unix` as well as `test` because
+    /// those tests exec a shell fixture and so are themselves unix-only --
+    /// a plain `cfg(test)` compiles this on Windows with nobody to call it,
+    /// which `-D warnings` rightly rejects.
+    #[cfg(all(test, unix))]
     pub(super) fn pid(&self) -> u32 {
         self.pid
     }
 
     /// How long `close_and_wait` stays polite. Test-only for the same reason:
     /// no caller has ever wanted a window other than `CLOSE_GRACE`, and the
-    /// tests want one they need not sit five seconds through.
-    #[cfg(test)]
+    /// tests want one they need not sit five seconds through. Same `unix`
+    /// gate as `pid`, and for the same reason.
+    #[cfg(all(test, unix))]
     pub(super) fn set_close_grace(&mut self, grace: Duration) {
         self.close_grace = grace;
     }
