@@ -255,7 +255,7 @@ pub fn resolve(
     if candidates.is_empty() {
         bail!(
             "no installed CLI declares a {} model. Available: {}",
-            class_name(wanted),
+            wanted.word(),
             render_classes(&pool)
         );
     }
@@ -276,7 +276,7 @@ pub fn resolve(
         bail!(
             "every {} model is resting on a quota cooldown: {}. Retry later, or \
              ask for a higher cost_class.",
-            class_name(wanted),
+            wanted.word(),
             candidates
                 .iter()
                 .map(|candidate| {
@@ -506,17 +506,6 @@ fn cooling_means(wire: &str) -> Option<FailureMeans> {
         .find(|means| failure_wire_name(*means) == wire)
 }
 
-/// The name a cost class goes by on the wire and in every message the PM
-/// reads. Spelled here because the catalogue enum is parse-only (`Deserialize`,
-/// no `Serialize`) and the PM skill promises these three words.
-pub fn class_name(class: CostClass) -> &'static str {
-    match class {
-        CostClass::Cheap => "cheap",
-        CostClass::Mid => "mid",
-        CostClass::Expensive => "expensive",
-    }
-}
-
 fn render_classes(entries: &[&CliEntry]) -> String {
     let listed: Vec<String> = [CostClass::Cheap, CostClass::Mid, CostClass::Expensive]
         .into_iter()
@@ -532,7 +521,7 @@ fn render_classes(entries: &[&CliEntry]) -> String {
                         .map(move |model| format!("{}/{}", entry.cli.id, model.id))
                 })
                 .collect();
-            (!models.is_empty()).then(|| format!("{} ({})", class_name(class), models.join(", ")))
+            (!models.is_empty()).then(|| format!("{} ({})", class.word(), models.join(", ")))
         })
         .collect();
     if listed.is_empty() {
@@ -1135,8 +1124,6 @@ pool_scope = "per-model""#,
                     timestamp: timestamp.to_string(),
                     exit_code: Some(i32::from(failure_means.is_some())),
                     duration_ms: Some(1000),
-                    input_tokens: None,
-                    output_tokens: None,
                     failure_means: failure_means.map(str::to_string),
                 },
             )

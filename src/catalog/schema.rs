@@ -99,6 +99,22 @@ pub enum PmDriver {
     OneshotContinue,
 }
 
+impl PmDriver {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(self) -> &'static str {
+        match self {
+            PmDriver::Acp => "acp",
+            PmDriver::Stream => "stream",
+            PmDriver::OneshotContinue => "oneshot-continue",
+        }
+    }
+}
+
 /// How a prompt reaches the process: as an argv element, on stdin, or as a
 /// JSONL frame on stdin.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -205,6 +221,21 @@ pub enum ToolChannel {
     Sentinel,
 }
 
+impl ToolChannel {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(self) -> &'static str {
+        match self {
+            ToolChannel::Mcp => "mcp",
+            ToolChannel::Sentinel => "sentinel",
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct Tools {
@@ -264,6 +295,22 @@ pub enum CostClass {
     Expensive,
 }
 
+impl CostClass {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(self) -> &'static str {
+        match self {
+            CostClass::Cheap => "cheap",
+            CostClass::Mid => "mid",
+            CostClass::Expensive => "expensive",
+        }
+    }
+}
+
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct StaticModel {
@@ -289,6 +336,23 @@ pub enum QuotaKind {
     Unknown,
 }
 
+impl QuotaKind {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(self) -> &'static str {
+        match self {
+            QuotaKind::Requests => "requests",
+            QuotaKind::Tokens => "tokens",
+            QuotaKind::Credits => "credits",
+            QuotaKind::Unknown => "unknown",
+        }
+    }
+}
+
 /// Whether exhausting the pool takes down every model behind it or only the
 /// one that hit the wall -- it decides how wide a cooldown reaches.
 #[derive(Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -296,6 +360,21 @@ pub enum QuotaKind {
 pub enum PoolScope {
     Global,
     PerModel,
+}
+
+impl PoolScope {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(self) -> &'static str {
+        match self {
+            PoolScope::Global => "global",
+            PoolScope::PerModel => "per-model",
+        }
+    }
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]

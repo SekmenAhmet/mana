@@ -43,7 +43,6 @@ use crate::project::{
 };
 use crate::sentinel::{Sentinel, ToolLine};
 use crate::status::{self, DispatchStatus, short};
-use crate::task::Role;
 use crate::tui::app::{App, Source};
 use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, map_key_event};
 use crate::tui::graph::GraphCache;
@@ -113,10 +112,6 @@ const IGNORE_EVERYTHING: &str = "*\n";
 
 /// Per-project memory, written next to the project's tasks and logs.
 const STATE_FILE: &str = "state.toml";
-
-/// The user's catalogue escape valve (design §7), read from the same place
-/// every other command reads it. A missing file is normal.
-const CATALOG_OVERRIDE: &str = "catalog.local.toml";
 
 /// Where mana writes the MCP registration it hands to the PM's CLI.
 const MCP_CONFIG: &str = "mcp-config.json";
@@ -806,7 +801,7 @@ fn prepare_session(
     agent_cli: &str,
     resume: bool,
 ) -> Result<Session> {
-    let catalog = Catalog::load(Some(&home.join(CATALOG_OVERRIDE)))?;
+    let catalog = Catalog::load(Some(&home.join(crate::catalog::CATALOG_OVERRIDE)))?;
     let entry = catalog.get(agent_cli).with_context(|| {
         format!(
             "unknown CLI id '{agent_cli}' -- the catalogue knows: {}",
@@ -1451,19 +1446,10 @@ fn truncated(line: &str) -> String {
 fn notification_message(notification: &Notification) -> String {
     format!(
         "[mana] {} finished for task {}: {}. Decide the next step.",
-        role_word(&notification.role),
+        notification.role.word(),
         notification.task_id,
         notification.outcome
     )
-}
-
-/// The role as the PM knows it -- the same word the `launch_subagent` schema
-/// uses, so a notification reads back in the vocabulary the PM wrote in.
-fn role_word(role: &Role) -> &'static str {
-    match role {
-        Role::Executor => "executor",
-        Role::Reviewer => "reviewer",
-    }
 }
 
 fn run_loop<B: Backend>(
@@ -1690,7 +1676,11 @@ fn answer_permission(allow: bool, app: &mut App, session: &mut Session) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Only the tests build notifications by hand; production reads the role
+    // off the record it was given, so this import lives here rather than at
+    // the top of the file where it would be dead in a release build.
     use crate::catalog::parse_entry;
+    use crate::task::Role;
 
     /// The guard leaves the terminal as it found it, whichever half of its own
     /// entry it got through.
@@ -2530,6 +2520,7 @@ url = "https://example.invalid/fixture"
 #[cfg(all(test, unix))]
 mod smoke {
     use super::*;
+    use crate::task::Role;
     use std::os::unix::fs::PermissionsExt;
 
     pub(super) struct Fixture {
@@ -2623,7 +2614,7 @@ mod smoke {
                 &format!(r#"permission_args = ["--allowedTools", "mcp__mana__*"]{extra_pm}"#),
                 channel,
             );
-            std::fs::write(self.home.join(CATALOG_OVERRIDE), source).unwrap();
+            std::fs::write(self.home.join(crate::catalog::CATALOG_OVERRIDE), source).unwrap();
         }
 
         /// A CLI that cannot read the role off disk, so the activation carries
@@ -2633,7 +2624,7 @@ mod smoke {
             let source =
                 super::tests::entry_source(bin, &[self.skills.to_str().unwrap()], "", "mcp")
                     .replace("dirs = ", "inline_in_activation = true\ndirs = ");
-            std::fs::write(self.home.join(CATALOG_OVERRIDE), source).unwrap();
+            std::fs::write(self.home.join(crate::catalog::CATALOG_OVERRIDE), source).unwrap();
         }
 
         fn paths(&self) -> ProjectPaths {
@@ -3516,6 +3507,7 @@ mod teardown_tests {
     use crate::lock::{SubagentRecord, append_record};
     use crate::log::now_iso8601;
     use crate::status::Liveness;
+    use crate::task::Role;
     use std::process::{Child, Command, Stdio};
 
     /// A stand-in for a dispatched sub-agent, killed on drop so a failing
@@ -3752,8 +3744,6 @@ mod teardown_tests {
                 timestamp: now_iso8601(),
                 exit_code: Some(0),
                 duration_ms: Some(10),
-                input_tokens: None,
-                output_tokens: None,
                 failure_means: None,
             },
         )

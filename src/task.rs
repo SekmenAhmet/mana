@@ -21,6 +21,21 @@ pub enum Role {
     Reviewer,
 }
 
+impl Role {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(&self) -> &'static str {
+        match self {
+            Role::Executor => "executor",
+            Role::Reviewer => "reviewer",
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct TaskFrontmatter {
     pub id: String,

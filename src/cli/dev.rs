@@ -23,10 +23,6 @@ use anyhow::{Context, Result, bail};
 use clap::{Args, Subcommand};
 use std::path::{Path, PathBuf};
 
-/// The user's escape valve (design §7), read from the same place every other
-/// command will read it from. A missing file is normal.
-const CATALOG_OVERRIDE: &str = "catalog.local.toml";
-
 #[derive(Subcommand)]
 pub enum DevCommand {
     /// Run one task file through an executor, then a reviewer, then a verdict
@@ -53,7 +49,7 @@ pub fn run(command: &DevCommand) -> Result<()> {
 
 fn run_task(args: &RunTaskArgs) -> Result<()> {
     let home = mana_home()?;
-    let catalog = Catalog::load(Some(&home.join(CATALOG_OVERRIDE)))?;
+    let catalog = Catalog::load(Some(&home.join(crate::catalog::CATALOG_OVERRIDE)))?;
     let entry = catalog.get(&args.cli).with_context(|| {
         format!(
             "unknown CLI id '{}' -- the catalogue knows: {}",

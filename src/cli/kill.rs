@@ -320,8 +320,6 @@ fn record_completion(
             duration_ms: dispatch
                 .age(now)
                 .and_then(|age| u64::try_from(age.num_milliseconds()).ok()),
-            input_tokens: None,
-            output_tokens: None,
             // Deliberately empty: the catalogue's failure vocabulary is about
             // what a *CLI* did (quota, rate limit, auth), and a cooldown for
             // "the operator pressed kill" would rest a pool for no reason.
@@ -536,8 +534,6 @@ mod tests {
                 timestamp: "2026-08-15T10:05:00Z".into(),
                 exit_code: Some(0),
                 duration_ms: Some(10),
-                input_tokens: None,
-                output_tokens: None,
                 failure_means: None,
             },
         )

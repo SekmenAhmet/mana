@@ -108,7 +108,7 @@ fn row(dispatch: &Dispatch, with_project: bool, now: DateTime<Utc>) -> Vec<Strin
         columns.push(dispatch.project.clone());
     }
     columns.push(dispatch.short_agent().to_string());
-    columns.push(role_word(&record.role).to_string());
+    columns.push(record.role.word().to_string());
     columns.push(format!("{}/{}", record.cli, record.model));
     columns.push(dispatch.short_task().to_string());
     columns.push(match record.pid {
@@ -149,14 +149,6 @@ fn notes(dispatches: &[Dispatch]) -> Vec<String> {
     notes
 }
 
-/// The same word the PM, the notifications and the task frontmatter use.
-fn role_word(role: &crate::task::Role) -> &'static str {
-    match role {
-        crate::task::Role::Executor => "executor",
-        crate::task::Role::Reviewer => "reviewer",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,8 +181,6 @@ mod tests {
                     timestamp: now_iso8601(),
                     exit_code: Some(0),
                     duration_ms: Some(1200),
-                    input_tokens: None,
-                    output_tokens: None,
                     failure_means: None,
                 },
             )

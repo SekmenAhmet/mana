@@ -630,15 +630,13 @@ mod process_tests {
     use super::super::events::fixture;
     use super::tests::{entry, source};
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     /// Writes an executable fake CLI and returns its path.
     fn script(dir: &Path, body: &str) -> String {
-        let path = dir.join("fake-cli");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path.to_string_lossy().into_owned()
+        crate::subprocess::write_executable(dir, "fake-cli", &format!("#!/bin/sh\n{body}\n"))
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn driver(bin: &str, first: &[&str], continued: &[&str]) -> OneshotDriver {

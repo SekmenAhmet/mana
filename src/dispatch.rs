@@ -363,8 +363,6 @@ fn run_dispatch(plan: Plan<'_>) -> Result<DispatchOutcome> {
             // the PM driver's half of the catalogue (`[pm.events].usage`).
             // Sub-agent enrichment is deliberately left for later; absent is
             // honest, zero would not be.
-            input_tokens: None,
-            output_tokens: None,
             failure_means: failure_means.map(|means| failure_wire_name(means).to_string()),
         },
     ) {
@@ -687,7 +685,6 @@ url = "https://example.invalid/fixture"
 pub(crate) mod test_fixture {
     use crate::project::{ProjectPaths, project_name_from_dir, resolve_project_paths};
     use crate::task::{Role, Task, TaskFrontmatter};
-    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use std::process::Command;
 
@@ -760,12 +757,9 @@ echo "executor finished"
         /// Writes an executable fake CLI and returns its absolute path, ready
         /// to be a catalogue entry's `bin`.
         pub fn script(&self, name: &str, body: &str) -> String {
-            let path = self.bin_dir.join(name);
-            std::fs::write(&path, format!("#!/bin/sh\n{body}")).unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-            path.to_string_lossy().into_owned()
+            crate::subprocess::write_executable(&self.bin_dir, name, &format!("#!/bin/sh\n{body}"))
+                .to_string_lossy()
+                .into_owned()
         }
 
         pub fn paths(&self) -> ProjectPaths {
