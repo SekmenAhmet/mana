@@ -18,10 +18,11 @@ latest model"), so they track vendor releases without catalogue edits.
 '''
 
 [cli]
-id           = "claude"
-name         = "Claude Code"
-bin          = "claude"            # optional [cli.bin_overrides] per OS
-version_args = ["--version"]
+id            = "claude"
+name          = "Claude Code"
+bin           = "claude"
+bin_overrides = { windows = "claude.cmd" }
+version_args  = ["--version"]
 
 [pm]
 driver = "stream"                  # acp | stream | oneshot-continue
