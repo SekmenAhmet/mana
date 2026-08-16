@@ -14,6 +14,14 @@ on:
 # permissions travel with the App token, not with GITHUB_TOKEN.
 permissions: {}
 
+# Every action below is pinned to a full commit SHA with the version in a
+# trailing comment (Renovate bumps both). Tags and branches are pointers the
+# upstream owner can move at will, and these two jobs are the worst place in
+# the repo for that: RELEASE_PLZ_APP_PRIVATE_KEY is passed to one step and a
+# `contents: write` token sits in the step environment of the next, so an
+# upstream repoint would be able to read the key and publish a release —
+# without a single line changing here.
+
 jobs:
   # Push that merged a Release PR -> create and push the vX.Y.Z tag, which is
   # what starts .github/workflows/release.yml (cargo-dist).
@@ -30,7 +38,7 @@ jobs:
       contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # release-plz derives the current version from the git tags
           # (`git_only = true`), so a shallow clone would make every release
@@ -39,14 +47,16 @@ jobs:
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
 
       # Not GITHUB_TOKEN: a tag pushed with it does not trigger other
       # workflows, so cargo-dist would never build a single artifact. This is
       # the token that makes the tag -> release.yml link work at all.
       - name: Mint an app token
         id: token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
@@ -56,7 +66,7 @@ jobs:
           permission-pull-requests: read
 
       - name: Run release-plz release
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
         with:
           command: release
         env:
@@ -78,13 +88,15 @@ jobs:
       cancel-in-progress: false
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           fetch-depth: 0
           persist-credentials: false
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
+        with:
+          toolchain: stable
 
       # The other reason GITHUB_TOKEN will not do: a PR it opens does not
       # trigger `on: pull_request` workflows, so CI's four required checks
@@ -92,7 +104,7 @@ jobs:
       # protected main. That deadlock is silent — the PR just sits there.
       - name: Mint an app token
         id: token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ secrets.RELEASE_PLZ_APP_ID }}
           private-key: ${{ secrets.RELEASE_PLZ_APP_PRIVATE_KEY }}
@@ -100,7 +112,7 @@ jobs:
           permission-pull-requests: write
 
       - name: Run release-plz release-pr
-        uses: release-plz/action@v0.5
+        uses: release-plz/action@2eb1d8bcb770b4c48ccfaad919734b38b51958c9 # v0.5
         with:
           command: release-pr
         env:

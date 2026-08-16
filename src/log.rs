@@ -77,13 +77,10 @@ pub fn now_iso8601() -> String {
 /// `ExitEntry` share one append-and-create-parents implementation.
 pub fn append_log<T: Serialize>(path: &Path, entry: &T) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::project::create_dir_all(parent)?;
     }
     let line = serde_json::to_string(entry)?;
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)?;
+    let mut file = crate::project::open_append(path)?;
     writeln!(file, "{line}")?;
     Ok(())
 }

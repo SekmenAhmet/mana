@@ -153,7 +153,9 @@ meant to be rare, the way adding a new database driver is rare.
 ## Install
 
 mana has not cut a `v0.1.0` release yet (see
-[Status and roadmap](#status-and-roadmap)), so for now, build it from source:
+[Status and roadmap](#status-and-roadmap)), so for now, build it from source.
+Needs Rust 1.88 or newer — the crate is edition 2024, and `rmcp` pushes the
+floor past that edition's own 1.85:
 
 ```sh
 git clone https://github.com/SekmenAhmet/mana.git

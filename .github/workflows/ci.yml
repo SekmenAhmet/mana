@@ -9,6 +9,13 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
+# Same least-privilege shape as release-plz.yml: nothing at the top, each job
+# asks for what it needs. Without this the token carries the repository-level
+# default -- an out-of-repo setting no file here enforces, and one that comes
+# back read/write on a fork or a re-created repo. CI runs third-party actions
+# and a `curl | sh`; none of them needs to write anything.
+permissions: {}
+
 # Two pushes in quick succession: the older run is obsolete the moment the
 # newer one starts — cancel it instead of burning runner minutes.
 concurrency:
@@ -19,6 +26,8 @@ jobs:
   ci:
     name: build, test, lint (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
     strategy:
       fail-fast: false
       matrix:
@@ -26,45 +35,68 @@ jobs:
         # claimed-but-untested is how the v1 flow shipped broken.
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
+      # Every third-party action is pinned to a full commit SHA, not a tag: a
+      # tag is a mutable pointer the upstream owner can repoint at any commit,
+      # and nothing in this repo would show a diff. The trailing comment is the
+      # human-readable version; Renovate reads it and bumps the SHA with it.
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
+      # `@stable` is a branch, not a version -- pinned to the `master` commit
+      # with the channel moved into `toolchain:`, which is what the branch did.
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # `--locked` everywhere: without it cargo silently re-resolves against
+      # Cargo.toml and throws the rewritten lock away with the runner, so a
+      # green run proves *some* resolution builds, not the committed one --
+      # while cargo-deny audits the lock as committed. The two would drift.
       - name: Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
 
       - name: Build
-        run: cargo build --all-targets --verbose
+        run: cargo build --locked --all-targets --verbose
 
       - name: Test
-        run: cargo test --all-targets --verbose
+        run: cargo test --locked --all-targets --verbose
+
+      # Everything above runs the dev profile, which has overflow checks and
+      # `debug_assert!`; `[profile.dist]` (release + thin LTO) has neither, and
+      # a binary that fails to start at all -- bad linkage, missing runtime dep
+      # -- was previously found by the first user to run `mana upgrade`.
+      # `cargo run` builds *and* executes it, so one line covers both, on all
+      # three OSes without hardcoding the target path.
+      - name: Smoke-test the shipping profile
+        run: cargo run --release --locked -- --version
 
   health:
     name: deps & coverage
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
 
       # The dependency gate: RustSec advisories, license allowlist, duplicate
       # majors, source restrictions. Renovate proposes updates; this blocks
       # the bad ones. Config + accepted-debt list live in deny.toml.
       - name: cargo-deny
-        uses: EmbarkStudios/cargo-deny-action@v2
+        uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # master
         with:
+          toolchain: stable
           components: llvm-tools-preview
 
       # `.github/workflows/release.yml` is generated from dist-workspace.toml.
@@ -72,28 +104,49 @@ jobs:
       # wrong things, discovered at tag time; this catches it at PR time. The
       # version must match `cargo-dist-version` in dist-workspace.toml -- a
       # different dist generates a different workflow.
+      #
+      # release.yml now also carries one hand-added job (`guard`, issue #80),
+      # which `--check` cannot know about, so dist-workspace.toml must set
+      # `allow-dirty = ["ci"]` for this step to pass. See RELEASING.md.
       - name: Check the release workflow matches dist-workspace.toml
+        # we specify bash to get pipefail; the default `bash -e` takes the exit
+        # status of `sh`, so a 404 or a truncated body from the release URL
+        # feeds `sh` garbage and still exits 0 -- surfacing one step later as
+        # `dist: No such file or directory`.
+        shell: bash
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
             https://github.com/axodotdev/cargo-dist/releases/download/v0.32.0/cargo-dist-installer.sh | sh
           "$HOME/.cargo/bin/dist" generate --check
 
       - name: Cache cargo/target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
 
+      # `@cargo-llvm-cov` is a rolling ref, not a version -- pinned to the
+      # v2.86.1 commit with the tool name moved into `with:`, same behaviour.
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@cargo-llvm-cov
+        uses: taiki-e/install-action@288e746965032cfcc232e09af2daf5f23c14d780 # v2.86.1
+        with:
+          tool: cargo-llvm-cov
 
       # Coverage was previously measured by hand per PR (74.79% -> 91.77%
       # region across three of them); this makes the number free and visible
       # on every push instead.
       - name: Coverage
+        # bash for pipefail: with the default `bash -e` the step takes `tee`'s
+        # exit status, so a test that fails only under `-C instrument-coverage`
+        # leaves the job green off the partial profraw.
+        shell: bash
         run: |
-          cargo llvm-cov --all-features --summary-only | tee coverage.txt
+          # A ratchet, not a target: region coverage measured 94.90% at 0.1.0,
+          # so 92 catches a PR that deletes real tests while leaving room for
+          # the normal noise of a refactor. Raise it when the number rises for
+          # good -- lowering it is the thing that needs an argument.
+          cargo llvm-cov --locked --all-features --summary-only --fail-under-regions 92 | tee coverage.txt
           cargo llvm-cov report --lcov --output-path lcov.info
 
       - name: Upload coverage artifact
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: coverage
           path: |

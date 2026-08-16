@@ -2,6 +2,13 @@
 name = "mana"
 version = "0.1.0"
 edition = "2024"
+# `edition = "2024"` alone needs 1.85, but the floor is set higher by the
+# dependency tree: rmcp 3 (and darling/instability under it) declare
+# `rust-version = "1.88"`, so cargo refuses the lock file below that. Verified
+# empirically -- `cargo +1.85 check --locked` fails on those crates, 1.88
+# passes. Stated here so an older stable gets cargo's "requires rustc 1.88"
+# instead of a raw `feature 'edition2024' is required`.
+rust-version = "1.88"
 # Not on crates.io yet; releases ship as GitHub binaries. crates.io
 # publication is a separate decision from the license (chosen 2026-08-16).
 publish = false

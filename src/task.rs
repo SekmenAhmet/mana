@@ -76,9 +76,9 @@ pub fn read_task(path: &Path) -> anyhow::Result<Task> {
 
 pub fn write_task(path: &Path, task: &Task) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
+        crate::project::create_dir_all(parent)?;
     }
-    std::fs::write(path, render_task_file(task)?)?;
+    crate::project::write(path, render_task_file(task)?)?;
     Ok(())
 }
 
