@@ -774,7 +774,23 @@ mod process_tests {
         let long_ago = (Utc::now() - TimeDelta::hours(3)).to_rfc3339();
         match guard(sleeper.pid(), &long_ago, Utc::now()) {
             Guard::NotOurs(reason) => assert!(reason.contains("recycled"), "{reason}"),
-            other => panic!("expected a refusal, got {other:?}"),
+            other => {
+                // Diagnostic for a CI-only failure: show exactly what the
+                // age lookup saw so the platform difference names itself.
+                let ps = std::process::Command::new("ps")
+                    .args(["-o", "etime=", "-p", &sleeper.pid().to_string()])
+                    .output();
+                panic!(
+                    "expected a refusal, got {other:?}; ps probe: {:?}; \
+                     parse_started_at: {:?}",
+                    ps.map(|o| (
+                        o.status.code(),
+                        String::from_utf8_lossy(&o.stdout).into_owned(),
+                        String::from_utf8_lossy(&o.stderr).into_owned(),
+                    )),
+                    parse_started_at(&long_ago),
+                );
+            }
         }
     }
 
