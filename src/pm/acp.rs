@@ -987,6 +987,10 @@ fn response_events(frame: &Value, line: &str, state: &mut TurnState) -> Decoded 
             "[the PM's CLI reported an error] {}",
             describe_error(error)
         )));
+        // A failed turn is still a turn that is over, and saying so is what
+        // stops mana holding a queued message for a PM that is never going to
+        // answer this one.
+        events.push(PmEvent::TurnEnded);
         return Decoded::events(events);
     }
     let result = &frame["result"];
@@ -1003,6 +1007,10 @@ fn response_events(frame: &Value, line: &str, state: &mut TurnState) -> Decoded 
     if let Some(usage) = result.get("usage").filter(|usage| !usage.is_null()) {
         events.push(PmEvent::Usage(usage.clone()));
     }
+    // Every `stopReason`, not only `end_turn`: the protocol's own word for
+    // "mana's request is answered". Last, so the whole turn -- prose, totals,
+    // the reason it stopped -- is in hand before anything acts on it.
+    events.push(PmEvent::TurnEnded);
     Decoded::events(events)
 }
 
@@ -1367,33 +1375,43 @@ url = "https://example.invalid/fake"
             vec![
                 PmEvent::Text("no trailing newline".to_string()),
                 PmEvent::Usage(json!({"outputTokens": 10})),
+                // Last, so everything the turn carried is in hand before
+                // anything waiting on it is released.
+                PmEvent::TurnEnded,
             ]
         );
     }
 
     /// A turn that ended for any other reason stopped mid-thought, and the
     /// operator has to know rather than wonder why the PM went quiet.
+    ///
+    /// It is still an ended turn: a queue that only drained on `end_turn`
+    /// would hold everything typed after a refusal for the rest of the session.
     #[test]
-    fn a_turn_that_ended_badly_says_why() {
+    fn a_turn_that_ended_badly_says_why_and_still_ends() {
         let events = replay([r#"{"jsonrpc":"2.0","id":3,"result":{"stopReason":"max_tokens"}}"#]);
         assert_eq!(
             events,
-            vec![PmEvent::Raw(
-                "[the PM's turn ended: max_tokens]".to_string()
-            )]
+            vec![
+                PmEvent::Raw("[the PM's turn ended: max_tokens]".to_string()),
+                PmEvent::TurnEnded,
+            ]
         );
     }
 
     #[test]
-    fn a_json_rpc_error_reaches_the_chat_pane() {
+    fn a_json_rpc_error_reaches_the_chat_pane_and_ends_the_turn() {
         let events = replay([
             r#"{"jsonrpc":"2.0","id":3,"error":{"code":-32000,"message":"quota exhausted","data":"try tomorrow"}}"#,
         ]);
         assert_eq!(
             events,
-            vec![PmEvent::Raw(
-                "[the PM's CLI reported an error] quota exhausted: try tomorrow".to_string()
-            )]
+            vec![
+                PmEvent::Raw(
+                    "[the PM's CLI reported an error] quota exhausted: try tomorrow".to_string()
+                ),
+                PmEvent::TurnEnded,
+            ]
         );
     }
 
@@ -1686,9 +1704,20 @@ mod golden {
         assert_eq!(usage[1]["outputTokens"], 10);
         assert_eq!(usage[1]["cachedReadTokens"], 81664);
 
+        // One turn, one boundary, and it is the last thing the recording
+        // produced -- the response to mana's `session/prompt`.
+        assert_eq!(events.last(), Some(&PmEvent::TurnEnded), "{events:#?}");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, PmEvent::TurnEnded))
+                .count(),
+            1
+        );
+
         // Nothing else survived: no permission requests, and the 128 KB
         // command list is gone.
-        assert_eq!(events.len(), 6, "{events:#?}");
+        assert_eq!(events.len(), 7, "{events:#?}");
     }
 
     /// The shape a maintainer needs to recognise: over ACP, a quota wall is

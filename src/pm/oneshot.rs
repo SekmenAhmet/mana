@@ -29,8 +29,8 @@
 //! process would fire it every turn if "process exit" were taken literally, so
 //! the rule here is about the *session*:
 //!
-//! - a turn that exits **0** ends the turn only -- no event, the session waits
-//!   for the next one;
+//! - a turn that exits **0** ends the turn only: one `TurnEnded`, and the
+//!   session waits for the next one;
 //! - a turn that exits **non-zero or is signalled** ends the session: its
 //!   stderr is drained into `Raw` first, then `Exited { code }`. A CLI that
 //!   failed this turn fails the next one identically (expired credentials, a
@@ -427,6 +427,14 @@ impl TurnSpawner {
             self.map
                 .extract(&line)
                 .into_iter()
+                // The process ending is this driver's turn boundary (see
+                // `run_turns`), so a frame-level one would be a second, racing
+                // source for the same fact. An entry that declares
+                // `[pm.events].turn_end` anyway gets it ignored rather than
+                // doubled -- two `TurnEnded` for one turn would release two
+                // queued messages back to back, which is the bug the event
+                // exists to prevent.
+                .filter(|event| !matches!(event, PmEvent::TurnEnded))
                 .all(|event| sender.send(event).is_ok())
         });
         // stdout is at EOF, so the process is on its way out. Drain stderr
@@ -475,6 +483,18 @@ fn run_turns(
         let code = spawner.run(child, &text, sender, in_flight, closed);
         if code != Some(0) {
             send_exit(sender, closed, exited, code);
+            return;
+        }
+        // A clean exit is this transport's end-of-turn: the process that held
+        // the turn is gone, everything it said is already on the channel, and
+        // the session is listening again. Nothing is read out of the stream to
+        // decide it -- which is what makes it the same kind of fact as ACP's
+        // `stopReason`, not a parse.
+        //
+        // Only after a *clean* exit: the other branch above already ended the
+        // whole session, and whoever is waiting on a turn is released by
+        // `Exited` instead.
+        if sender.send(PmEvent::TurnEnded).is_err() {
             return;
         }
     }
@@ -705,8 +725,12 @@ mod process_tests {
 
         driver.send_user("first turn").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        // The process that held the turn is gone, which is this transport's
+        // whole answer to "is the PM free?".
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
         driver.send_user("second turn").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
 
         assert_eq!(
             wait_for_lines(&argv, 2),
@@ -744,8 +768,12 @@ mod process_tests {
 
         driver.send_user("first turn").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        // The process that held the turn is gone, which is this transport's
+        // whole answer to "is the PM free?".
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
         driver.send_user("second turn").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
 
         assert_eq!(
             wait_for_lines(&argv, 2),
@@ -764,9 +792,12 @@ mod process_tests {
 
         driver.send_user("one").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
         driver.send_user("two").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
-        // Nothing else arrived: no `Exited` between the two turns.
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
+        // Nothing else arrived: no `Exited` between the two turns -- a turn
+        // ending and a session ending are different events here.
         assert!(driver.events().try_recv().is_err());
         driver.shutdown().unwrap();
     }
@@ -793,7 +824,9 @@ mod process_tests {
         driver.send_user("one").unwrap();
         driver.send_user("two").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
 
         assert_eq!(
             wait_for_lines(&log, 4),
@@ -959,6 +992,7 @@ mod process_tests {
         );
         driver.send_user("one").unwrap();
         assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
         wait_until_idle(&driver);
 
         driver.shutdown().unwrap();

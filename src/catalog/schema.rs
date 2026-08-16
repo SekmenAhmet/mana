@@ -126,10 +126,19 @@ pub struct Pm {
     pub events: Option<PmEvents>,
 }
 
-/// Deliberately two fields and no more. Parsing a CLI's full proprietary
-/// stream is what forces per-CLI code (the lesson vibe-kanban paid for), so
-/// tool calls, permissions and session control travel over ACP, MCP or the
-/// sentinel channel instead -- never over this map.
+/// Three fields and no more. Parsing a CLI's full proprietary stream is what
+/// forces per-CLI code (the lesson vibe-kanban paid for), so tool calls and
+/// permissions travel over ACP, MCP or the sentinel channel instead -- never
+/// over this map.
+///
+/// The design (§4) wrote this rule as "only `text` and `usage`", and
+/// `turn_end` is the one addition, for the same reason `PmEvent::TurnEnded`
+/// earns its place in the contract: on a persistent-process driver the turn
+/// boundary exists *only* in the CLI's own stream, and mana needs it to know
+/// whether the PM is mid-answer. The two other drivers read it off their
+/// transport (a process that exited, an ACP response) and leave this empty.
+/// It is a predicate over one frame, never content to render -- which is what
+/// keeps it on the data side of the line the rule was drawn for.
 #[derive(Deserialize, Debug, Clone, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct PmEvents {
@@ -137,6 +146,28 @@ pub struct PmEvents {
     pub text: String,
     /// Optional enrichment (token counts, cost) when the CLI reports it.
     pub usage: Option<String>,
+    /// Which frame closes a turn, for the drivers whose process outlives one.
+    /// Absent means "this transport says so some other way" -- and a `stream`
+    /// entry without it simply never queues (see `PmTransport::tracks_turn_end`).
+    pub turn_end: Option<TurnEnd>,
+}
+
+/// "A turn ended" as catalogue data: the frame where `path` resolves to
+/// `equals`.
+///
+/// A pair rather than one JSONPath because the question is a *predicate*
+/// ("is this the closing frame?") and RFC 9535 has no way to spell "the
+/// document itself matches this filter" -- a filter selector only ever yields
+/// *children* of an object or array. The spellings that do work
+/// (`$.usage[?$.type=='result']` and friends) test the wrong thing and read
+/// like a riddle. Two obvious keys beat one clever path in a file humans edit.
+#[derive(Deserialize, Debug, Clone, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TurnEnd {
+    /// Where the frame's kind lives, as a JSONPath.
+    pub path: String,
+    /// The string it holds on the frame that ends a turn.
+    pub equals: String,
 }
 
 /// How the PM reaches mana's orchestration tools.

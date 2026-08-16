@@ -132,9 +132,15 @@ prompt        = "argv"             # argv | stdin | stdin-jsonl
 # CLI offers no mechanism. Inventing a flag would be worse than having none: an
 # unrecognised argument is how a launch fails at startup for no reason.
 
-[pm.events]                        # non-ACP drivers only; 2 fields MAX (design §4)
+[pm.events]                        # non-ACP drivers only; 3 fields MAX (design §4)
 text  = "$.result.response"        # the whole turn, once, when it ends
 usage = "$.result.usage"
+# No turn_end: this driver runs one process per turn, so the turn is over when
+# the process is, and the transport says so without reading a frame. Both paths
+# above are already scoped to the `result` event by their own prefix, so the
+# skill-echo class of bug (see claude.toml) cannot reach them: agy's other
+# frames are `init` and `step_update`, neither of which carries `$.result`, and
+# this CLI never gets to load a skill file at all (inline_in_activation).
 
 [tools]
 channel = "sentinel"               # no MCP surface found

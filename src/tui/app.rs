@@ -49,6 +49,10 @@ pub enum Source {
 pub struct ChatLine {
     pub source: Source,
     pub text: String,
+    /// Written, shown, but not yet handed to the PM: the PM was mid-turn when
+    /// the user pressed Enter, so this line is waiting in the session's queue.
+    /// Cleared by `release_pending` when it goes out.
+    pub pending: bool,
 }
 
 pub struct App {
@@ -88,6 +92,10 @@ pub struct App {
     /// for the answer before doing anything else, so a queue would be a
     /// structure that never holds two.
     pub pending_permission: Option<PendingPermission>,
+    /// How many turns the session is holding back because the PM is mid-turn.
+    /// Kept in step with the session once a frame; the queue itself lives
+    /// where the transport does.
+    pub queued: usize,
     /// When this session started, which drives the graph's running blink
     /// without a render-loop clock in the tests (`graph::is_blink_visible`).
     pub started_at: Instant,
@@ -126,6 +134,7 @@ impl App {
             show_raw: false,
             raw_lines: 0,
             pending_permission: None,
+            queued: 0,
             started_at: Instant::now(),
         }
     }
@@ -167,7 +176,11 @@ impl App {
                     options: options.clone(),
                 });
             }
-            PmEvent::Exited { .. } => {}
+            // Neither of these is anything to render. `TurnEnded` releases a
+            // queued turn and `Exited` ends the session: both are the loop's
+            // business, not the view's. What the view shows of the queue is
+            // `queued`, which the loop keeps in step with the session.
+            PmEvent::TurnEnded | PmEvent::Exited { .. } => {}
         }
     }
 
@@ -180,6 +193,34 @@ impl App {
     /// Appends text as chat lines, one entry per `\n`-separated line, dropping
     /// the oldest once the ring is full.
     pub fn push(&mut self, source: Source, text: &str) {
+        self.push_line(source, text, false);
+    }
+
+    /// The same, for a turn the session is holding until the PM finishes: it
+    /// reads as the user turn it is, marked as not yet sent.
+    ///
+    /// Written now rather than when it goes out because that is when the user
+    /// wrote it, and a transcript that reordered their questions to match the
+    /// PM's schedule would be a transcript of a different conversation.
+    pub fn push_pending(&mut self, source: Source, text: &str) {
+        self.push_line(source, text, true);
+    }
+
+    /// Clears the mark on the oldest line still waiting.
+    ///
+    /// Oldest first because the queue is a FIFO: the line that leaves is the
+    /// line that has waited longest. One line per call, which is exact for the
+    /// only thing that is ever marked -- a typed turn, which is one line
+    /// because the input box holds no newline. A marked line the ring has
+    /// already dropped is simply not there to unmark, and nothing needs it to
+    /// be.
+    pub fn release_pending(&mut self) {
+        if let Some(line) = self.chat.iter_mut().find(|line| line.pending) {
+            line.pending = false;
+        }
+    }
+
+    fn push_line(&mut self, source: Source, text: &str, pending: bool) {
         for line in text.split('\n') {
             if source == Source::Raw {
                 self.raw_lines += 1;
@@ -190,6 +231,7 @@ impl App {
             self.chat.push_back(ChatLine {
                 source,
                 text: line.trim_end_matches('\r').to_string(),
+                pending,
             });
             while self.chat.len() > CHAT_CAPACITY {
                 self.chat.pop_front();
@@ -527,6 +569,34 @@ mod tests {
         }
         assert_eq!(app.raw_lines, CHAT_CAPACITY + 10);
         assert_eq!(app.lines().count(), CHAT_CAPACITY);
+    }
+
+    /// The transcript keeps the order the user wrote in, and the mark says
+    /// which of those lines the PM has actually been handed.
+    #[test]
+    fn queued_turns_are_written_now_and_unmarked_oldest_first() {
+        let mut app = App::new("Fixture CLI");
+        app.push(Source::User, "first");
+        app.push_pending(Source::User, "second");
+        app.push_pending(Source::User, "third");
+        assert_eq!(texts(&app), ["first", "second", "third"]);
+        assert_eq!(
+            app.lines().map(|line| line.pending).collect::<Vec<bool>>(),
+            [false, true, true]
+        );
+
+        // FIFO: the line that leaves is the one that has waited longest.
+        app.release_pending();
+        assert_eq!(
+            app.lines().map(|line| line.pending).collect::<Vec<bool>>(),
+            [false, false, true]
+        );
+        app.release_pending();
+        assert!(app.lines().all(|line| !line.pending));
+        // One more release than there were queued turns changes nothing --
+        // a PM that died mid-queue leaves exactly that shape.
+        app.release_pending();
+        assert!(app.lines().all(|line| !line.pending));
     }
 
     #[test]
