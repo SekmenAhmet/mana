@@ -23,6 +23,15 @@ use std::path::Path;
 /// The only schema this build understands. The catalogue carries a version --
 /// unlike mana's internal contracts -- because outside humans edit these files
 /// and their editor may be older or newer than the binary reading them.
+/// The user's catalogue escape valve (design §7): a local override may replace
+/// a shipped entry or add a CLI mana ships no entry for.
+///
+/// Declared here rather than in each command because four of them read it, and
+/// four spellings of one filename is four chances for a command to look in a
+/// place the others do not -- the failure would be a silently ignored override,
+/// which is the hardest kind to notice.
+pub const CATALOG_OVERRIDE: &str = "catalog.local.toml";
+
 pub const SCHEMA_VERSION: u32 = 1;
 
 /// The catalogue as mana sees it: the embedded entries, with the user's local

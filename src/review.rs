@@ -23,6 +23,21 @@ pub enum Decision {
     Rejected,
 }
 
+impl Decision {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(self) -> &'static str {
+        match self {
+            Decision::Validated => "validated",
+            Decision::Rejected => "rejected",
+        }
+    }
+}
+
 /// Whose failure a rejection is. The field exists because a bad brief must
 /// not condemn a good model: only `Code` rejections count against the (CLI ×
 /// model) pair the router reads (design §8) -- the agy-cwd incident is what
@@ -32,6 +47,21 @@ pub enum Decision {
 pub enum Attribution {
     Code,
     Brief,
+}
+
+impl Attribution {
+    /// The name this variant answers to in prose and on the wire.
+    ///
+    /// On the type rather than in the module that prints it: the same mapping was
+    /// hand-written in two places and drifted apart nowhere only by luck (#53).
+    /// A reader who adds a variant now gets a non-exhaustive-match error here
+    /// instead of a silently missing word at some call site.
+    pub fn word(self) -> &'static str {
+        match self {
+            Attribution::Code => "code",
+            Attribution::Brief => "brief",
+        }
+    }
 }
 
 /// The verdict file, exactly as `assets/roles/reviewer.md` asks for it.

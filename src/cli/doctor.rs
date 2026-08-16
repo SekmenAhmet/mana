@@ -34,7 +34,7 @@
 //! Every finding is printed either way. Output is plain aligned text with no
 //! colour and no table crate, so `mana doctor | grep` works.
 
-use crate::catalog::{Catalog, CliEntry, CostClass, PmDriver, PoolScope, QuotaKind, ToolChannel};
+use crate::catalog::{Catalog, CliEntry};
 use crate::cli::ps;
 use crate::log;
 use crate::mcp::routing::Observations;
@@ -47,10 +47,6 @@ use anyhow::Result;
 use chrono::{DateTime, TimeDelta, Utc};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
-
-/// The user's catalogue escape valve (design §7), read from the same place
-/// every other command reads it from.
-const CATALOG_OVERRIDE: &str = "catalog.local.toml";
 
 /// Budget for one `[models].discovery_args` run. Longer than the version probe
 /// because discovery usually hits the network, short enough that four CLIs
@@ -141,7 +137,7 @@ pub fn run(project: Option<&Path>, prune: bool) -> Result<()> {
 /// exactly one place to turn "no report at all" into exit 2.
 fn build_report(project: Option<&Path>, prune: bool) -> Result<Report> {
     let home = mana_home()?;
-    let override_path = home.join(CATALOG_OVERRIDE);
+    let override_path = home.join(crate::catalog::CATALOG_OVERRIDE);
     let (catalog, override_error) = catalog_or_shipped(&override_path)?;
 
     // `--project` is an explicit request and always gets a section, even when
@@ -318,8 +314,8 @@ fn catalogue_section(
             "pm",
             format!(
                 "driver {}, tools over {}",
-                driver_word(entry.pm.driver),
-                channel_word(entry.tools.channel)
+                entry.pm.driver.word(),
+                entry.tools.channel.word()
             ),
         );
         field(report, "models", models_line(entry, installed.as_deref()));
@@ -341,32 +337,6 @@ fn catalogue_section(
 /// longest label used above.
 fn field(report: &mut Report, label: &str, value: impl Into<String>) {
     report.say(format!("  {label:<12}{}", value.into()));
-}
-
-/// The transports mana implements, spelled the way the catalogue spells them.
-/// A match on a closed set of drivers is not a match on a CLI: adding a CLI
-/// never touches this, adding a *protocol* does.
-fn driver_word(driver: PmDriver) -> &'static str {
-    match driver {
-        PmDriver::Acp => "acp",
-        PmDriver::Stream => "stream",
-        PmDriver::OneshotContinue => "oneshot-continue",
-    }
-}
-
-fn channel_word(channel: ToolChannel) -> &'static str {
-    match channel {
-        ToolChannel::Mcp => "mcp",
-        ToolChannel::Sentinel => "sentinel",
-    }
-}
-
-fn class_word(class: CostClass) -> &'static str {
-    match class {
-        CostClass::Cheap => "cheap",
-        CostClass::Mid => "mid",
-        CostClass::Expensive => "expensive",
-    }
 }
 
 /// The static list, or the result of actually running the CLI's discovery
@@ -401,7 +371,7 @@ fn models_line(entry: &CliEntry, binary: Option<&Path>) -> String {
             format!(
                 "{} ({}, pool {})",
                 model.id,
-                class_word(model.cost_class),
+                model.cost_class.word(),
                 model.pool
             )
         })
@@ -451,25 +421,6 @@ fn truncate_list(items: &[String]) -> String {
     )
 }
 
-/// Spelled the way the catalogue file spells them, not the way `Debug` spells
-/// the enum: a user comparing this report against their `catalog.local.toml`
-/// must not have to translate `PerModel` back into `per-model`.
-fn kind_word(kind: QuotaKind) -> &'static str {
-    match kind {
-        QuotaKind::Requests => "requests",
-        QuotaKind::Tokens => "tokens",
-        QuotaKind::Credits => "credits",
-        QuotaKind::Unknown => "unknown",
-    }
-}
-
-fn scope_word(scope: PoolScope) -> &'static str {
-    match scope {
-        PoolScope::Global => "global",
-        PoolScope::PerModel => "per-model",
-    }
-}
-
 fn quota_line(entry: &CliEntry) -> String {
     if entry.quota.pools.is_empty() {
         return "none declared".to_string();
@@ -482,9 +433,9 @@ fn quota_line(entry: &CliEntry) -> String {
             format!(
                 "{} ({}, {}, {})",
                 pool.id,
-                kind_word(pool.kind),
+                pool.kind.word(),
                 pool.period,
-                scope_word(pool.pool_scope)
+                pool.pool_scope.word()
             )
         })
         .collect::<Vec<_>>()
@@ -901,8 +852,6 @@ url = "https://example.invalid/alpha"
                 timestamp: now_iso8601(),
                 exit_code: Some(0),
                 duration_ms: Some(duration_ms),
-                input_tokens: None,
-                output_tokens: None,
                 failure_means: None,
             },
         )
@@ -1008,7 +957,7 @@ cooldown_minutes = 30
     #[test]
     fn override_note_says_which_shipped_entry_it_replaces() {
         let tmp = tempfile::tempdir().unwrap();
-        let path = tmp.path().join(CATALOG_OVERRIDE);
+        let path = tmp.path().join(crate::catalog::CATALOG_OVERRIDE);
         std::fs::write(
             &path,
             FIXTURE.replace(r#"id = "alpha""#, r#"id = "claude""#),
@@ -1022,7 +971,7 @@ cooldown_minutes = 30
     #[test]
     fn override_note_is_absent_without_a_file() {
         let tmp = tempfile::tempdir().unwrap();
-        assert!(override_note(&tmp.path().join(CATALOG_OVERRIDE)).is_none());
+        assert!(override_note(&tmp.path().join(crate::catalog::CATALOG_OVERRIDE)).is_none());
     }
 
     #[test]
@@ -1096,7 +1045,7 @@ cooldown_minutes = 30
     #[test]
     fn a_broken_catalog_override_is_a_finding_not_an_abort() {
         let tmp = tempfile::tempdir().unwrap();
-        let override_path = tmp.path().join(CATALOG_OVERRIDE);
+        let override_path = tmp.path().join(crate::catalog::CATALOG_OVERRIDE);
         std::fs::write(&override_path, "not [ valid").unwrap();
 
         let (catalog, error) = catalog_or_shipped(&override_path).unwrap();
@@ -1379,13 +1328,7 @@ mod tests_support {
     }
 
     pub(super) fn write_script(dir: &Path, name: &str, body: &str) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let path = dir.join(name);
-        std::fs::write(&path, body).unwrap();
-        let mut perms = std::fs::metadata(&path).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&path, perms).unwrap();
-        path
+        crate::subprocess::write_executable(dir, name, body)
     }
 
     /// A throwaway git project with one commit, which is the minimum

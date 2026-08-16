@@ -391,7 +391,6 @@ mod process_tests {
     use super::super::child::{CLOSE_GRACE, POLL_INTERVAL};
     use super::super::events::fixture;
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
 
     const TEXT_PATH: &str = "$.message.content[?@.type=='text'].text";
@@ -400,10 +399,9 @@ mod process_tests {
 
     /// Writes an executable fake CLI and returns its path.
     fn script(dir: &Path, body: &str) -> String {
-        let path = dir.join("fake-cli");
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
-        path.to_string_lossy().into_owned()
+        crate::subprocess::write_executable(dir, "fake-cli", &format!("#!/bin/sh\n{body}\n"))
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn driver(bin: &str, args: &[&str]) -> StreamDriver {

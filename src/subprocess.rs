@@ -159,24 +159,35 @@ pub fn join_or_detach(handle: JoinHandle<()>, deadline: Instant) {
     }
 }
 
-/// Writes an executable shell script at `dir/name` that prints
-/// `printed_version` and exits. Test-only fixture shared by every module
-/// that needs a fake "CLI" binary to check version-reporting behavior
-/// against, without depending on a specific real binary being installed.
+/// Writes an executable shell script at `dir/name` with `body` as its
+/// contents, shebang included.
+///
+/// The one place the write-then-chmod ritual lives. Five modules had their own
+/// copy of it and a sixth open-coded it inline, which is six chances to forget
+/// the `0o755` and get a "Permission denied" that reads like a bug in the code
+/// under test rather than in its fixture (#66).
 #[cfg(all(test, unix))] // uses unix permission bits; every caller is unix-gated
+pub(crate) fn write_executable(dir: &Path, name: &str, body: &str) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let script = dir.join(name);
+    std::fs::write(&script, body).unwrap();
+    let mut perms = std::fs::metadata(&script).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&script, perms).unwrap();
+    script
+}
+
+/// A fake CLI that prints `printed_version` and exits — the fixture every
+/// version-reporting test needs, without depending on a real binary being
+/// installed.
+#[cfg(all(test, unix))]
 pub(crate) fn write_version_script(
     dir: &Path,
     name: &str,
     printed_version: &str,
 ) -> std::path::PathBuf {
-    use std::os::unix::fs::PermissionsExt;
-
-    let script = dir.join(name);
-    std::fs::write(&script, format!("#!/bin/sh\necho {printed_version}\n")).unwrap();
-    let mut perms = std::fs::metadata(&script).unwrap().permissions();
-    perms.set_mode(0o755);
-    std::fs::set_permissions(&script, perms).unwrap();
-    script
+    write_executable(dir, name, &format!("#!/bin/sh\necho {printed_version}\n"))
 }
 
 #[cfg(all(test, unix))] // every test here execs unix shell fixtures

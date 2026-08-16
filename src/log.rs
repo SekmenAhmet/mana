@@ -23,12 +23,15 @@ pub struct LogEntry {
 /// `LogEntry` rather than packing everything into `action` as a string
 /// (v1 wrote `exited(code=3)`) — that string-packing only existed to make a
 /// regex-based counters pass find the exit code again later, which is
-/// exactly the kind of cleverness a typed field removes. Duration and token
-/// fields use the exact OTEL GenAI semantic-convention key names (see
-/// design doc §8) so a future OTEL exporter is a pipe change, not a rename;
-/// they're `Option` because the dispatcher fills `exit_code`, `duration_ms`
-/// and `failure_means` but token usage lands later and must be absent from
-/// the wire, not `null`, until then.
+/// exactly the kind of cleverness a typed field removes. `duration_ms` uses
+/// the exact OTEL GenAI semantic-convention key name (see design doc §8) so a
+/// future OTEL exporter is a pipe change, not a rename.
+///
+/// Token-usage fields used to sit here reserved for that exporter, written by
+/// nothing and read by nothing (#58). They are gone, and re-adding them when
+/// something actually fills them is free in both directions: `default` makes a
+/// line without the keys parse, and serde ignores keys it does not know, so
+/// every log already on disk stays readable either way.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct ExitEntry {
     pub status: Status,
@@ -49,18 +52,6 @@ pub struct ExitEntry {
         skip_serializing_if = "Option::is_none"
     )]
     pub duration_ms: Option<u64>,
-    #[serde(
-        rename = "gen_ai.usage.input_tokens",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub input_tokens: Option<u64>,
-    #[serde(
-        rename = "gen_ai.usage.output_tokens",
-        default,
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub output_tokens: Option<u64>,
     /// `Some("quota_exhausted")` etc. once the catalogue's ordered failure
     /// signatures (design doc §8) match this run's exit code/stderr/stdout.
     /// `dispatch::run_dispatch` writes it; `counters` below reads it back.
@@ -352,8 +343,6 @@ mod tests {
             timestamp: now_iso8601(),
             exit_code: Some(if failure_means.is_some() { 1 } else { 0 }),
             duration_ms,
-            input_tokens: None,
-            output_tokens: None,
             failure_means: failure_means.map(str::to_string),
         }
     }
@@ -369,18 +358,11 @@ mod tests {
             timestamp: "2026-08-15T10:00:00Z".into(),
             exit_code: Some(3),
             duration_ms: Some(1500),
-            input_tokens: Some(120),
-            output_tokens: Some(340),
             failure_means: Some("quota_exhausted".into()),
         };
         let json = serde_json::to_string(&entry).unwrap();
         assert!(
             json.contains("\"gen_ai.client.operation.duration\":1500"),
-            "{json}"
-        );
-        assert!(json.contains("\"gen_ai.usage.input_tokens\":120"), "{json}");
-        assert!(
-            json.contains("\"gen_ai.usage.output_tokens\":340"),
             "{json}"
         );
         assert!(json.contains("\"exit_code\":3"), "{json}");

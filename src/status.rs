@@ -585,8 +585,6 @@ mod tests {
                 timestamp: "2026-08-15T10:05:00Z".into(),
                 exit_code: Some(0),
                 duration_ms: Some(1000),
-                input_tokens: None,
-                output_tokens: None,
                 failure_means: None,
             },
         )

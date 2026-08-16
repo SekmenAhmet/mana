@@ -46,7 +46,7 @@ use crate::dispatch::{self, DispatchOutcome};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
-use crate::review::{self, Attribution, Decision, Verdict};
+use crate::review::{self, Verdict};
 use crate::task::{Role, Task, TaskFrontmatter, read_task, write_task};
 use crate::worktree::WorktreeInfo;
 use anyhow::{Context, Result, bail};
@@ -61,10 +61,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, PoisonError};
-
-/// The user's catalogue escape valve (design §7). Read from the same place
-/// every other command reads it; a missing file is normal.
-const CATALOG_OVERRIDE: &str = "catalog.local.toml";
 
 /// Serves MCP on stdin/stdout until the parent closes the pipe.
 ///
@@ -86,7 +82,7 @@ pub fn serve(project_root: &Path) -> Result<()> {
     }
 
     let home = mana_home()?;
-    let catalog = Catalog::load(Some(&home.join(CATALOG_OVERRIDE)))?;
+    let catalog = Catalog::load(Some(&home.join(crate::catalog::CATALOG_OVERRIDE)))?;
     let tools = ManaTools::new(project_root.to_path_buf(), home, catalog);
 
     // One current-thread runtime, built here and nowhere else: this process
@@ -558,7 +554,7 @@ impl ManaTools {
                         .iter()
                         .map(|model| ModelOut {
                             id: model.id.clone(),
-                            cost_class: routing::class_name(model.cost_class).to_string(),
+                            cost_class: model.cost_class.word().to_string(),
                             stats: observations.stats(&entry.cli.id, &model.id),
                             cooldown_until: observations
                                 .cooldown_until(&entry.cli.id, &model.id)
@@ -963,29 +959,11 @@ pub struct ReviewOut {
 impl From<&Verdict> for ReviewOut {
     fn from(verdict: &Verdict) -> Self {
         ReviewOut {
-            verdict: decision_name(verdict.verdict).to_string(),
-            attribution: verdict.attribution.map(|a| attribution_name(a).to_string()),
+            verdict: verdict.verdict.word().to_string(),
+            attribution: verdict.attribution.map(|a| a.word().to_string()),
             issues: verdict.issues.clone(),
             counts_against_model: verdict.counts_against_model(),
         }
-    }
-}
-
-/// The verdict file's own spellings, so the PM reads back exactly what the
-/// reviewer wrote. `review::Verdict` is `Serialize`, but re-serializing it
-/// whole would also re-export its shape as the tool's output schema, and those
-/// are two contracts that only happen to agree today.
-fn decision_name(decision: Decision) -> &'static str {
-    match decision {
-        Decision::Validated => "validated",
-        Decision::Rejected => "rejected",
-    }
-}
-
-fn attribution_name(attribution: Attribution) -> &'static str {
-    match attribution {
-        Attribution::Code => "code",
-        Attribution::Brief => "brief",
     }
 }
 
@@ -1837,7 +1815,7 @@ mod dispatch_tests {
     /// escape valve uses (design §7).
     fn install_override(repo: &Repo, bin: &str) -> Catalog {
         let source = install_override_source(repo, bin);
-        let path = repo.mana_home.join(CATALOG_OVERRIDE);
+        let path = repo.mana_home.join(crate::catalog::CATALOG_OVERRIDE);
         std::fs::create_dir_all(&repo.mana_home).unwrap();
         std::fs::write(&path, source).unwrap();
         Catalog::load(Some(&path)).unwrap()
@@ -1935,7 +1913,7 @@ url = "https://example.invalid/fixture"
         let catalog = {
             let source = install_override_source(&repo, &slow)
                 .replace("max_concurrent = 0", "max_concurrent = 1");
-            let path = repo.mana_home.join(CATALOG_OVERRIDE);
+            let path = repo.mana_home.join(crate::catalog::CATALOG_OVERRIDE);
             std::fs::create_dir_all(&repo.mana_home).unwrap();
             std::fs::write(&path, source).unwrap();
             Catalog::load(Some(&path)).unwrap()
