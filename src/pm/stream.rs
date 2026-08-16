@@ -53,6 +53,9 @@ pub struct StreamDriver {
     /// returns.
     reader: Option<JoinHandle<()>>,
     close_grace: Duration,
+    /// Read off the map before it was handed to the reader thread: whether this
+    /// entry names the frame that closes a turn.
+    tracks_turn_end: bool,
 }
 
 impl StreamDriver {
@@ -158,6 +161,9 @@ impl StreamDriver {
 
         let (sender, events) = channel();
         let stderr_reader = pump_stderr(stderr, sender.clone());
+        // Asked before the map moves into the reader thread, which owns it for
+        // the rest of the session.
+        let tracks_turn_end = map.tracks_turn_end();
 
         let child = Arc::new(Mutex::new(child));
         let reaped = Arc::clone(&child);
@@ -186,6 +192,7 @@ impl StreamDriver {
             events,
             reader: Some(reader),
             close_grace: CLOSE_GRACE,
+            tracks_turn_end,
         })
     }
 
@@ -294,6 +301,14 @@ impl PmTransport for StreamDriver {
 
     fn events(&self) -> &Receiver<PmEvent> {
         StreamDriver::events(self)
+    }
+
+    /// One process for the whole session, so the turn boundary exists only in
+    /// the CLI's own stream: this driver knows it exactly when the catalogue
+    /// names the frame that carries it, and says so rather than leaving a
+    /// caller waiting on an event that will never come.
+    fn tracks_turn_end(&self) -> bool {
+        self.tracks_turn_end
     }
 
     fn shutdown(&mut self) -> Result<()> {
@@ -520,6 +535,55 @@ mod process_tests {
             "{\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"hello \\\"world\\\"\"}}\n\
              {\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"second turn\"}}\n"
         );
+    }
+
+    /// The turn boundary on a driver whose process outlives the turn: it comes
+    /// out of the frame the catalogue names, and it arrives after everything
+    /// the turn carried.
+    #[test]
+    fn a_turn_ends_on_the_frame_the_catalogue_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(
+            tmp.path(),
+            &format!(
+                "while IFS= read -r line; do\n\
+                 \x20 {ACK}\n\
+                 \x20 echo '{{\"type\":\"result\",\"usage\":{{\"output_tokens\":7}}}}'\n\
+                 done"
+            ),
+        );
+        let entry = fixture::parse(&fixture::with_turn_end(
+            &fixture::source(&bin, &[], "stdin-jsonl", TEXT_PATH, Some("$.usage")),
+            "$.type",
+            "result",
+        ));
+        let mut driver = StreamDriver::start(&entry, &[], None).unwrap();
+        assert!(driver.tracks_turn_end());
+
+        driver.send_user("hello").unwrap();
+        assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert_eq!(
+            next(&driver),
+            PmEvent::Usage(serde_json::json!({"output_tokens": 7}))
+        );
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
+
+        // A second turn ends the same way: the process is the session, not the
+        // turn, so nothing about the first one is consumed.
+        driver.send_user("again").unwrap();
+        assert_eq!(next(&driver), PmEvent::Text("ack".to_string()));
+        assert!(matches!(next(&driver), PmEvent::Usage(_)));
+        assert_eq!(next(&driver), PmEvent::TurnEnded);
+        driver.shutdown().unwrap();
+    }
+
+    /// An entry that never names the closing frame must say so rather than let
+    /// a caller wait on an event that cannot arrive.
+    #[test]
+    fn a_stream_entry_without_a_turn_end_admits_it_cannot_track_turns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let driver = driver(&script(tmp.path(), "cat > /dev/null"), &[]);
+        assert!(!driver.tracks_turn_end());
     }
 
     /// Closing stdin is enough for a CLI that reads turns to EOF -- no kill, so

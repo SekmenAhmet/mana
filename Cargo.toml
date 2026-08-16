@@ -2,9 +2,12 @@
 name = "mana"
 version = "0.1.0"
 edition = "2024"
-# Not on crates.io yet; releases ship as GitHub binaries. Flipping this
-# requires choosing a license first (deny gates on it).
+# Not on crates.io yet; releases ship as GitHub binaries. crates.io
+# publication is a separate decision from the license (chosen 2026-08-16).
 publish = false
+# The Rust ecosystem's standard pair: MIT for frictionless use, Apache-2.0
+# for its explicit patent grant — protecting users and contributors both.
+license = "MIT OR Apache-2.0"
 # Not decoration: cargo-dist refuses to generate GitHub CI without it (it needs
 # the owner/repo to build release URLs), and `self_update`'s GitHub backend
 # targets the same repo from the constants in src/cli/upgrade.rs.

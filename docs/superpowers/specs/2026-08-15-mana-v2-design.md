@@ -88,6 +88,14 @@ the lesson from vibe-kanban: parsing full streams forces per-CLI code. At
 runtime, if a path stops matching, fall back to raw text lines — degraded and
 visible, never silent; orchestration is unaffected.
 
+> **Amendment (2026-08-16):** a third field, `turn_end` (`{path, equals}`),
+> joined the map when the input queue landed. On a persistent-process driver
+> the turn boundary exists *only* in the stream, and it is protocol state,
+> not content — naming it as catalogue data was judged truer to the deeper
+> rule than deriving it invisibly in Rust from a frame that happens to
+> coincide. The content prohibition stands: tool calls and permissions still
+> never come out of a proprietary stream.
+
 ## 5. Tool channels (how the PM orchestrates)
 
 | Channel | Mechanism | Known fits |
@@ -183,7 +191,7 @@ args   = ["-p", "--input-format", "stream-json",
           "--output-format", "stream-json", "--verbose"]
 prompt = "stdin-jsonl"             # argv | stdin | stdin-jsonl
 
-[pm.events]                        # non-ACP drivers only; 2 fields MAX (see §4)
+[pm.events]                        # non-ACP drivers only; 3 fields MAX (see §4)
 text  = "$.message.content[?@.type=='text'].text"
 usage = "$.usage"
 

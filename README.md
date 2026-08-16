@@ -56,12 +56,20 @@ transport drivers, chosen per catalogue entry:
 | `oneshot-continue` | one process per turn: a headless flag on the first call, a continue flag on every one after | agy |
 
 For the two non-ACP drivers, the catalogue's `[pm.events]` table maps the
-CLI's own JSON stream to exactly two fields mana understands: `text` (what
-reaches the chat pane) and `usage` (optional token/cost enrichment). Nothing
-else is parsed out of a CLI's proprietary stream — tool calls and permissions
-travel over ACP, MCP, or the sentinel channel instead, never scraped from
-rendered output. A stream that stops matching those paths falls back to raw
-lines: degraded, but visible, never silent.
+CLI's own JSON stream to three fields mana understands: `text` (what reaches
+the chat pane), `usage` (optional token/cost enrichment) and `turn_end` (which
+frame closes a turn, so mana can queue rather than interrupt). Nothing else is
+parsed out of a CLI's proprietary stream — tool calls and permissions travel
+over ACP, MCP, or the sentinel channel instead, never scraped from rendered
+output. A stream that stops matching those paths falls back to raw lines:
+degraded, but visible, never silent.
+
+The paths are frame-scoped, and that is load-bearing: RFC 9535 allows an
+absolute query inside a filter, so claude's `text` reads
+`$.message.content[?@.type=='text' && $.type=='assistant'].text`. Without the
+second half, the frame in which that CLI echoes a loaded skill back — same
+shape, `"type":"user"` — rendered the whole skill file as if the PM had said
+it.
 
 ### Tool channels
 
@@ -191,7 +199,12 @@ mana launch claude -c        # ...picking the previous conversation back up
 mana launch -c               # ...on whichever CLI this project used last
 ```
 
-Type and press `Enter` to talk to the PM. In the TUI:
+Type and press `Enter` to talk to the PM. A turn typed while the PM is still
+answering is queued rather than dropped into the middle of its turn: it shows
+in the transcript straight away, marked `…` until it goes out, the status bar
+counts what is waiting, and each message is handed over as the PM finishes the
+one before. Notifications mana injects itself queue in the same line. In the
+TUI:
 
 | Key | Effect |
 |---|---|
@@ -403,10 +416,11 @@ README.
 
 ## Status and roadmap
 
-v0.1, pre-release: no tag has been pushed yet, and the license is
-deliberately undecided (`Cargo.toml` carries `publish = false` in the
-meantime; `deny.toml` skips the license gate for this crate explicitly, for
-the same reason). What is left open, mostly at the edges the design already
+v0.1, pre-release: no tag has been pushed yet. Licensed under
+[MIT](LICENSE-MIT) OR [Apache-2.0](LICENSE-APACHE), at your option — use it,
+fork it, contribute to it. (`publish = false` stays for now: crates.io is a
+separate decision from the license.) What is left open, mostly at the edges
+the design already
 flags as unverified: Windows is covered at the unit level in CI but has no
 end-to-end run yet; copilot's model list needs re-measuring once its monthly
 quota resets (only `auto` is catalogued today); and a few ACP behaviors —

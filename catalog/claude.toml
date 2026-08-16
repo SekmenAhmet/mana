@@ -66,9 +66,24 @@ resume_args = ["--continue"]
 # Not `--tools`: see the note above about what that flag does to the context.
 permission_args = ["--allowedTools", "mcp__mana__*,Read,Grep,Glob"]
 
-[pm.events]                        # non-ACP drivers only; 2 fields MAX (design §4)
-text  = "$.message.content[?@.type=='text'].text"
+[pm.events]                        # non-ACP drivers only; 3 fields MAX (design §4)
+# `$.type=='assistant'` is not decoration: this CLI echoes a loaded skill back
+# as a frame with *exactly* the shape of an assistant message --
+# `{"type":"user","isSynthetic":true,"message":{"role":"user","content":
+# [{"type":"text","text":"Base directory for this skill: ...\n\n# mana PM\n..."}]}}`
+# -- and the unscoped filter matched it, so the chat pane opened on the whole of
+# SKILL.md rendered as the PM's own words (reported by the user, reproduced with
+# this argv on 2026-08-16 and recorded in goldens/claude/skill-echo.jsonl).
+# An absolute ($-rooted) query inside a filter is RFC 9535 and serde_json_path
+# implements it, so the frame scope is data here rather than an `if` in Rust.
+text  = "$.message.content[?@.type=='text' && $.type=='assistant'].text"
 usage = "$.usage"
+# The end of a turn, which is what lets mana hold a typed line back instead of
+# dropping it into the middle of an answer. This CLI closes every turn with one
+# `result` frame -- present in both goldens, and emitted for a failed turn too
+# (`subtype: error_during_execution`), which is what stops a queue wedging on a
+# turn that went wrong.
+turn_end = { path = "$.type", equals = "result" }
 
 [tools]
 channel  = "mcp"                   # mcp | sentinel

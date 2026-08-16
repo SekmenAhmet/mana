@@ -27,6 +27,7 @@
 //!         PmEvent::PermissionRequest { id, options, .. } => {
 //!             pm.answer_permission(id, &options[0].id)?
 //!         }
+//!         PmEvent::TurnEnded => queue.release_one(&mut pm)?,
 //!         PmEvent::Exited { code } => break,
 //!     }
 //! }
@@ -50,16 +51,19 @@ use std::sync::mpsc::Receiver;
 
 /// Everything mana is willing to learn from a PM session.
 ///
-/// Five variants and no more, because the contract is thin on purpose (design
+/// Six variants and no more, because the contract is thin on purpose (design
 /// §4): tool calls and session control travel over MCP, ACP or the sentinel
 /// channel, never parsed out of a CLI's proprietary stream. That is the lesson
 /// vibe-kanban paid for -- parsing whole streams forces one Rust module per
 /// CLI.
 ///
-/// `PermissionRequest` is the one addition ACP forced (task 3.1), and it earns
-/// its place for the same reason the others do: it is *typed protocol*, not
-/// something scraped out of a stream. A CLI with no permission protocol simply
-/// never sends it.
+/// `PermissionRequest` is the first addition ACP forced (task 3.1), and
+/// `TurnEnded` is the second; both earn their place for the same reason the
+/// others do: they are *typed protocol*, not something scraped out of a
+/// stream. Every driver already holds the fact -- a process that exited, an
+/// ACP response, a frame the catalogue names -- and none of them has to read a
+/// word of what the PM said to produce it. A CLI with no permission protocol
+/// simply never sends the first.
 #[derive(Debug, Clone, PartialEq)]
 pub enum PmEvent {
     /// Assistant prose, ready to render in the chat pane. One event per match:
@@ -91,6 +95,19 @@ pub enum PmEvent {
         /// transport instead of surfaced.
         options: Vec<PermissionChoice>,
     },
+    /// The PM finished the turn it was on and is listening again.
+    ///
+    /// Not a display event: nothing renders it. It exists so mana can tell a
+    /// PM that is mid-answer from one that is idle, which is what makes the
+    /// input queue possible -- a line typed into a busy PM used to go straight
+    /// down the transport and land in the middle of its turn.
+    ///
+    /// Arrives once per turn on the transports that can say so, and never at
+    /// all on a `stream` entry whose catalogue declares no
+    /// `[pm.events].turn_end` (see `PmTransport::tracks_turn_end`). A turn that
+    /// ended badly still ends: the queue must drain even when the PM refused,
+    /// ran out of tokens or errored.
+    TurnEnded,
     /// The PM process is gone. Always arrives, exactly once, last -- v1 could
     /// not tell a thinking PM from a dead one and waited forever on both.
     /// `None` means the process was signalled rather than exited.
@@ -130,6 +147,19 @@ pub trait PmTransport: Send {
     fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
         let _ = option_id;
         bail!("this PM transport never asks for permission, so there is nothing to answer ({id})")
+    }
+
+    /// Whether this session reports `TurnEnded`, and so whether anything above
+    /// may hold a turn back until the PM is free.
+    ///
+    /// True for every transport that reads the boundary off its own protocol
+    /// (`acp`, `oneshot-continue`) and for a `stream` entry whose catalogue
+    /// names the closing frame. False is the honest answer for a `stream`
+    /// entry that does not: mana would otherwise open a turn that nothing ever
+    /// closes and queue the session into silence. The caller degrades to v2.1
+    /// behaviour -- every turn goes out at once -- and says so.
+    fn tracks_turn_end(&self) -> bool {
+        true
     }
 
     /// The id this conversation can be reopened by, when the transport's

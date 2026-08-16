@@ -1,1 +1,4 @@
 /target
+
+# hone's per-project learned-filter state is machine-local, not source
+.hone/

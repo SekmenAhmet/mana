@@ -42,6 +42,11 @@ const GUTTER: usize = 2;
 /// punctuation can sit a shade below the things it separates.
 const SEPARATOR: &str = " · ";
 
+/// What stands in the gutter of a turn the session has not sent yet. One
+/// text-width character, like every other marker in that column, so a queued
+/// line does not shift the text it belongs to.
+const PENDING_MARKER: &str = "…";
+
 pub fn draw(frame: &mut Frame, app: &App, nodes: &[GraphNode]) {
     let [main, status, input] = Layout::vertical([
         Constraint::Min(1),
@@ -154,8 +159,18 @@ const COUNTER: Decoration = Decoration {
 };
 
 /// One chat line as one or more rows: a marker in the gutter, then the text.
+///
+/// A line still waiting in the queue keeps its own colours and swaps its
+/// marker for an ellipsis: the words are the user's either way, and the one
+/// thing that differs is whether the PM has them yet. The gutter is the right
+/// place for that -- the same column that already distinguishes who spoke --
+/// and it costs no colour the theme has not already spent.
 fn render_line(line: &ChatLine, width: usize) -> Vec<Line<'static>> {
-    render_rows(&line.text, &decoration(line.source), width)
+    let mut decoration = decoration(line.source);
+    if line.pending {
+        decoration.marker = PENDING_MARKER;
+    }
+    render_rows(&line.text, &decoration, width)
 }
 
 /// Wraps `text` to the pane and hangs `decoration`'s marker off the first row.
@@ -319,30 +334,50 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         // arithmetic, never the way out. The PM's name is not repeated here —
         // the chat pane's title already carries it, and those columns are
         // better spent on the figures.
-        None => Line::from(vec![
-            Span::styled(" Ctrl+G graph", theme::STATUS_KEY),
-            Span::styled(SEPARATOR, theme::STATUS_SEPARATOR),
-            // Named rather than implied: the pane hides most of what the
-            // session produced, and a key nobody knows about is a feature
-            // nobody has.
-            Span::styled("Ctrl+O raw ", theme::STATUS_KEY),
-            if app.show_raw {
-                Span::styled("on", theme::STATUS_ON)
-            } else {
-                Span::styled("off", theme::STATUS_OFF)
-            },
-            Span::styled(SEPARATOR, theme::STATUS_SEPARATOR),
-            Span::styled("Ctrl+C quit", theme::STATUS_KEY),
-            Span::styled(SEPARATOR, theme::STATUS_SEPARATOR),
-            Span::styled(
+        None => Line::from(
+            vec![
+                Span::styled(" Ctrl+G graph", theme::STATUS_KEY),
+                Span::styled(SEPARATOR, theme::STATUS_SEPARATOR),
+                // Named rather than implied: the pane hides most of what the
+                // session produced, and a key nobody knows about is a feature
+                // nobody has.
+                Span::styled("Ctrl+O raw ", theme::STATUS_KEY),
+                if app.show_raw {
+                    Span::styled("on", theme::STATUS_ON)
+                } else {
+                    Span::styled("off", theme::STATUS_OFF)
+                },
+                Span::styled(SEPARATOR, theme::STATUS_SEPARATOR),
+                Span::styled("Ctrl+C quit", theme::STATUS_KEY),
+                Span::styled(SEPARATOR, theme::STATUS_SEPARATOR),
+            ]
+            .into_iter()
+            // Between the keys and the figures, and absent entirely when the queue
+            // is empty (which is most of a session): it is the one fact on this
+            // line that is about to change, and a truncated status bar should lose
+            // arithmetic rather than the answer to "where did my message go?".
+            .chain(queued_segment(app.queued))
+            .chain([Span::styled(
                 app.usage
                     .clone()
                     .unwrap_or_else(|| "no usage reported yet".to_string()),
                 theme::STATUS_FACT,
-            ),
-        ]),
+            )])
+            .collect::<Vec<Span>>(),
+        ),
     };
     frame.render_widget(Paragraph::new(line), area);
+}
+
+/// `N queued · `, or nothing at all.
+fn queued_segment(queued: usize) -> Vec<Span<'static>> {
+    if queued == 0 {
+        return Vec::new();
+    }
+    vec![
+        Span::styled(format!("{queued} queued"), theme::STATUS_ON),
+        Span::styled(SEPARATOR, theme::STATUS_SEPARATOR),
+    ]
 }
 
 /// The agent's own wording for a key, so the operator approves the thing the
@@ -491,6 +526,61 @@ mod tests {
         assert!(rendered.contains("› and a test"), "{rendered}");
         // The graph is hidden until asked for.
         assert!(!rendered.contains("Graph"), "{rendered}");
+    }
+
+    /// The queue, as the operator sees it: their words are in the transcript
+    /// the moment they typed them, marked as not yet handed over, and the bar
+    /// says how many are waiting.
+    #[test]
+    fn queued_turns_are_marked_in_the_pane_and_counted_in_the_status_bar() {
+        let mut app = App::new("Claude Code");
+        app.push(Source::User, "add a healthcheck endpoint");
+        app.push_pending(Source::User, "and a test for it");
+        app.push_pending(Source::User, "then open the PR");
+        app.queued = 2;
+        app.usage = Some("output 44".to_string());
+
+        let rendered = dump(&screen(&app, &[], 100, 12));
+        // Sent: the usual chevron. Waiting: an ellipsis in the same column, so
+        // the text does not shift when it finally goes out.
+        assert!(
+            rendered.contains("› add a healthcheck endpoint"),
+            "{rendered}"
+        );
+        assert!(rendered.contains("… and a test for it"), "{rendered}");
+        assert!(rendered.contains("… then open the PR"), "{rendered}");
+        // Between the keys and the figures.
+        assert!(
+            rendered.contains("Ctrl+C quit · 2 queued · output 44"),
+            "{rendered}"
+        );
+    }
+
+    /// Nothing waiting, nothing said: the bar reads exactly as it did before
+    /// the queue existed, which is what most of a session looks like.
+    #[test]
+    fn an_empty_queue_says_nothing_at_all() {
+        let app = App::new("Claude Code");
+        let rendered = dump(&screen(&app, &[], 100, 8));
+        assert!(!rendered.contains("queued"), "{rendered}");
+        assert!(
+            rendered.contains("Ctrl+C quit · no usage reported yet"),
+            "{rendered}"
+        );
+    }
+
+    /// A released turn loses its mark in place, rather than being written into
+    /// the transcript a second time.
+    #[test]
+    fn releasing_a_queued_turn_restores_the_ordinary_user_marker() {
+        let mut app = App::new("Claude Code");
+        app.push_pending(Source::User, "and a test for it");
+        app.release_pending();
+        app.queued = 0;
+
+        let rendered = dump(&screen(&app, &[], 100, 8));
+        assert!(rendered.contains("› and a test for it"), "{rendered}");
+        assert!(!rendered.contains("… and a test"), "{rendered}");
     }
 
     /// The status bar is truncated, not wrapped, and an ACP agent's usage

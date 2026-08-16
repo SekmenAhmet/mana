@@ -45,10 +45,9 @@ ignore = [
 
 [licenses]
 version = 2
-# mana itself is publish = false and its license is deliberately undecided for
-# now (Ahmet, 2026-08-15) — skip the check for unpublished crates so the gate
-# stays meaningful for dependencies without forcing that decision early.
-private = { ignore = true }
+# mana is MIT OR Apache-2.0 (chosen 2026-08-16) and still publish = false —
+# crates.io is a separate decision. The gate now checks mana's own license
+# like any other crate's; both halves of the pair are in the allowlist below.
 # Allowlist, not denylist: an unexpected license should be a conscious
 # decision, not something that slips in with a transitive dependency.
 allow = [

@@ -52,7 +52,7 @@ use crossterm::terminal::{
 use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -143,6 +143,20 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     for line in std::mem::take(&mut session.startup) {
         app.push(Source::Mana, &line);
     }
+    // Degraded, and visible rather than silent -- the same rule the event map
+    // follows. Without a turn boundary mana cannot hold anything back, so
+    // typing mid-answer behaves as it did before the queue existed, and the
+    // operator learns that here instead of from a counter that never moves.
+    if !session.tracks_turns {
+        app.push(
+            Source::Mana,
+            &format!(
+                "[mana] {} declares no [pm.events].turn_end, so mana cannot tell when a turn \
+                 ends: anything typed while the PM is answering goes straight to it.",
+                session.cli_name
+            ),
+        );
+    }
 
     enable_raw_mode()?;
     let mut stdout = std::io::stdout();
@@ -163,6 +177,16 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     terminal.show_cursor()?;
 
     let _ = session.shutdown();
+    // Quitting with turns still waiting is the operator's own decision, but it
+    // is one they may have forgotten they made: the queue lives in a status
+    // bar that has just disappeared. Printed after the alternate screen is
+    // gone, where it can actually be read.
+    for queued in session.flush_queue() {
+        println!(
+            "never sent -- you ended the session first: {}",
+            first_line(&queued.text)
+        );
+    }
     // Both ways out of the loop lead here, and both mean the same thing for a
     // sub-agent: the process that dispatched it is leaving. Nothing else would
     // ever stop it -- its observer thread died with mana, so it would run to
@@ -260,6 +284,42 @@ struct Session {
     /// same four tools over its own protocol, and scanning its prose for
     /// fenced blocks would be a second way in that nothing asked for.
     sentinel: Option<Sentinel>,
+    /// Everything that would have been sent while the PM was mid-answer, in
+    /// the order it arrived.
+    ///
+    /// One queue for both kinds of turn, and that is the point: a typed
+    /// question and an injected `[mana]` notification are the same thing to
+    /// the PM -- a user turn -- so interleaving them by arrival is the only
+    /// order that reads as a conversation. Two queues would let a dispatch
+    /// notice overtake a question the operator asked first.
+    queue: VecDeque<Queued>,
+    /// Whether the PM is mid-turn. Opened by every send, closed by
+    /// `PmEvent::TurnEnded` (or by the PM dying).
+    turn_open: bool,
+    /// Whether the transport can close a turn at all. False leaves `turn_open`
+    /// permanently shut, which is v2.1 behaviour: every turn goes out at once.
+    /// Saying so is `run`'s job -- silently not queueing would look like a
+    /// queue that never fills.
+    tracks_turns: bool,
+}
+
+/// One turn waiting its place.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Queued {
+    text: String,
+    /// Whether a human typed it. Only these have a line already on screen
+    /// waiting to lose its pending mark, and only these are worth naming back
+    /// to the user if the PM dies before they are sent.
+    typed: bool,
+}
+
+/// What became of something the session was asked to send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Delivery {
+    /// Written to the transport now.
+    Sent,
+    /// Held: the PM is mid-turn. It goes out on `TurnEnded`, in order.
+    Queued,
 }
 
 impl Session {
@@ -271,8 +331,8 @@ impl Session {
     /// The one turn whose words the chat pane shows: a human typed it. The
     /// echo itself is `apply_app_event`'s, because that is the only place that
     /// knows somebody pressed Enter.
-    fn send_typed(&mut self, text: &str) -> Result<()> {
-        self.pm.send_user(text)
+    fn send_typed(&mut self, text: &str) -> Result<Delivery> {
+        self.deliver(text, true)
     }
 
     /// A turn mana wrote itself -- the activation (and, on the CLIs that cannot
@@ -286,8 +346,65 @@ impl Session {
     /// tell them apart. The chat pane may say *that* mana spoke to the PM --
     /// one short line, or the one-line notice a finished dispatch deserves --
     /// and never *what* was said. Nothing here returns text to render.
-    fn send_internal(&mut self, text: &str) -> Result<()> {
-        self.pm.send_user(text)
+    fn send_internal(&mut self, text: &str) -> Result<Delivery> {
+        self.deliver(text, false)
+    }
+
+    /// The single door every turn leaves by: send it, or hold it until the PM
+    /// is free.
+    ///
+    /// A PM is a conversation, and a conversation has turns. Writing into one
+    /// that is already open is what v2.1 did -- the frame landed in the middle
+    /// of an answer, and what a CLI does with that is anybody's guess. So mana
+    /// keeps the fact it now has (`PmEvent::TurnEnded`) and waits.
+    ///
+    /// The `oneshot-continue` driver already serialises turns inside itself,
+    /// and it is routed through here anyway: its internal queue is invisible,
+    /// so a session on that driver would show `0 queued` while holding three
+    /// messages. One queue mana can see beats two it cannot.
+    fn deliver(&mut self, text: &str, typed: bool) -> Result<Delivery> {
+        if self.turn_open {
+            self.queue.push_back(Queued {
+                text: text.to_string(),
+                typed,
+            });
+            return Ok(Delivery::Queued);
+        }
+        self.pm.send_user(text)?;
+        // Only after the write succeeded: a turn that never reached the PM did
+        // not open one, and pretending otherwise would wedge the queue behind
+        // an answer nobody is coming to give.
+        self.turn_open = self.tracks_turns;
+        Ok(Delivery::Sent)
+    }
+
+    /// Closes the open turn and sends the next thing waiting, if any.
+    ///
+    /// Returns what went out, so the caller can clear its pending mark, and
+    /// how it went -- a delivery failure here is almost always a PM that died
+    /// between the end of its turn and this line.
+    fn release_next(&mut self) -> Option<(Queued, Result<()>)> {
+        self.turn_open = false;
+        let queued = self.queue.pop_front()?;
+        let sent = self.pm.send_user(&queued.text);
+        if sent.is_ok() {
+            self.turn_open = self.tracks_turns;
+        }
+        Some((queued, sent))
+    }
+
+    fn queued(&self) -> usize {
+        self.queue.len()
+    }
+
+    /// Empties the queue, for a session that is over.
+    ///
+    /// The messages come back rather than being dropped: somebody typed them,
+    /// they were never sent, and a queue that vanished silently would leave
+    /// the operator believing the PM had read them.
+    fn flush_queue(&mut self) -> Vec<Queued> {
+        self.turn_open = false;
+        self.queue.drain(..).collect()
     }
 
     fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
@@ -332,6 +449,11 @@ impl Session {
         // The results themselves never render: they are a tool's answer to the
         // PM, often a page of JSON, and the operator gets `outcome.log`'s one
         // compact line per call instead.
+        // Queued like anything else when the PM is still mid-turn: on this
+        // channel the results *are* the next user turn, and a CLI that reads
+        // one while it is still answering is exactly the race the queue exists
+        // to remove. It leaves on `TurnEnded`, which on the one CLI that uses
+        // this channel is the very next event.
         if let Some(reply) = outcome.reply
             && let Err(error) = self.send_internal(&reply)
         {
@@ -351,6 +473,35 @@ impl Session {
 
     fn shutdown(&mut self) -> Result<()> {
         self.pm.shutdown()
+    }
+
+    /// Waits for the PM to go idle, doing what `run_loop` does with the events
+    /// it finds on the way: `TurnEnded` releases the queue, `Exited` empties
+    /// it. Returns whatever was still waiting when the PM died.
+    ///
+    /// For the smoke tests, which drive a real session without a terminal and
+    /// would otherwise race the shell script standing in for a CLI. The
+    /// activation is a turn like any other, so nothing a test sends afterwards
+    /// leaves until that turn is over -- which is the behaviour under test as
+    /// much as it is a precondition for it.
+    #[cfg(all(test, unix))]
+    fn settle(&mut self) -> Vec<Queued> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut never_sent = Vec::new();
+        while self.turn_open && Instant::now() < deadline {
+            for event in self.drain() {
+                match event {
+                    PmEvent::TurnEnded => {
+                        self.release_next();
+                    }
+                    PmEvent::Exited { .. } => never_sent.extend(self.flush_queue()),
+                    _ => {}
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!self.turn_open, "the PM never finished its turn");
+        never_sent
     }
 }
 
@@ -430,6 +581,7 @@ fn prepare_session(
         activation(entry, &skill.path)
     };
 
+    let tracks_turns = pm.tracks_turn_end();
     let mut session = Session {
         pm,
         cli_name: entry.cli.name.clone(),
@@ -439,6 +591,9 @@ fn prepare_session(
         sentinel,
         project,
         paths,
+        queue: VecDeque::new(),
+        turn_open: false,
+        tracks_turns,
     };
     // Through `send_internal` rather than straight down the transport, so the
     // rule holds where it matters most: this message is a briefing mana wrote,
@@ -969,9 +1124,39 @@ fn run_loop<B: Backend>(
                 }
                 continue;
             }
+            // The PM is free again, so whatever was held goes now -- one turn
+            // per boundary, in the order it was written, because two turns
+            // released at once would land on top of each other exactly the way
+            // the queue exists to prevent.
+            if event == PmEvent::TurnEnded
+                && let Some((queued, sent)) = session.release_next()
+            {
+                if queued.typed {
+                    app.release_pending();
+                }
+                if let Err(error) = sent {
+                    app.push(
+                        Source::Mana,
+                        &format!("[mana] that turn did not reach the PM: {error:#}"),
+                    );
+                }
+            }
             app.apply(&event);
             if let PmEvent::Exited { code } = event {
                 ended = Some(code);
+                // Nothing queued will ever be sent now. Said out loud, with
+                // the words in it: the operator typed them, and a queue that
+                // emptied itself quietly would leave them believing the PM had
+                // read them.
+                for queued in session.flush_queue() {
+                    app.push(
+                        Source::Mana,
+                        &format!(
+                            "[mana] never sent -- the PM is gone: {}",
+                            first_line(&queued.text)
+                        ),
+                    );
+                }
             }
         }
 
@@ -1000,6 +1185,10 @@ fn run_loop<B: Backend>(
         }
         graph.refresh(&session.paths, now, changed);
 
+        // The queue lives in the session and the status bar lives in the view,
+        // so the count is copied across once a frame rather than mirrored in
+        // two places that could disagree.
+        app.queued = session.queued();
         terminal.draw(|frame| render::draw(frame, app, graph.nodes()))?;
 
         // Drawn first, so the last thing the PM said is on screen before mana
@@ -1040,17 +1229,32 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
                 // wondering what "/graph" was supposed to mean.
                 app.toggle_graph();
             } else if !message.trim().is_empty() {
-                app.push(Source::User, &message);
-                if let Err(error) = session.send_typed(&message) {
-                    app.push(
-                        Source::Mana,
-                        &format!("[mana] that turn did not reach the PM: {error:#}"),
-                    );
+                // Echoed before the outcome is known, and echoed the same way
+                // either way: the user's own words belong in the transcript at
+                // the moment they pressed Enter, whether the PM reads them now
+                // or in a minute. What changes is the mark in the gutter.
+                match session.send_typed(&message) {
+                    Ok(Delivery::Sent) => app.push(Source::User, &message),
+                    Ok(Delivery::Queued) => app.push_pending(Source::User, &message),
+                    Err(error) => {
+                        app.push(Source::User, &message);
+                        app.push(
+                            Source::Mana,
+                            &format!("[mana] that turn did not reach the PM: {error:#}"),
+                        );
+                    }
                 }
             }
         }
     }
     true
+}
+
+/// The first line of a message, for a notice that has to fit in the pane. A
+/// queued turn is usually one line anyway -- this is the guard for the ones
+/// mana wrote itself, which can run to the whole role text.
+fn first_line(text: &str) -> &str {
+    text.lines().next().unwrap_or("").trim()
 }
 
 /// Answers the permission the PM is waiting on, if there is one.
@@ -1121,6 +1325,7 @@ prompt = "stdin-jsonl"
 [pm.events]
 text = "$.message.content[?@.type=='text'].text"
 usage = "$.usage"
+turn_end = {{ path = "$.type", equals = "result" }}
 
 [tools]
 channel = "{channel}"
@@ -1859,8 +2064,17 @@ mod smoke {
             fixture
         }
 
-        /// A PM that records what it is told and answers every turn once.
+        /// A PM that records what it is told, answers every turn once, and
+        /// closes each turn with the frame its catalogue entry names -- which
+        /// is what makes the session's turn tracking (and so its queue) real
+        /// in these tests rather than permanently switched off.
         fn fake_pm(&self) -> String {
+            self.fake_pm_body("")
+        }
+
+        /// The same, with `extra` run before the answer -- how a test makes the
+        /// PM slow enough to have a turn typed into.
+        fn fake_pm_body(&self, extra: &str) -> String {
             let path = self.home.join("fake-pm");
             std::fs::write(
                 &path,
@@ -1869,7 +2083,9 @@ mod smoke {
                      printf '%s\\n' \"$*\" > '{argv}'\n\
                      while IFS= read -r line; do\n\
                      \x20 printf '%s\\n' \"$line\" >> '{received}'\n\
+                     {extra}\
                      \x20 echo '{{\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ack\"}}]}}}}'\n\
+                     \x20 echo '{{\"type\":\"result\"}}'\n\
                      done\n",
                     argv = self.argv.display(),
                     received = self.received.display(),
@@ -1878,6 +2094,16 @@ mod smoke {
             .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             path.to_string_lossy().into_owned()
+        }
+
+        /// A PM that takes one turn and dies without answering it: the shape
+        /// that leaves a turn open for ever, and so the only one that shows
+        /// what happens to a queue nobody is coming back for.
+        fn write_mute_pm(&self) {
+            let path = self.home.join("mute-pm");
+            std::fs::write(&path, "#!/bin/sh\nhead -n 1 > /dev/null\nexit 3\n").unwrap();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+            self.write_override(&path.to_string_lossy());
         }
 
         /// Goes through the real override path (design §7) rather than
@@ -1988,11 +2214,19 @@ mod smoke {
         let deadline = Instant::now() + Duration::from_secs(10);
         while app.lines().next().is_none() && Instant::now() < deadline {
             for event in session.drain() {
+                // The activation is a turn like any other, and this loop is
+                // the only thing standing in for `run_loop`: an event dropped
+                // here is a turn that never closes.
+                if event == PmEvent::TurnEnded {
+                    session.release_next();
+                }
                 app.apply(&event);
             }
             std::thread::sleep(Duration::from_millis(20));
         }
         assert_eq!(app.lines().next().unwrap().text, "ack");
+        // ...and nothing mana sends next goes out until that turn is closed.
+        assert!(session.settle().is_empty(), "the queue lost a turn");
 
         // 5. A dispatch reporting in is injected as a user turn -- this is how
         // the PM learns an executor finished without polling.
@@ -2210,6 +2444,7 @@ mod smoke {
                  \x20 else\n\
                  \x20   printf '%s\\n' '{{\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ack\"}}]}}}}'\n\
                  \x20 fi\n\
+                 \x20 printf '%s\\n' '{{\"type\":\"result\"}}'\n\
                  done\n",
                 received = fixture.received.display(),
             ),
@@ -2227,18 +2462,28 @@ mod smoke {
         let activation = fixture.wait_for(&fixture.received, ACTIVATION);
         assert!(activation.contains("fenced ```mana block"), "{activation}");
 
-        // Wait for the PM's answer, then run it through the tool channel.
+        // One turn's events, handled in the order `run_loop` handles them: the
+        // PM's prose goes through the tool channel, which writes the results
+        // back as the next user turn -- and that turn is *queued*, because the
+        // frame closing this one has not arrived yet. The release is what
+        // finally hands it over.
         let deadline = Instant::now() + Duration::from_secs(10);
-        let mut said = None;
-        while said.is_none() && Instant::now() < deadline {
+        let mut pass = None;
+        let mut released = 0;
+        while Instant::now() < deadline && (pass.is_none() || session.queued() > 0) {
             for event in session.drain() {
-                if let PmEvent::Text(text) = event {
-                    said = Some(text);
+                match event {
+                    PmEvent::Text(text) => pass = Some(session.apply_tools(&text)),
+                    PmEvent::TurnEnded => {
+                        released += session.release_next().is_some() as usize;
+                    }
+                    _ => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        let pass = session.apply_tools(&said.expect("the PM never answered"));
+        let pass = pass.expect("the PM never answered");
+        assert_eq!(released, 1, "the tool results were never released");
 
         // The operator sees the sentence and one line of tool activity, not
         // the block and not the JSON that came back.
@@ -2324,6 +2569,164 @@ mod smoke {
         }
     }
 
+    /// Waits for one closing frame and releases whatever it frees, which is
+    /// what `run_loop` does with the same event.
+    fn release_one(session: &mut Session) -> Option<Queued> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            for event in session.drain() {
+                if event == PmEvent::TurnEnded {
+                    return session.release_next().map(|(queued, sent)| {
+                        sent.expect("the release never reached the PM");
+                        queued
+                    });
+                }
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        panic!("the PM never ended its turn");
+    }
+
+    /// The bug, at the level it is fixed: the PM is mid-turn -- it always is
+    /// right after the activation -- and everything sent at it waits its place
+    /// instead of landing in the middle of an answer.
+    #[test]
+    fn everything_sent_while_the_pm_is_answering_is_queued_and_released_in_order() {
+        let fixture = Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+
+        // One FIFO for both kinds of turn: a typed question and an injected
+        // notification are the same thing to the PM, and interleaving them by
+        // arrival is the only order that reads as a conversation.
+        assert_eq!(session.send_typed("who is free").unwrap(), Delivery::Queued);
+        assert_eq!(
+            session.send_internal("[mana] executor finished").unwrap(),
+            Delivery::Queued
+        );
+        assert_eq!(session.send_typed("and then").unwrap(), Delivery::Queued);
+        assert_eq!(session.queued(), 3);
+        // Nothing but the activation has reached the PM yet.
+        assert_eq!(
+            fixture
+                .wait_for(&fixture.received, ACTIVATION)
+                .lines()
+                .count(),
+            1
+        );
+
+        // One turn ends, one turn goes -- not three.
+        let released = release_one(&mut session).expect("the queue held nothing");
+        assert_eq!(released.text, "who is free");
+        assert!(released.typed);
+        assert_eq!(session.queued(), 2);
+
+        // The rest follow, in order, as the PM works through them.
+        assert!(session.settle().is_empty(), "the queue lost a turn");
+        assert_eq!(session.queued(), 0);
+        let received = fixture.wait_for(&fixture.received, "and then");
+        let sent: Vec<String> = received
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["message"]["content"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(sent.len(), 4, "{sent:?}");
+        assert!(sent[0].starts_with(ACTIVATION), "{sent:?}");
+        assert_eq!(
+            &sent[1..],
+            ["who is free", "[mana] executor finished", "and then"]
+        );
+        session.shutdown().unwrap();
+    }
+
+    /// A turn sent to an idle PM is not queued at all: the queue is a wait, not
+    /// a pipeline, and a session that buffered everything would answer every
+    /// question one turn late.
+    #[test]
+    fn a_turn_sent_to_an_idle_pm_goes_straight_out() {
+        let fixture = Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        session.settle();
+
+        assert_eq!(session.send_typed("who is free").unwrap(), Delivery::Sent);
+        assert_eq!(session.queued(), 0);
+        fixture.wait_for(&fixture.received, "who is free");
+        session.shutdown().unwrap();
+    }
+
+    /// Queued messages that will never be sent must not vanish: the operator
+    /// typed them, and a queue that emptied itself quietly would leave them
+    /// believing the PM had read them.
+    #[test]
+    fn a_pm_that_dies_hands_back_everything_it_never_read() {
+        let fixture = Fixture::new();
+        fixture.write_mute_pm();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        assert_eq!(
+            session.send_typed("are you there").unwrap(),
+            Delivery::Queued
+        );
+
+        // No answer is coming: the turn the activation opened is closed by the
+        // process ending, not by the PM finishing.
+        let never_sent = session.settle();
+        assert_eq!(
+            never_sent,
+            [Queued {
+                text: "are you there".to_string(),
+                typed: true
+            }]
+        );
+        assert_eq!(session.queued(), 0);
+    }
+
+    /// The same, through the loop that actually runs it: the notice lands in
+    /// the pane the operator is looking at, with the words they typed in it.
+    #[test]
+    fn the_loop_says_out_loud_what_a_dead_pm_never_read() {
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new();
+        fixture.write_mute_pm();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        assert_eq!(
+            session.send_typed("are you there").unwrap(),
+            Delivery::Queued
+        );
+
+        let mut app = App::new(&session.cli_name);
+        app.push_pending(Source::User, "are you there");
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let end = run_loop(
+            &mut terminal,
+            &mut session,
+            &mut app,
+            &mut GraphCache::new(),
+            &mut Idle {
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(end, SessionEnd::PmExited { code: Some(3) });
+        let lines: Vec<&str> = app.lines().map(|line| line.text.as_str()).collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("never sent") && line.contains("are you there")),
+            "{lines:?}"
+        );
+        assert_eq!(app.queued, 0);
+    }
+
     /// A dead PM must not take the interface down with it: the user typed
     /// that turn, and the explanation belongs where they are looking.
     #[test]
@@ -2332,6 +2735,10 @@ mod smoke {
         let mut session =
             prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         session.shutdown().unwrap();
+        // The activation's turn is closed by the exit rather than by an answer,
+        // which is what leaves the transport -- not the queue -- to refuse the
+        // turn typed next.
+        session.settle();
 
         let mut app = App::new(&session.cli_name);
         app.input = "are you there".to_string();
@@ -2467,6 +2874,10 @@ mod smoke {
         let fixture = Fixture::new();
         let mut session =
             prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        // The scripted keys arrive as fast as the loop can read them, so the
+        // activation turn is closed first: this test is about what typing does,
+        // not about how quickly a shell script answers.
+        session.settle();
         let mut app = App::new(&session.cli_name);
         let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
         let mut events = FakeEventSource::new([

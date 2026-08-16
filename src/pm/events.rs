@@ -29,6 +29,9 @@ pub struct EventMap {
     text: JsonPath,
     /// Optional: a CLI that reports no token counts simply omits the field.
     usage: Option<JsonPath>,
+    /// Optional: only a driver whose process outlives a turn needs to read the
+    /// boundary out of the stream.
+    turn_end: Option<(JsonPath, String)>,
 }
 
 impl EventMap {
@@ -51,19 +54,35 @@ impl EventMap {
             .map(compile)
             .transpose()
             .with_context(|| format!("{id}: [pm.events].usage is not a valid JSONPath"))?;
-        Ok(EventMap { text, usage })
+        let turn_end = events
+            .turn_end
+            .as_ref()
+            .map(|end| compile(&end.path).map(|path| (path, end.equals.clone())))
+            .transpose()
+            .with_context(|| format!("{id}: [pm.events].turn_end.path is not a valid JSONPath"))?;
+        Ok(EventMap {
+            text,
+            usage,
+            turn_end,
+        })
+    }
+
+    /// Whether this map can tell mana a turn is over.
+    pub fn tracks_turn_end(&self) -> bool {
+        self.turn_end.is_some()
     }
 
     /// Turns one line of the PM's output into the events it carries.
     ///
     /// The contract is deliberately thin (design §4): text to display, usage to
-    /// record, and nothing else. Anything the map did not match comes back as
-    /// `Raw` -- degraded and visible, never silent, because a CLI that changes
-    /// its stream shape must show up as ugly lines in the chat pane rather than
-    /// as a PM that mysteriously went quiet.
+    /// record, the frame that closes a turn, and nothing else. Anything the map
+    /// did not match comes back as `Raw` -- degraded and visible, never silent,
+    /// because a CLI that changes its stream shape must show up as ugly lines
+    /// in the chat pane rather than as a PM that mysteriously went quiet.
     ///
-    /// Order within a line: every `text` match in document order, then `usage`.
-    /// A line that yields anything at all never also yields `Raw`.
+    /// Order within a line: every `text` match in document order, then `usage`,
+    /// then `turn_end`. A line that yields anything at all never also yields
+    /// `Raw`.
     pub fn extract(&self, line: &str) -> Vec<PmEvent> {
         // Blank lines are framing, not degradation: emitting `Raw("")` for the
         // gaps between frames would fill the chat pane with nothing.
@@ -91,6 +110,14 @@ impl EventMap {
             if let Some(node) = usage.query(&value).first() {
                 events.push(PmEvent::Usage(node.clone()));
             }
+        }
+        if let Some((path, expected)) = &self.turn_end
+            && path.query(&value).first().and_then(Value::as_str) == Some(expected.as_str())
+        {
+            // Last of the three, so everything the closing frame carried --
+            // the answer, the totals -- is already in hand when whoever is
+            // waiting on the turn is told it may speak.
+            events.push(PmEvent::TurnEnded);
         }
         if events.is_empty() {
             events.push(PmEvent::Raw(line.to_string()));
@@ -126,6 +153,17 @@ pub(super) mod fixture {
 
     pub fn parse(source: &str) -> CliEntry {
         crate::catalog::parse_entry(source).expect("fixture entry must be valid")
+    }
+
+    /// Adds `[pm.events].turn_end` to a source built by `source`.
+    ///
+    /// A patch rather than a sixth parameter: only the turn-taking tests care,
+    /// and every other caller would have to grow a `None` for it.
+    pub fn with_turn_end(source: &str, path: &str, equals: &str) -> String {
+        source.replace(
+            "\n[tools]",
+            &format!("turn_end = {{ path = \"{path}\", equals = \"{equals}\" }}\n\n[tools]"),
+        )
     }
 
     pub fn source(
@@ -193,6 +231,89 @@ mod tests {
 
     fn map(text: &str, usage: Option<&str>) -> EventMap {
         EventMap::for_entry(&fixture::entry("fake", &[], "stdin-jsonl", text, usage)).unwrap()
+    }
+
+    fn map_with_turn_end(text: &str, path: &str, equals: &str) -> EventMap {
+        let source = fixture::source("fake", &[], "stdin-jsonl", text, Some("$.usage"));
+        EventMap::for_entry(&fixture::parse(&fixture::with_turn_end(
+            &source, path, equals,
+        )))
+        .unwrap()
+    }
+
+    /// The bug this scoping exists for, in one line: claude echoes a loaded
+    /// skill back as a `user` frame shaped exactly like an assistant one, and
+    /// an unscoped filter renders the whole SKILL.md as if the PM had said it.
+    ///
+    /// RFC 9535 allows an absolute (`$`-rooted) query inside a filter
+    /// expression, and serde_json_path implements it -- which is what keeps
+    /// this fix inside the catalogue instead of inside a Rust `if`.
+    #[test]
+    fn a_filter_may_scope_a_text_path_to_the_frame_that_carries_it() {
+        const SCOPED: &str = "$.message.content[?@.type=='text' && $.type=='assistant'].text";
+        let map = map(SCOPED, None);
+
+        assert_eq!(
+            map.extract(
+                r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"prose"}]}}"#
+            ),
+            vec![PmEvent::Text("prose".to_string())]
+        );
+        // Same shape, different frame: not the PM talking, so not chat.
+        let echo = r##"{"type":"user","isSynthetic":true,"message":{"role":"user","content":[{"type":"text","text":"# mana PM"}]}}"##;
+        assert_eq!(map.extract(echo), vec![PmEvent::Raw(echo.to_string())]);
+    }
+
+    #[test]
+    fn the_frame_the_catalogue_names_ends_the_turn() {
+        let map = map_with_turn_end(TEXT_PATH, "$.type", "result");
+        assert_eq!(
+            map.extract(r#"{"type":"result","usage":{"output_tokens":4}}"#),
+            vec![
+                PmEvent::Usage(json!({"output_tokens": 4})),
+                PmEvent::TurnEnded,
+            ]
+        );
+        // Mid-turn frames leave it open.
+        assert_eq!(
+            map.extract(
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"hi"}]}}"#
+            ),
+            vec![PmEvent::Text("hi".to_string())]
+        );
+    }
+
+    /// A frame that ends a turn and says nothing else is still a turn ending,
+    /// not an unmatched line -- otherwise the queue would wait on a `Raw`.
+    #[test]
+    fn a_bare_turn_end_frame_is_not_degraded_to_raw() {
+        let map = map_with_turn_end(TEXT_PATH, "$.kind", "done");
+        assert_eq!(map.extract(r#"{"kind":"done"}"#), vec![PmEvent::TurnEnded]);
+    }
+
+    /// The value has to match, not merely exist: `stopReason: max_tokens` and
+    /// `stopReason: end_turn` are different frames on some CLIs.
+    #[test]
+    fn a_turn_end_path_that_resolves_to_another_value_ends_nothing() {
+        let map = map_with_turn_end(TEXT_PATH, "$.type", "result");
+        let line = r#"{"type":"system","subtype":"init"}"#;
+        assert_eq!(map.extract(line), vec![PmEvent::Raw(line.to_string())]);
+    }
+
+    #[test]
+    fn a_map_without_a_turn_end_never_claims_to_track_turns() {
+        assert!(!map(TEXT_PATH, None).tracks_turn_end());
+        assert!(map_with_turn_end(TEXT_PATH, "$.type", "result").tracks_turn_end());
+    }
+
+    #[test]
+    fn a_bad_turn_end_path_is_a_loud_startup_error_naming_the_field() {
+        let source = fixture::source("fake", &[], "stdin-jsonl", TEXT_PATH, None);
+        let entry = fixture::parse(&fixture::with_turn_end(&source, "$.[", "result"));
+        let err = EventMap::for_entry(&entry).unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("[pm.events].turn_end.path"), "{rendered}");
+        assert!(rendered.contains("fake"), "{rendered}");
     }
 
     #[test]
@@ -343,6 +464,15 @@ mod golden {
     /// scanner has to survive.
     const AGY_MALFORMED: &str = include_str!("../../catalog/goldens/agy/malformed-block.jsonl");
 
+    /// The bug the user reported, recorded: a real `mana launch claude`
+    /// activation turn (2026-08-16, haiku, this entry's exact argv, the skill
+    /// installed at `.claude/skills/mana-pm`) in which the PM called the
+    /// `Skill` tool and the CLI echoed the whole of SKILL.md back into the
+    /// stream. Nine frames out of the 53 that turn produced: the two assistant
+    /// texts, the thinking blocks around them, the tool_use, its tool_result,
+    /// the echo itself, a rate-limit notice, and the closing `result`.
+    const SKILL_ECHO: &str = include_str!("../../catalog/goldens/claude/skill-echo.jsonl");
+
     fn replay(cli: &str, transcript: &str) -> Vec<Vec<PmEvent>> {
         let catalog = Catalog::embedded().unwrap();
         let map = EventMap::for_entry(catalog.get(cli).expect("catalogue entry")).unwrap();
@@ -365,11 +495,13 @@ mod golden {
             .collect();
         assert_eq!(texts.len(), 1, "extra text leaked into the chat pane");
 
-        // Line 9, the result frame, is where claude reports the turn's totals.
+        // Line 9, the result frame, is where claude reports the turn's totals
+        // -- and, since 2026-08-16, where it closes the turn.
         let PmEvent::Usage(usage) = &events[8][0] else {
             panic!("the result line lost its usage: {:?}", events[8]);
         };
-        assert_eq!(events[8].len(), 1);
+        assert_eq!(events[8].len(), 2);
+        assert_eq!(events[8][1], PmEvent::TurnEnded);
         assert_eq!(usage["output_tokens"], 44);
 
         // Line 6 is an assistant frame whose only content block is `thinking`,
@@ -391,6 +523,58 @@ mod golden {
                 index + 1
             );
         }
+    }
+
+    /// The regression guard for the reported bug: a session where the PM loads
+    /// its role must open on the PM's greeting, not on the role text.
+    ///
+    /// The frame that caused it is line 5 of the golden. It is a *user* frame
+    /// -- `{"type":"user","isSynthetic":true,...}` -- whose message content is
+    /// one ordinary `{"type":"text"}` block holding the entire SKILL.md, so the
+    /// only thing that can tell it apart from the PM talking is the frame it
+    /// arrived in.
+    #[test]
+    fn claude_never_renders_a_loaded_skill_as_something_the_pm_said() {
+        let lines: Vec<&str> = SKILL_ECHO.lines().collect();
+        let events = replay("claude", SKILL_ECHO);
+        assert_eq!(events.len(), lines.len(), "a line produced no verdict");
+
+        let texts: Vec<&str> = events
+            .iter()
+            .flatten()
+            .filter_map(|event| match event {
+                PmEvent::Text(text) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        // Exactly the two things the PM said, in order, and nothing else.
+        assert_eq!(
+            texts,
+            [
+                "I'll load the mana-pm skill to get the full instructions.",
+                "Understood. I'm your PM for this session.\n\nBefore I start breaking work into \
+                 tasks, I need to understand what we're building. What's the objective?",
+            ]
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("# mana PM")),
+            "the role text reached the chat pane"
+        );
+
+        // The echo is still visible as degradation rather than dropped: it goes
+        // to the raw view, behind the counter, like every other frame mana
+        // understands but did not ask for.
+        assert_eq!(events[4], vec![PmEvent::Raw(lines[4].to_string())]);
+        assert!(lines[4].contains("# mana PM"), "wrong golden line");
+
+        // The turn closes exactly once, on the last frame.
+        let ends = events
+            .iter()
+            .flatten()
+            .filter(|event| matches!(event, PmEvent::TurnEnded))
+            .count();
+        assert_eq!(ends, 1);
+        assert_eq!(events[8].last(), Some(&PmEvent::TurnEnded));
     }
 
     /// agy's shipped paths against agy's real stream. Both were wrong until
