@@ -57,6 +57,13 @@ pub fn map_key_event(
 /// Source of raw key events for the PM's render loop. The loop depends on
 /// this instead of calling `crossterm::event::poll`/`read` directly, so its
 /// per-tick logic is testable against a scripted key sequence.
+///
+/// A trait rather than a `&mut dyn FnMut(Duration) -> …` parameter (#69):
+/// every implementation carries behaviour that wants a name and a comment --
+/// the Windows key-release filter below, the fail-fast contract on
+/// `test_support::FakeEventSource`, the deadline on `launch_pm`'s `Idle`.
+/// Closures would relocate all three into anonymous lambdas at their call
+/// sites, not delete them.
 pub trait EventSource {
     fn poll_key(
         &mut self,

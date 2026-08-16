@@ -103,7 +103,7 @@ pub fn create(
     // Before anything else: a worktree still registered at this path pins the
     // branch (git refuses to force-update a branch checked out in a worktree)
     // and blocks `worktree add` (the directory "already exists").
-    remove_worktree(project_root, &path)?;
+    remove_at(project_root, &path)?;
     if let Some(parent) = path.parent() {
         crate::project::create_dir_all(parent)?;
     }
@@ -132,29 +132,6 @@ pub fn create(
         branch,
         base_ref,
     })
-}
-
-/// Removes the worktree at the end of a task. The branch survives on purpose:
-/// it carries the executor's commits, which the reviewer and then the PM
-/// still need. Tolerates a worktree that was already deleted or mangled by
-/// hand — cleanup that fails on a half-dead worktree just leaves the next
-/// dispatch to trip over the same corpse (managent's stale-lock failure).
-/// Unused by the dev command on purpose — M1 keeps worktrees inspectable and
-/// prints the manual hint; automated cleanup wires in with the router (2.x).
-#[allow(dead_code)]
-pub fn cleanup(project_root: &Path, info: &WorktreeInfo) -> anyhow::Result<()> {
-    remove_at(project_root, &info.path)
-}
-
-/// The same teardown, addressed by path rather than by `WorktreeInfo`.
-///
-/// Added for `mana doctor --prune` (task 4.3), which finds leftovers by
-/// walking `worktrees_dir` and therefore knows a path and nothing else — the
-/// branch and base ref that `WorktreeInfo` also carries would have to be
-/// invented to call `cleanup`, and an invented branch name in a teardown path
-/// is exactly the kind of near-truth that deletes the wrong thing one day.
-pub fn remove_at(project_root: &Path, path: &Path) -> anyhow::Result<()> {
-    remove_worktree(project_root, path)
 }
 
 fn branch_name(task_id: &str) -> String {
@@ -205,7 +182,13 @@ fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
 /// "validation failed ... .git does not exist" the moment someone deleted
 /// part of the directory. The two remaining steps finish the job, so only
 /// they are fatal.
-fn remove_worktree(project_root: &Path, path: &Path) -> anyhow::Result<()> {
+///
+/// Addressed by path, never by `WorktreeInfo`: `create` calls it on a path it
+/// has not built a `WorktreeInfo` for yet, and `mana doctor --prune` finds
+/// leftovers by walking `worktrees_dir` and knows nothing but a path. The
+/// branch never enters into it — it carries the executor's commits, which the
+/// reviewer and then the PM still need, so teardown must not touch it.
+pub fn remove_at(project_root: &Path, path: &Path) -> anyhow::Result<()> {
     // Doubled `--force` is git's documented way to remove a *locked*
     // worktree; a single one only covers a dirty one.
     let _ = git(
@@ -601,7 +584,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_removes_the_worktree_and_its_admin_entry_but_keeps_the_branch() {
+    fn remove_at_removes_the_worktree_and_its_admin_entry_but_keeps_the_branch() {
         let fixture = Fixture::new();
         fixture.seed_commit("README.md", "base\n");
         let info = create(&fixture.project, &fixture.mana_home, TASK_ID).unwrap();
@@ -611,7 +594,7 @@ mod tests {
         fixture.git_ok(&info.path, &["commit", "-m", "mana: executor commit"]);
         let tip = fixture.git_ok(&info.path, &["rev-parse", "HEAD"]);
 
-        cleanup(&fixture.project, &info).unwrap();
+        remove_at(&fixture.project, &info.path).unwrap();
 
         assert!(!info.path.exists(), "worktree directory survived cleanup");
         assert_eq!(
@@ -632,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn cleanup_survives_a_worktree_directory_deleted_by_hand() {
+    fn remove_at_survives_a_worktree_directory_deleted_by_hand() {
         let fixture = Fixture::new();
         fixture.seed_commit("README.md", "base\n");
         let info = create(&fixture.project, &fixture.mana_home, TASK_ID).unwrap();
@@ -641,7 +624,7 @@ mod tests {
         // still there, its `.git` pointer is not.
         std::fs::remove_file(info.path.join(".git")).unwrap();
 
-        cleanup(&fixture.project, &info).unwrap();
+        remove_at(&fixture.project, &info.path).unwrap();
         assert!(!info.path.exists());
         assert_eq!(fixture.worktree_admin_entries(), 0);
         assert_eq!(fixture.registered_worktrees(), 1);

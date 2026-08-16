@@ -14,6 +14,10 @@
 //! then report -- so no path leaves a sub-agent running behind mana's back.
 
 use crate::catalog::PromptMode;
+// The two halves of this that carry no timeout policy -- the process group and
+// the bounded join -- are the same call the PM drivers make, so they live once
+// in `subprocess`. The kill below is the half that is genuinely this module's.
+use crate::subprocess::{join_or_detach, set_process_group};
 use anyhow::{Context, Result, bail};
 use std::io::{Read, Write};
 use std::path::PathBuf;
@@ -156,8 +160,8 @@ pub fn run(spec: &SpawnSpec, on_spawn: impl FnOnce(u32)) -> Result<SpawnOutcome>
     let duration = started.elapsed();
 
     let drain_deadline = Instant::now() + DRAIN_GRACE;
-    await_eof(stdout_reader, drain_deadline);
-    await_eof(stderr_reader, drain_deadline);
+    join_or_detach(stdout_reader, drain_deadline);
+    join_or_detach(stderr_reader, drain_deadline);
 
     Ok(SpawnOutcome {
         pid,
@@ -195,19 +199,6 @@ fn wait(child: &mut Child, pid: u32, deadline: Instant) -> Result<(Option<i32>, 
     }
 }
 
-/// Waits for a capture thread to hit EOF, but never past `deadline`.
-///
-/// Unbounded joining would hand mana's timeout enforcement to the very process
-/// that ignored it: a grandchild that somehow survived the kill still holds the
-/// write end of the pipe, so the reader would never see EOF. An abandoned
-/// thread keeps appending to a capped buffer nobody reads, which costs a
-/// bounded amount of memory and no correctness.
-fn await_eof(reader: JoinHandle<()>, deadline: Instant) {
-    while !reader.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
 fn capture<R: Read + Send + 'static>(mut pipe: R) -> (Arc<Mutex<CappedBuffer>>, JoinHandle<()>) {
     let buffer = Arc::new(Mutex::new(CappedBuffer::new(OUTPUT_CAP_BYTES)));
     let sink = Arc::clone(&buffer);
@@ -241,25 +232,6 @@ fn deliver(mut pipe: ChildStdin, prompt: String) {
         // Dropping the handle closes stdin: a CLI that reads to EOF hangs
         // forever otherwise.
     });
-}
-
-#[cfg(unix)]
-fn set_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // 0 = "become the leader of your own group", so the child's pgid equals
-    // its pid. Without this the child shares mana's group, and killing that
-    // group on timeout would kill mana.
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-fn set_process_group(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    // The child and its descendants form a group of their own, so a console
-    // control event aimed at a sub-agent cannot travel back up into the TUI.
-    // See `kill_group` for what a timeout actually kills here.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
 }
 
 #[cfg(unix)]

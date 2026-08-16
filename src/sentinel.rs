@@ -37,7 +37,7 @@
 //! on, rather than being argued with turn after turn.
 
 use crate::catalog::Catalog;
-use crate::mcp::{CreateTaskParams, LaunchSubagentParams, ManaTools, TaskRef};
+use crate::mcp::ManaTools;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
@@ -325,16 +325,6 @@ fn truncate(text: &str, limit: usize) -> String {
     let kept: String = text.chars().take(limit).collect();
     format!("{kept}...")
 }
-
-// The types the arms of `execute` deserialize into are named here rather than
-// inferred, so a renamed parameter struct in `mcp.rs` breaks this file instead
-// of quietly widening what a sentinel PM may send.
-const _: fn() = || {
-    fn assert_deserialize<T: serde::de::DeserializeOwned>() {}
-    assert_deserialize::<CreateTaskParams>();
-    assert_deserialize::<LaunchSubagentParams>();
-    assert_deserialize::<TaskRef>();
-};
 
 #[cfg(test)]
 mod tests {

@@ -1,8 +1,22 @@
+//! Process plumbing that belongs to no single caller: the short "run a CLI and
+//! read what it printed" probe `doctor` and `install` share, plus the two
+//! platform details the sub-agent spawner (`crate::spawn`) and the PM drivers
+//! (`crate::pm::child`) need identically -- putting a child in its own process
+//! group, and waiting on a reader thread without waiting forever.
+//!
+//! Only the parts that carry no policy live here. What a timeout or a shutdown
+//! then *does* to that group stays with whoever owns the deadline.
+
 use anyhow::Context;
 use std::io::Read;
 use std::path::Path;
-use std::process::Stdio;
+use std::process::{Command, Stdio};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+/// How often a wait loop asks whether it can stop. Small enough that a
+/// sub-second bound is still honoured, large enough not to spin a core.
+const POLL_INTERVAL: Duration = Duration::from_millis(20);
 
 /// Default budget for `capture_version_output`: long enough for a real CLI
 /// to answer `--version`, short enough that a hung/unresponsive binary
@@ -64,7 +78,7 @@ pub fn capture_output(
     timeout: Duration,
     capture: Capture,
 ) -> anyhow::Result<String> {
-    let mut child = std::process::Command::new(path)
+    let mut child = Command::new(path)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -101,9 +115,47 @@ pub fn capture_output(
                         timeout
                     ));
                 }
-                std::thread::sleep(Duration::from_millis(20));
+                std::thread::sleep(POLL_INTERVAL);
             }
         }
+    }
+}
+
+/// Puts a child in a process group of its own, so a signal aimed at the group
+/// on either side cannot cross into the other.
+///
+/// One copy for two callers because it is one call for one reason: without it
+/// the child shares mana's group, so killing that group would kill mana and a
+/// Ctrl-C meant for the TUI would reach the child. What each caller then kills
+/// -- and when -- is policy and stays with the caller.
+#[cfg(unix)]
+pub fn set_process_group(command: &mut Command) {
+    use std::os::unix::process::CommandExt;
+    // 0 = "become the leader of your own group", so the child's pgid equals
+    // its pid -- which is what makes a later `killpg` reach its descendants.
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+pub fn set_process_group(command: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    // The child and its descendants form a console group of their own. This is
+    // the whole of what Windows gives for free: see each caller's `kill_group`
+    // for what a kill actually reaches, which is where the two diverge.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+/// Waits for a reader thread to finish, but never past `deadline`.
+///
+/// Unbounded joining would hand mana's own timing to whatever still holds the
+/// write end of the pipe -- a grandchild that survived the kill, say -- so the
+/// process that ignored a deadline would decide how long mana waits on it. A
+/// detached thread keeps appending to a bounded buffer nobody reads, which
+/// costs memory that is already capped and no correctness.
+pub fn join_or_detach(handle: JoinHandle<()>, deadline: Instant) {
+    while !handle.is_finished() && Instant::now() < deadline {
+        std::thread::sleep(POLL_INTERVAL);
     }
 }
 

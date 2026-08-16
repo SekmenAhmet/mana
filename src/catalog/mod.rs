@@ -6,7 +6,6 @@
 //! -- a hardcoded list already went stale within months -- so they belong in
 //! `catalog/*.toml`, where updating them is a data change and not a refactor.
 //! Nothing below may branch on which CLI it is holding.
-#![allow(dead_code)] // Consumers (spawner, router, PM drivers) land in later phases.
 
 mod embedded;
 mod schema;

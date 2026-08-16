@@ -124,6 +124,13 @@ impl Dispatch {
 /// The first `SHORT_ID_CHARS` of an id, or all of it when it is shorter.
 /// Byte-sliced: every id mana mints is a hyphenated ASCII UUID, and `get`
 /// returns `None` rather than panicking if some future id is not.
+///
+/// The one truncation the *display* surfaces share -- `mana ps`, `mana kill`
+/// and the TUI graph pane. Deliberately not `worktree::task_dir_name`, which
+/// truncates to the same width for a different reason: that one names a
+/// directory, so its width answers to Windows' 260-char path cap and cannot
+/// be retuned for legibility. Same number today, two different constraints
+/// (#64).
 pub fn short(id: &str) -> &str {
     id.get(..SHORT_ID_CHARS).unwrap_or(id)
 }

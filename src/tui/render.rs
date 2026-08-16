@@ -409,7 +409,14 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
     );
 }
 
-/// A bordered block's usable interior.
+/// A bordered block's usable interior, in characters.
+///
+/// A conversion, not a reimplementation of `Rect::inner` (#68): the layout
+/// speaks `Rect` (`u16` cells) and everything below speaks `usize` chars, so
+/// the cast has to happen somewhere, and once here beats twice per caller.
+/// The `.max(1)` floor is belt-and-braces -- `render_rows` re-guards the
+/// width it is handed -- but it keeps "a pane is at least one column wide"
+/// true at the boundary rather than in whichever consumer remembers to.
 fn inner_size(area: Rect) -> (usize, usize) {
     (
         area.width.saturating_sub(2).max(1) as usize,

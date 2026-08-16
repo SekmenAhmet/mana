@@ -15,8 +15,7 @@
 //! shape this module hardcodes is the one the catalogue's `prompt` field names.
 
 use super::child::{
-    CLOSE_GRACE, DRAIN_GRACE, POLL_INTERVAL, join_or_detach, kill_group, pump_stderr, read_lines,
-    reap, set_process_group,
+    DRAIN_GRACE, PersistentChild, join_or_detach, pump_stderr, read_lines, reap, set_process_group,
 };
 use super::events::EventMap;
 use super::{PmEvent, PmTransport, Resume};
@@ -26,11 +25,10 @@ use serde::Serialize;
 use std::collections::HashMap;
 use std::io::Write;
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{ChildStdin, Command, Stdio};
 use std::sync::mpsc::{Receiver, channel};
 use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 /// A live PM session.
 ///
@@ -40,19 +38,16 @@ use std::time::{Duration, Instant};
 /// must stay responsive), and the `Child` is shared between the reader and
 /// shutdown because both need to reap it and only one may do so at a time.
 pub struct StreamDriver {
-    child: Arc<Mutex<Child>>,
-    /// Captured at spawn: after the child is reaped the pid is meaningless,
-    /// and `kill_group` must never signal a recycled one.
-    pid: u32,
-    /// `None` once stdin has been closed -- the polite half of shutdown.
+    /// The process, its reader thread and the shutdown that ends both -- the
+    /// part the ACP driver holds identically (see `PersistentChild`).
+    child: PersistentChild,
+    /// `None` once stdin has been closed -- the polite half of shutdown. Owned
+    /// outright, unlike ACP's, which is the one reason the two shutdowns are
+    /// not the same function.
     stdin: Option<ChildStdin>,
     /// Decides how a turn is framed. Catalogue data, not a per-CLI branch.
     prompt: PromptMode,
     events: Receiver<PmEvent>,
-    /// Taken by `shutdown`, which joins it so `Exited` is queued before it
-    /// returns.
-    reader: Option<JoinHandle<()>>,
-    close_grace: Duration,
     /// Read off the map before it was handed to the reader thread: whether this
     /// entry names the frame that closes a turn.
     tracks_turn_end: bool,
@@ -190,17 +185,26 @@ impl StreamDriver {
         });
 
         Ok(StreamDriver {
-            child,
-            pid,
+            child: PersistentChild::new(child, pid, reader),
             stdin: Some(stdin),
             prompt,
             events,
-            reader: Some(reader),
-            close_grace: CLOSE_GRACE,
             tracks_turn_end,
         })
     }
+}
 
+impl Drop for StreamDriver {
+    fn drop(&mut self) {
+        // A PM that outlives mana is v1's zombie: it holds a quota slot, keeps
+        // whatever it spawned (its MCP server, for one) alive, and answers to
+        // nobody. Cheap when `shutdown` was already called -- the child is
+        // reaped and every wait it makes returns at once.
+        let _ = self.shutdown();
+    }
+}
+
+impl PmTransport for StreamDriver {
     /// Writes one user turn and flushes it.
     ///
     /// Synchronous, and deliberately so: a turn is the size of something a
@@ -208,7 +212,7 @@ impl StreamDriver {
     /// large enough to fill that buffer would block until the CLI reads it,
     /// which is the right back-pressure -- the alternative is queueing turns
     /// for a PM that stopped listening.
-    pub fn send_user(&mut self, text: &str) -> Result<()> {
+    fn send_user(&mut self, text: &str) -> Result<()> {
         let prompt = self.prompt;
         let stdin = self.stdin.as_mut().ok_or_else(|| {
             anyhow!("the PM session is closed: its stdin was shut down, so no turn can be sent")
@@ -231,81 +235,8 @@ impl StreamDriver {
             .context("writing a user turn to the PM (has it exited?)")
     }
 
-    /// The session's event stream. Borrowed rather than moved so the driver
-    /// stays the single owner of the process and its channel; `recv` and
-    /// `try_recv` both take `&self`, so a caller loses nothing.
-    pub fn events(&self) -> &Receiver<PmEvent> {
-        &self.events
-    }
-
-    /// Ends the session: close stdin, wait, kill what is left.
-    ///
-    /// Waits for the reader thread to report the exit before returning, so a
-    /// caller may drain the channel afterwards without racing it. The wait is
-    /// bounded (`DRAIN_GRACE`): if some surviving grandchild still holds the
-    /// stdout pipe open, mana's own shutdown must not hang on it.
-    pub fn shutdown(&mut self) -> Result<()> {
-        // Closing stdin is the polite exit: a CLI that reads turns until EOF
-        // ends its own session and flushes whatever it still owes.
-        self.stdin = None;
-        let deadline = Instant::now() + self.close_grace;
-        while !self.has_exited() && Instant::now() < deadline {
-            std::thread::sleep(POLL_INTERVAL);
-        }
-        self.kill_if_alive();
-        if let Some(reader) = self.reader.take() {
-            join_or_detach(reader, Instant::now() + DRAIN_GRACE);
-        }
-        Ok(())
-    }
-
-    /// The PM's pid, for the process registry (`mana ps`/`mana kill`).
-    pub fn pid(&self) -> u32 {
-        self.pid
-    }
-
-    /// How long `shutdown` waits before killing. Tests shorten it; a caller
-    /// with a CLI known to linger could lengthen it.
-    pub fn set_close_grace(&mut self, grace: Duration) {
-        self.close_grace = grace;
-    }
-
-    fn has_exited(&self) -> bool {
-        // An error means the child is unreachable, which is as final as an exit
-        // status for every purpose here.
-        !matches!(self.child.lock().unwrap().try_wait(), Ok(None))
-    }
-
-    fn kill_if_alive(&self) {
-        let mut child = self.child.lock().unwrap();
-        // Under the lock, and only while `try_wait` reports the child unreaped:
-        // the kernel still holds its pid, so the group id cannot yet have been
-        // recycled onto somebody else's processes.
-        if let Ok(None) = child.try_wait() {
-            kill_group(&mut child, self.pid);
-            // SIGKILL cannot be caught, so this reaps rather than waits.
-            let _ = child.wait();
-        }
-    }
-}
-
-impl Drop for StreamDriver {
-    fn drop(&mut self) {
-        // A PM that outlives mana is v1's zombie: it holds a quota slot, keeps
-        // whatever it spawned (its MCP server, for one) alive, and answers to
-        // nobody. Cheap when `shutdown` was already called -- the child is
-        // reaped and every wait below returns at once.
-        let _ = self.shutdown();
-    }
-}
-
-impl PmTransport for StreamDriver {
-    fn send_user(&mut self, text: &str) -> Result<()> {
-        StreamDriver::send_user(self, text)
-    }
-
     fn events(&self) -> &Receiver<PmEvent> {
-        StreamDriver::events(self)
+        &self.events
     }
 
     /// One process for the whole session, so the turn boundary exists only in
@@ -316,8 +247,18 @@ impl PmTransport for StreamDriver {
         self.tracks_turn_end
     }
 
+    /// Ends the session: close stdin, wait, kill what is left.
+    ///
+    /// Only the first line is this driver's own -- dropping the handle is what
+    /// closes stdin here. Everything after it is the shutdown the ACP driver
+    /// runs too, down to the bounded wait that guarantees `Exited` is queued
+    /// before this returns, so a caller may drain the channel without racing it.
     fn shutdown(&mut self) -> Result<()> {
-        StreamDriver::shutdown(self)
+        // Closing stdin is the polite exit: a CLI that reads turns until EOF
+        // ends its own session and flushes whatever it still owes.
+        self.stdin = None;
+        self.child.close_and_wait();
+        Ok(())
     }
 }
 
@@ -447,9 +388,11 @@ mod tests {
 
 #[cfg(all(test, unix))] // every test here execs a unix shell fixture
 mod process_tests {
+    use super::super::child::{CLOSE_GRACE, POLL_INTERVAL};
     use super::super::events::fixture;
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+    use std::time::Duration;
 
     const TEXT_PATH: &str = "$.message.content[?@.type=='text'].text";
     const ACK: &str =
@@ -476,7 +419,7 @@ mod process_tests {
     /// kernel rather than the driver.
     fn impatient_driver(bin: &str, args: &[&str]) -> StreamDriver {
         let mut driver = driver(bin, args);
-        driver.set_close_grace(Duration::from_millis(200));
+        driver.child.set_close_grace(Duration::from_millis(200));
         driver
     }
 
@@ -632,7 +575,7 @@ mod process_tests {
              sleep 30",
         );
         let mut driver = impatient_driver(&bin, &[pidfile.to_string_lossy().as_ref()]);
-        let pid = driver.pid() as i32;
+        let pid = driver.child.pid() as i32;
         assert_eq!(next(&driver), PmEvent::Text("hi".to_string()));
 
         let started = Instant::now();
@@ -762,7 +705,7 @@ mod process_tests {
     fn dropping_the_driver_kills_the_pm() {
         let tmp = tempfile::tempdir().unwrap();
         let driver = impatient_driver(&script(tmp.path(), "sleep 30"), &[]);
-        let pid = driver.pid() as i32;
+        let pid = driver.child.pid() as i32;
         drop(driver);
 
         let deadline = Instant::now() + Duration::from_secs(3);

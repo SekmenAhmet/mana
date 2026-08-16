@@ -9,19 +9,27 @@
 //! hundred lines into the second driver would have meant fixing the next
 //! shutdown bug twice.
 //!
-//! Deliberately not shared with `spawn.rs`, which does something that looks
-//! the same for a different policy: a sub-agent is killed the moment it blows
-//! its budget, while a PM is only killed after the graceful close window has
-//! passed. Folding both into one helper would mean a policy parameter around
-//! two libc calls.
+//! What `spawn.rs` (the sub-agent spawner) shares with this is the plumbing
+//! that carries no policy -- putting a child in its own group, joining a reader
+//! thread with a deadline -- which lives in `crate::subprocess` and is
+//! re-exported below so the drivers keep one door onto their process handling.
+//!
+//! The kills stay apart. On unix they read alike and are not the same decision:
+//! a sub-agent is killed the moment it blows its budget, a PM only after the
+//! graceful close window. On Windows they are not even the same code -- a
+//! sub-agent's timeout shells out to `taskkill /T /F` to reach the tree behind
+//! the `.cmd` shim mana resolves an npm CLI to, while a PM session has never
+//! been measured there and says so rather than pretending.
 
 use super::PmEvent;
 use std::io::{BufRead, BufReader, ErrorKind, Read};
-use std::process::{Child, Command};
-use std::sync::Mutex;
+use std::process::Child;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
+
+pub(super) use crate::subprocess::{join_or_detach, set_process_group};
 
 /// How often a wait loop asks whether the child is done. Small enough that
 /// shutdown feels immediate, large enough not to spin a core while a PM thinks.
@@ -108,36 +116,6 @@ pub(super) fn reap(child: &Mutex<Child>) -> Option<i32> {
     }
 }
 
-/// Waits for a thread to finish, but never past `deadline`.
-///
-/// Waiting longer would hand mana's shutdown timing to whatever still holds the
-/// write end of a pipe -- a grandchild that survived the kill, say. A detached
-/// thread costs a blocked read on a stream nobody reads and no correctness.
-pub(super) fn join_or_detach(handle: JoinHandle<()>, deadline: Instant) {
-    while !handle.is_finished() && Instant::now() < deadline {
-        std::thread::sleep(POLL_INTERVAL);
-    }
-}
-
-#[cfg(unix)]
-pub(super) fn set_process_group(command: &mut Command) {
-    use std::os::unix::process::CommandExt;
-    // 0 = "become the leader of your own group", so the child's pgid equals its
-    // pid. Without this the PM shares mana's group, and killing that group on
-    // shutdown would kill mana -- while a Ctrl-C meant for the TUI would go to
-    // the PM instead.
-    command.process_group(0);
-}
-
-#[cfg(windows)]
-pub(super) fn set_process_group(command: &mut Command) {
-    use std::os::windows::process::CommandExt;
-    // The PM and its descendants form a group of their own, so a console
-    // control event cannot travel back up into mana's TUI.
-    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
-}
-
 /// Kills the PM and everything it started.
 #[cfg(unix)]
 pub(super) fn kill_group(child: &mut Child, pid: u32) {
@@ -168,4 +146,91 @@ pub(super) fn kill_group(child: &mut Child, _pid: u32) {
     // session has actually been measured, the honest statement is: the PM dies,
     // its children may leak.
     let _ = child.kill();
+}
+
+/// The half of a long-lived PM that `stream` and `acp` held identically: the
+/// process, the pid it was spawned with, the thread reading its stdout, and how
+/// long a shutdown stays polite before it kills.
+///
+/// What is *not* here is stdin. `stream` owns its write end outright while
+/// `acp` shares it with a reader thread that has to answer the agent's
+/// requests, so each driver drops its own and only then hands over to
+/// `close_and_wait` -- that one field was the entire difference between two
+/// otherwise byte-identical shutdowns, and it is a field, not a lifecycle.
+pub(super) struct PersistentChild {
+    child: Arc<Mutex<Child>>,
+    /// Captured at spawn: after the child is reaped the pid is meaningless, and
+    /// `kill_group` must never signal a recycled one.
+    pid: u32,
+    /// Taken by `close_and_wait`, which joins it so `Exited` is queued before
+    /// the shutdown that called it returns.
+    reader: Option<JoinHandle<()>>,
+    close_grace: Duration,
+}
+
+impl PersistentChild {
+    /// `child` is shared because the reader thread reaps it too; `reader` is
+    /// the thread that owns stdout and sends `Exited` when it reaches EOF.
+    pub(super) fn new(child: Arc<Mutex<Child>>, pid: u32, reader: JoinHandle<()>) -> Self {
+        PersistentChild {
+            child,
+            pid,
+            reader: Some(reader),
+            close_grace: CLOSE_GRACE,
+        }
+    }
+
+    /// Waits out the exit the caller's stdin close asked for, kills whatever is
+    /// still running, and waits for the reader to report it.
+    ///
+    /// Both waits are bounded: the first by `close_grace` because a PM that
+    /// ignores EOF must not hold mana open, the second by `DRAIN_GRACE` because
+    /// a surviving grandchild still holding the stdout pipe would otherwise
+    /// decide when mana may exit. Safe to run twice -- `shutdown` then `Drop`
+    /// is the normal path -- since the second pass finds a reaped child and no
+    /// reader.
+    pub(super) fn close_and_wait(&mut self) {
+        let deadline = Instant::now() + self.close_grace;
+        while !self.has_exited() && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        self.kill_if_alive();
+        if let Some(reader) = self.reader.take() {
+            join_or_detach(reader, Instant::now() + DRAIN_GRACE);
+        }
+    }
+
+    fn has_exited(&self) -> bool {
+        // An error means the child is unreachable, which is as final as an exit
+        // status for every purpose here.
+        !matches!(self.child.lock().unwrap().try_wait(), Ok(None))
+    }
+
+    fn kill_if_alive(&self) {
+        let mut child = self.child.lock().unwrap();
+        // Under the lock, and only while `try_wait` reports the child unreaped:
+        // the kernel still holds its pid, so the group id cannot yet have been
+        // recycled onto somebody else's processes.
+        if let Ok(None) = child.try_wait() {
+            kill_group(&mut child, self.pid);
+            // SIGKILL cannot be caught, so this reaps rather than waits.
+            let _ = child.wait();
+        }
+    }
+
+    /// The PM's pid. Test-only: nothing in mana registers a PM the way it
+    /// registers a sub-agent, so the only callers are the process tests that
+    /// check what a shutdown killed.
+    #[cfg(test)]
+    pub(super) fn pid(&self) -> u32 {
+        self.pid
+    }
+
+    /// How long `close_and_wait` stays polite. Test-only for the same reason:
+    /// no caller has ever wanted a window other than `CLOSE_GRACE`, and the
+    /// tests want one they need not sit five seconds through.
+    #[cfg(test)]
+    pub(super) fn set_close_grace(&mut self, grace: Duration) {
+        self.close_grace = grace;
+    }
 }

@@ -28,11 +28,6 @@ pub const BLINK_INTERVAL: Duration = Duration::from_millis(500);
 /// Two seconds is slow enough to be free and fast enough that nobody notices.
 pub const GRAPH_REFRESH: Duration = Duration::from_secs(2);
 
-/// How much of a task id the pane shows. Ids are v4 UUIDs (36 characters),
-/// which is wider than the whole pane; the first block is plenty to tell two
-/// tasks apart by eye and matches how one refers to a commit.
-const SHORT_ID: usize = 8;
-
 /// Pure on/off decision for the blink, given how long the TUI has been
 /// running. Kept separate from any real clock so it is testable without
 /// sleeping or faking a `Terminal`.
@@ -145,12 +140,8 @@ pub fn node_body(node: &GraphNode, blink_visible: bool) -> String {
         role_label(&node.role),
         node.cli,
         node.model,
-        short_id(&node.task_id),
+        crate::status::short(&node.task_id),
     )
-}
-
-fn short_id(task_id: &str) -> String {
-    task_id.chars().take(SHORT_ID).collect()
 }
 
 pub fn status_symbol(status: &Option<Status>, blink_visible: bool) -> &'static str {

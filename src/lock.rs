@@ -16,7 +16,6 @@
 use crate::task::Role;
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::path::Path;
 
 /// One sub-agent dispatch. Written exactly once, right after the process is
@@ -39,13 +38,13 @@ pub struct SubagentRecord {
 
 /// The full dispatch history for a project, loaded fresh from disk on every
 /// call — state lives in the file, not across `Registry` values. `records`
-/// keeps append order (oldest first); `by_agent_id` is the common lookup
-/// ("what did mana launch for this agent-id") without every caller writing
-/// its own linear scan.
+/// keeps append order (oldest first), which is the order every reader wants:
+/// `ps` prints it, `counters` and the graph pane fold over all of it, and
+/// `kill` resolves an unambiguous *prefix*. None of them wants a point
+/// lookup, so there is no id index to keep in step with the vector.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct Registry {
     pub records: Vec<SubagentRecord>,
-    pub by_agent_id: BTreeMap<String, SubagentRecord>,
     /// One ready-to-print message per line `load_registry` could not read,
     /// naming the file and the 1-based line number. Data rather than an
     /// `eprintln!` at the reader: the TUI's graph pane re-reads this file
@@ -56,30 +55,14 @@ pub struct Registry {
 }
 
 impl Registry {
-    /// Builds both views from a flat list of records — the shape both
-    /// `load_registry` and test fixtures need, so it's one function instead
-    /// of two copies of the same indexing loop.
+    /// A registry over records that never came off disk — the shape test
+    /// fixtures across the tree build, so `skipped` stays private to the
+    /// reader that can actually produce one.
     pub fn from_records(records: Vec<SubagentRecord>) -> Self {
-        let by_agent_id = records
-            .iter()
-            .map(|r| (r.agent_id.clone(), r.clone()))
-            .collect();
         Registry {
             records,
-            by_agent_id,
             skipped: Vec::new(),
         }
-    }
-
-    /// Still not called from a live command. `mana ps`/`kill` (task 4.2) were
-    /// the expected consumers and turned out not to be: `ps` walks every
-    /// record in append order, and `kill` resolves an *unambiguous prefix*
-    /// rather than an exact id, so neither wants a point lookup. Kept for the
-    /// exact-id readers that remain plausible (the MCP tool surface), and
-    /// proven meanwhile by this file's round-trip test and by `dispatch`'s.
-    #[allow(dead_code)]
-    pub fn get(&self, agent_id: &str) -> Option<&SubagentRecord> {
-        self.by_agent_id.get(agent_id)
     }
 }
 
@@ -159,7 +142,6 @@ mod tests {
         let path = tmp.path().join("subagents.jsonl");
         let registry = load_registry(&path).unwrap();
         assert!(registry.records.is_empty());
-        assert!(registry.by_agent_id.is_empty());
     }
 
     #[test]
@@ -183,10 +165,11 @@ mod tests {
         assert_eq!(registry.records[0].agent_id, "agent-1");
         assert_eq!(registry.records[1].agent_id, "agent-2");
 
-        assert_eq!(registry.get("agent-1").unwrap().pid, Some(1234));
-        assert_eq!(registry.get("agent-2").unwrap().pid, None);
-        assert_eq!(registry.get("agent-1").unwrap().task_id, "task-1");
-        assert!(registry.get("does-not-exist").is_none());
+        // A pid that was reported and one that was not both survive the
+        // round trip — `None` must come back as `None`, not as a missing key.
+        assert_eq!(registry.records[0].pid, Some(1234));
+        assert_eq!(registry.records[1].pid, None);
+        assert_eq!(registry.records[0].task_id, "task-1");
     }
 
     /// One torn line — what a crash mid-write, or the pre-`append_line` race,
