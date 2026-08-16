@@ -22,7 +22,16 @@ fn main() -> anyhow::Result<()> {
     let args = normalize_help_invocation(std::env::args().collect());
     let cli = Cli::parse_from(args);
     match cli.command {
-        Command::Launch { agent, resume } => cli::launch_pm::run(agent.as_deref(), resume)?,
+        // The one subcommand that wraps a child process, and therefore the one
+        // whose exit code is not mana's to invent: a PM that exited 7 has to
+        // reach the shell as 7, not as anyhow's 1 (#95). Every other arm's
+        // success is mana's own, so `Ok(())` is the whole answer.
+        Command::Launch { agent, resume } => {
+            let code = cli::launch_pm::run(agent.as_deref(), resume)?;
+            if code != 0 {
+                std::process::exit(i32::from(code));
+            }
+        }
         Command::Ps { all, project } => cli::ps::run(all, project.as_deref())?,
         Command::Kill {
             agent_id,

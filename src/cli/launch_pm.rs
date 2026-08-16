@@ -1,7 +1,12 @@
 //! `mana launch <cli>` -- the v2 PM session.
 //!
-//! Six things happen, in this order, and each one kills a v1 defect:
+//! Six things happen, in this order, and each one kills a v1 defect -- after
+//! one thing that happens before all of them:
 //!
+//! 0. **Refuse what cannot work.** A terminal to draw in and a git repo to
+//!    branch worktrees off are a millisecond to check each, neither has a
+//!    degraded mode, and both used to be discovered after the launch had
+//!    already paid for itself (`check_preconditions`, #85 and #86).
 //! 1. **Resolve the catalogue entry.** Everything CLI-specific below comes
 //!    from it, so nothing here branches on which CLI the user named.
 //! 2. **Install the PM skill.** `assets/roles/pm/SKILL.md` is embedded in the
@@ -53,7 +58,7 @@ use ratatui::Terminal;
 use ratatui::backend::{Backend, CrosstermBackend};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::io::{Read, Seek, SeekFrom, Stdout};
+use std::io::{IsTerminal, Read, Seek, SeekFrom, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -124,7 +129,12 @@ const NOTIFICATION_POLL: Duration = Duration::from_millis(500);
 /// How long the loop blocks waiting for a key before redrawing.
 const TICK: Duration = Duration::from_millis(50);
 
-pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
+pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<u8> {
+    let project_root = std::env::current_dir()?;
+    // First, and before even the update check spawns a thread: everything below
+    // this line costs something the machine or the user's wallet cannot get
+    // back.
+    check_preconditions(&project_root, std::io::stdout().is_terminal())?;
     let home = mana_home()?;
     // Started before the session is prepared, so the answer is usually already
     // waiting by the first frame. It is the only command that looks: `ps`,
@@ -132,7 +142,6 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     // last of those is a protocol server on stdio where a stray request would
     // be a genuine defect (design §5).
     let update_notice = crate::cli::upgrade::spawn_check(&home);
-    let project_root = std::env::current_dir()?;
     let paths = resolve_project_paths(&home, &project_name_from_dir(&project_root));
     let agent_cli = resolve_cli(&paths, agent_cli, resume)?;
     let mut session = prepare_session(&home, &project_root, &agent_cli, resume)?;
@@ -196,6 +205,42 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<()> {
     }
 }
 
+/// Everything that makes a launch impossible, checked in one place before the
+/// launch does anything it cannot take back.
+///
+/// Both are a `git rev-parse` or an `ioctl` away, both are certain, and both
+/// used to be discovered by the thing that needed them:
+///
+/// - the terminal, by `enable_raw_mode` -- after the role had been written into
+///   the user's skills directory (and a stale copy deleted from another),
+///   `state.toml` rewritten, the PM CLI spawned and the whole activation turn
+///   sent to it, which on `[skills].inline_in_activation` is the entire role
+///   text billed to the user (#85);
+/// - the repo, by the first dispatch's `worktree::ensure_git_repo` -- on a
+///   background thread, after the PM had planned and dispatched every task, with
+///   one paid PM turn coming back per executor to say the same thing (#86).
+///
+/// Refusing the launch outright on a non-git project is stronger than the
+/// dispatch gate it hoists: a read-only role would have run. That is the point.
+/// The session exists to dispatch work, isolation *is* the worktree (spec §9),
+/// and a PM told to plan for a project it can never write is worth less than the
+/// five milliseconds it takes to say so.
+///
+/// `interactive` is a parameter rather than a read, because whether this process
+/// has a terminal is the one thing a test cannot arrange. stdout is what is
+/// asked about: the alternate screen and every frame go there, so a launch whose
+/// stdout is a pipe has nowhere to draw whatever `/dev/tty` may still offer.
+fn check_preconditions(project_root: &Path, interactive: bool) -> Result<()> {
+    if !interactive {
+        bail!(
+            "mana launch is a full-screen terminal UI and stdout here is not a terminal (a pipe, \
+             a CI job, a supervisor). Run it from a terminal -- there is no headless mode, and \
+             nothing has been started."
+        );
+    }
+    crate::worktree::ensure_git_repo(project_root)
+}
+
 /// Everything a session owes the machine once the loop is over, whichever way
 /// it went out.
 ///
@@ -210,7 +255,7 @@ fn finish_session(
     session: &mut Session,
     app: &App,
     outcome: Result<SessionEnd>,
-) -> Result<()> {
+) -> Result<u8> {
     let _ = session.shutdown();
     // Quitting with turns still waiting is the operator's own decision, but it
     // is one they may have forgotten they made: the queue lives in a status
@@ -249,7 +294,7 @@ fn finish_session(
         // losses better than a count of them does, and that arm already fails.
         // #95 is about which code it should fail with; if it ever grows a
         // success case, this guard has to cover that too.
-        SessionEnd::UserQuit if session.lost.is_empty() && sweep.clean => Ok(()),
+        SessionEnd::UserQuit if session.lost.is_empty() && sweep.clean => Ok(0),
         SessionEnd::UserQuit => bail!(
             "this session ended with {} message(s) that never reached the PM{} -- see above",
             session.lost.len(),
@@ -262,20 +307,51 @@ fn finish_session(
         // A PM that died on its own took the session with it, and the only
         // explanation there is arrived on its stderr -- which is now behind a
         // screen the user cannot get back to.
+        // A PM that ended by itself is not automatically a failure, and mana
+        // used to make it one: every exit here bailed, so a PM that finished
+        // its work and returned 0 still gave the shell exit 1, and a PM that
+        // returned 7 also gave 1 (#95). mana is a wrapper here -- the child's
+        // code is the answer to "did the work succeed", and mana's own job is
+        // only to add what it knows: whether *it* lost anything (#96).
+        SessionEnd::PmExited { code: Some(0) } if session.lost.is_empty() && sweep.clean => Ok(0),
+        SessionEnd::PmExited { code: Some(0) } => bail!(
+            "the PM ({}) ended cleanly, but this session lost {} message(s) that never \
+             reached it{} -- see above",
+            session.cli_name,
+            session.lost.len(),
+            if sweep.clean {
+                ""
+            } else {
+                ", and left sub-agents mana could not stop"
+            }
+        ),
         SessionEnd::PmExited { code } => {
-            let status = match code {
-                Some(code) => format!("exit code {code}"),
-                None => "a signal".to_string(),
-            };
+            // The explanation is printed rather than returned, because for a
+            // non-zero child the *code* is what a wrapper script reads and
+            // anyhow's own exit code (1) would overwrite it.
             let reason = app
                 .last_raw
                 .as_deref()
                 .map(|line| format!("\nits last output was: {line}"))
                 .unwrap_or_default();
-            bail!(
-                "the PM ({}) ended the session with {status}{reason}",
-                session.cli_name
-            )
+            match code {
+                Some(code) => {
+                    eprintln!(
+                        "the PM ({}) ended the session with exit code {code}{reason}",
+                        session.cli_name
+                    );
+                    // Codes above 255 cannot survive a process exit status
+                    // anyway; saturating keeps a non-zero child non-zero
+                    // instead of wrapping some of them to 0.
+                    Ok(u8::try_from(code).unwrap_or(1).max(1))
+                }
+                // A signal has no code to propagate, and 1 is the honest
+                // stand-in: something went wrong and mana cannot say what.
+                None => bail!(
+                    "the PM ({}) was killed by a signal{reason}",
+                    session.cli_name
+                ),
+            }
         }
     }
 }

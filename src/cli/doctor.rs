@@ -10,23 +10,28 @@
 //!
 //! # Exit-code contract
 //!
-//! Exactly two codes, because scripts read them:
+//! Three codes, because scripts read them, and "the report never ran" is not
+//! the same answer as "the report ran and found something":
 //!
-//! - **0** — nothing mana can check is broken. Reported but *not* broken, on
-//!   purpose: a catalogued CLI you never installed (you are not required to
-//!   install all of them), a model-discovery probe that failed (the list
-//!   degrades, dispatch does not), a quota pool resting on a cooldown (that is
-//!   the system working), a leftover worktree (disk, not correctness).
-//! - **1** — at least one of three things is broken:
-//!   1. a *registered* CLI whose binary has vanished — every dispatch to it
-//!      will fail at spawn;
-//!   2. a **stale** dispatch — a record with a dead pid and no exit record,
-//!      i.e. an agent that will never finish and never notify the PM;
-//!   3. a config file mana cannot read, including v1's leftover `config.yaml`.
+//! - **0** — the report ran and nothing mana can check is broken. Reported but
+//!   *not* broken, on purpose: a catalogued CLI you never installed (you are
+//!   not required to install all of them), a model-discovery probe that failed
+//!   (the list degrades, dispatch does not), a quota pool resting on a cooldown
+//!   (that is the system working), a leftover worktree (disk, not
+//!   correctness).
+//! - **1** — the report ran and at least one finding is broken, i.e. anything
+//!   `Report::broken` was called for: a *registered* CLI whose binary has
+//!   vanished (every dispatch to it fails at spawn); a **stale** dispatch (a
+//!   dead pid with no exit record — an agent that will never finish and never
+//!   notify the PM); a config file mana cannot read, including v1's leftover
+//!   `config.yaml`; a `catalog.local.toml` mana cannot parse (dispatch silently
+//!   runs on the shipped entry instead of yours); a `--prune` that failed and
+//!   left the worktree behind.
+//! - **2** — no report: doctor could not get far enough to print one. Never
+//!   returned for a finding, only for doctor itself failing.
 //!
-//! Every finding is printed either way; the exit code only says whether any of
-//! them was of the third kind. Output is plain aligned text with no colour and
-//! no table crate, so `mana doctor | grep` works.
+//! Every finding is printed either way. Output is plain aligned text with no
+//! colour and no table crate, so `mana doctor | grep` works.
 
 use crate::catalog::{Catalog, CliEntry, CostClass, PmDriver, PoolScope, QuotaKind, ToolChannel};
 use crate::cli::ps;
@@ -94,6 +99,10 @@ pub struct Options<'a> {
     pub entries: &'a [CliEntry],
     /// One rendered line about an active `catalog.local.toml`, if there is one.
     pub override_note: Option<String>,
+    /// Why `catalog.local.toml` could not be applied, if it could not be:
+    /// `entries` are then the shipped ones, which is *not* what dispatch will
+    /// run once the file parses again.
+    pub override_error: Option<String>,
     /// The project directory to report on. `None` when the working directory
     /// is not a project mana has state for and `--project` was not given.
     pub project_root: Option<&'a Path>,
@@ -102,28 +111,16 @@ pub struct Options<'a> {
 }
 
 pub fn run(project: Option<&Path>, prune: bool) -> Result<()> {
-    let home = mana_home()?;
-    let override_path = home.join(CATALOG_OVERRIDE);
-    let catalog = Catalog::load(Some(&override_path))?;
-
-    // `--project` is an explicit request and always gets a section, even when
-    // the project has no state yet; without it, the working directory only
-    // gets one if mana has actually been used there. Printing an empty project
-    // section from `~` would be noise on every run.
-    let cwd = std::env::current_dir()?;
-    let project_root = match project {
-        Some(path) => Some(path.to_path_buf()),
-        None => has_project_state(&home, &cwd).then_some(cwd),
+    let report = match build_report(project, prune) {
+        Ok(report) => report,
+        // Exit 2, not the 1 that returning the error to `main` would give:
+        // "doctor could not run" has to stay distinguishable from "doctor ran
+        // and found something broken".
+        Err(error) => {
+            eprintln!("mana doctor could not run: {error:#}");
+            std::process::exit(2);
+        }
     };
-
-    let report = diagnose(&Options {
-        mana_home: &home,
-        entries: catalog.entries(),
-        override_note: override_note(&override_path),
-        project_root: project_root.as_deref(),
-        prune,
-        now: Utc::now(),
-    })?;
 
     for line in &report.lines {
         println!("{line}");
@@ -137,6 +134,51 @@ pub fn run(project: Option<&Path>, prune: bool) -> Result<()> {
         std::process::exit(code);
     }
     Ok(())
+}
+
+/// Everything between the environment and `diagnose`. Split out so `run` has
+/// exactly one place to turn "no report at all" into exit 2.
+fn build_report(project: Option<&Path>, prune: bool) -> Result<Report> {
+    let home = mana_home()?;
+    let override_path = home.join(CATALOG_OVERRIDE);
+    let (catalog, override_error) = catalog_or_shipped(&override_path)?;
+
+    // `--project` is an explicit request and always gets a section, even when
+    // the project has no state yet; without it, the working directory only
+    // gets one if mana has actually been used there. Printing an empty project
+    // section from `~` would be noise on every run. A working directory that
+    // no longer exists is not worth dying on either: it only means there is no
+    // project section to print.
+    let project_root = match project {
+        Some(path) => Some(path.to_path_buf()),
+        None => std::env::current_dir()
+            .ok()
+            .filter(|cwd| has_project_state(&home, cwd)),
+    };
+
+    diagnose(&Options {
+        mana_home: &home,
+        entries: catalog.entries(),
+        override_note: override_note(&override_path),
+        override_error,
+        project_root: project_root.as_deref(),
+        prune,
+        now: Utc::now(),
+    })
+}
+
+/// The catalogue to report on, plus the override failure that made it degrade.
+///
+/// Every other command is right to die on an unreadable `catalog.local.toml`.
+/// Doctor is the command you run *because* the override is broken, so it falls
+/// back to the shipped entries and reports the failure as a finding -- dying
+/// here would take the config, project and worktree sections down with it, and
+/// the override is exactly the kind of damage those sections explain.
+fn catalog_or_shipped(override_path: &Path) -> Result<(Catalog, Option<String>)> {
+    match Catalog::load(Some(override_path)) {
+        Ok(catalog) => Ok((catalog, None)),
+        Err(error) => Ok((Catalog::embedded()?, Some(format!("{error:#}")))),
+    }
 }
 
 fn has_project_state(mana_home: &Path, project_root: &Path) -> bool {
@@ -154,9 +196,9 @@ fn override_note(path: &Path) -> Option<String> {
     }
     let source = std::fs::read_to_string(path).ok()?;
     let Ok(entry) = crate::catalog::parse_entry(&source) else {
-        // An unparseable override never reaches here -- `Catalog::load` fails
-        // first, loudly, and names the file.
-        return Some(format!("{} is present but unreadable", path.display()));
+        // No note: the same failure already reached the report as
+        // `Options::override_error`, with the parse error attached.
+        return None;
     };
     let shipped = Catalog::embedded().ok()?;
     let verb = if shipped.get(&entry.cli.id).is_some() {
@@ -216,6 +258,15 @@ fn catalogue_section(
     ));
     if let Some(note) = &options.override_note {
         report.say(format!("  {note}"));
+    }
+    // Broken, not a note: the entries below are the shipped ones, so every
+    // per-CLI fact in this section is describing a catalogue the user did not
+    // ask for.
+    if let Some(error) = &options.override_error {
+        report.broken(format!(
+            "  BROKEN: {error} -- reporting on the shipped catalogue instead; \
+             fix or delete the file"
+        ));
     }
     for entry in options.entries {
         report.say("");
@@ -717,7 +768,13 @@ fn worktree_section(
         }
         match worktree::remove_at(project_root, &path) {
             Ok(()) => report.say(format!("  {dir_name}  age {age}  pruned")),
-            Err(error) => report.say(format!("  {dir_name}  age {age}  prune failed: {error:#}")),
+            // A leftover worktree is disk, not correctness, so listing one is
+            // not broken -- but a *failed* prune is: the cleanup the user
+            // asked for did not happen, and a script that read exit 0 here
+            // would move on believing the directory is gone.
+            Err(error) => {
+                report.broken(format!("  {dir_name}  age {age}  prune failed: {error:#}"))
+            }
         }
     }
     Ok(())
@@ -810,6 +867,7 @@ url = "https://example.invalid/alpha"
             mana_home,
             entries,
             override_note: None,
+            override_error: None,
             project_root: None,
             prune: false,
             now: Utc::now(),
@@ -1030,6 +1088,70 @@ cooldown_minutes = 30
         assert!(!text.contains("worktrees --"), "{text}");
     }
 
+    /// The whole point of issue #115: doctor is the command you run *because*
+    /// the override is broken, so it has to survive it, name it, and keep
+    /// reporting past the finding.
+    #[test]
+    fn a_broken_catalog_override_is_a_finding_not_an_abort() {
+        let tmp = tempfile::tempdir().unwrap();
+        let override_path = tmp.path().join(CATALOG_OVERRIDE);
+        std::fs::write(&override_path, "not [ valid").unwrap();
+
+        let (catalog, error) = catalog_or_shipped(&override_path).unwrap();
+        // Degraded to the shipped entries rather than dying on the load.
+        assert_eq!(
+            catalog.entries().len(),
+            Catalog::embedded().unwrap().entries().len()
+        );
+        let error = error.expect("a broken override must be reported");
+        assert!(
+            error.contains(&override_path.display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("TOML parse error"), "{error}");
+
+        let entries = entries();
+        let report = diagnose(&Options {
+            override_error: Some(error),
+            ..options(tmp.path(), &entries)
+        })
+        .unwrap();
+        let text = joined(&report);
+        assert!(text.contains("BROKEN"), "{text}");
+        assert!(text.contains("TOML parse error"), "{text}");
+        // The report kept going past the finding -- that is what aborting used
+        // to cost. The catalogue's own entries are printed after the BROKEN
+        // line, from the shipped catalogue it fell back to.
+        assert!(text.contains("Alpha CLI"), "{text}");
+        assert_eq!(report.exit_code(), 1, "{text}");
+    }
+
+    /// Issue #114: a cleanup that reports success while leaving the mess is
+    /// worse than one that does nothing.
+    #[test]
+    fn a_failed_prune_is_broken_rather_than_a_clean_exit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mana_home = tmp.path().join("mana-home");
+        // No `git init`, which is the reported repro: every git call in
+        // `worktree::remove_at` fails with "not a git repository".
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let leftover =
+            worktree::worktrees_dir(&mana_home, &project_name_from_dir(&project)).join("3f2a1b6c");
+        std::fs::create_dir_all(&leftover).unwrap();
+
+        let entries = entries();
+        let report = diagnose(&Options {
+            project_root: Some(&project),
+            prune: true,
+            ..options(&mana_home, &entries)
+        })
+        .unwrap();
+        let text = joined(&report);
+        assert!(text.contains("prune failed"), "{text}");
+        assert_eq!(report.exit_code(), 1, "a failed prune exited clean: {text}");
+    }
+
     #[test]
     fn truncate_list_says_how_many_it_left_out() {
         let many: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
@@ -1079,6 +1201,7 @@ mod process_tests {
             mana_home: tmp.path(),
             entries: &entries,
             override_note: None,
+            override_error: None,
             project_root: Some(&project),
             prune: false,
             now: Utc::now(),
@@ -1181,6 +1304,7 @@ mod process_tests {
             mana_home: &mana_home,
             entries: &entries,
             override_note: None,
+            override_error: None,
             project_root: Some(&fixture.project),
             prune: false,
             now: Utc::now(),
@@ -1195,6 +1319,7 @@ mod process_tests {
             mana_home: &mana_home,
             entries: &entries,
             override_note: None,
+            override_error: None,
             project_root: Some(&fixture.project),
             prune: true,
             now: Utc::now(),
