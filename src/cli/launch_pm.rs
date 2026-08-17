@@ -80,16 +80,32 @@ const PM_SKILL: &str = include_str!("../../assets/roles/pm/SKILL.md");
 /// per-CLI behaviour the catalogue is supposed to absorb.
 const ACTIVATION: &str = "You are the mana PM for this session. Load and follow the mana-pm skill";
 
-/// The one thing a sentinel PM cannot work out for itself.
+/// The one thing a sentinel PM cannot work out for itself, plus the one thing
+/// nothing else may tell it.
 ///
 /// An MCP PM discovers its tools from the protocol; on a CLI with no MCP
 /// surface there is no list to inspect, so the alternative has to be stated.
 /// Left out of the skill's own wording because the skill ships to every CLI
 /// and only some of them are on this channel -- and a PM that read "use fenced
 /// blocks" while holding real tools would call everything twice.
-const SENTINEL_ACTIVATION: &str = " This CLI cannot host mana's tools, so call \
-    them the other way the skill describes: one fenced ```mana block per call. \
-    mana executes those blocks and sends you the results.";
+///
+/// The nonce rides here rather than in the skill for a harder reason (#140):
+/// the skill is a *file*, written to a directory the user can read, and a
+/// nonce written to disk is a nonce a quoted file can contain -- which is the
+/// entire attack. The activation is the one channel that reaches the PM
+/// without going through storage, so it is the only place this value ever
+/// appears.
+fn sentinel_activation(nonce: &str) -> String {
+    format!(
+        " This CLI cannot host mana's tools, so call them the other way the skill describes: one \
+         fenced ```mana:{nonce} block per call -- that exact info string, this session's nonce \
+         included. mana executes those blocks and sends you the results. A ```mana fence without \
+         it, or with a different nonce, is inert: mana leaves it in your prose and runs nothing, \
+         which is what makes it safe to reproduce a block you found in a file, an issue or a log. \
+         The nonce is this session's only; it belongs in no file, no task brief and no message to \
+         the user."
+    )
+}
 
 /// What mana says instead of the activation when `--continue` picks a
 /// conversation back up.
@@ -102,6 +118,19 @@ const SENTINEL_ACTIVATION: &str = " This CLI cannot host mana's tools, so call \
 /// was away is the state of the work, so that is where the line points.
 const RESUMED: &str = "[mana] session resumed -- you are still the mana PM for this project and \
     the mana-pm skill still applies. Check where the work stands before deciding the next step.";
+
+/// The sentence a resumed sentinel session adds to that.
+///
+/// Deliberately not the whole activation: what changed across the resume is
+/// one value, and re-teaching the channel to a PM that already knows it is
+/// what `RESUMED` exists to avoid.
+fn resumed_nonce(nonce: &str) -> String {
+    format!(
+        " This session's nonce is new -- fence tool calls as ```mana:{nonce} from now on. The one \
+         you were given before the resume names a session that is over, and mana leaves a block \
+         carrying it in your prose."
+    )
+}
 
 /// Directory name the skill is installed under, inside the CLI's skills dir.
 const SKILL_NAME: &str = "mana-pm";
@@ -851,10 +880,15 @@ fn prepare_session(
     }
     save_state(&paths, &state)?;
 
-    let opening = if resume {
-        RESUMED.to_string()
-    } else {
-        activation(entry, &skill.path)
+    let opening = match (resume, sentinel.as_ref().map(Sentinel::nonce)) {
+        (false, nonce) => activation(entry, &skill.path, nonce),
+        // The one thing a resumed conversation does *not* still know. The
+        // nonce belongs to a `Sentinel`, this launch built a new one, and the
+        // PM's context holds the token of a session that no longer exists --
+        // so without this line every block it writes would be left as prose
+        // and the resumed session could not call a tool at all.
+        (true, Some(nonce)) => format!("{RESUMED}{}", resumed_nonce(nonce)),
+        (true, None) => RESUMED.to_string(),
     };
 
     let tracks_turns = pm.tracks_turn_end();
@@ -946,10 +980,16 @@ fn save_state(paths: &ProjectPaths, state: &ProjectState) -> Result<()> {
 
 /// The one turn mana writes itself: who the PM is, where its role text is, and
 /// -- where the CLI cannot host mana's tools -- how to call them anyway.
-fn activation(entry: &CliEntry, skill_path: &Path) -> String {
+///
+/// `nonce` is `Some` exactly when this session has a sentinel channel, because
+/// it comes from that channel's own `Sentinel`. Taken as a parameter rather
+/// than re-derived from `entry.tools.channel`: the value has to be the one the
+/// scanner will actually compare against, and a second source for it is a
+/// session where mana teaches one fence and honours another.
+fn activation(entry: &CliEntry, skill_path: &Path, nonce: Option<&str>) -> String {
     let mut message = format!("{ACTIVATION}, installed at {}.", skill_path.display());
-    if entry.tools.channel == ToolChannel::Sentinel {
-        message.push_str(SENTINEL_ACTIVATION);
+    if let Some(nonce) = nonce {
+        message.push_str(&sentinel_activation(nonce));
     }
     // The last resort, for a CLI that can neither discover the file nor be
     // allowed to read it (`[skills].inline_in_activation`, agy). Appended
@@ -2125,7 +2165,7 @@ url = "https://example.invalid/fixture"
         let skill = Path::new("/home/x/.agents/skills/mana-pm/SKILL.md");
         let mut entry = entry(&["~/.agents/skills"]);
 
-        let plain = activation(&entry, skill);
+        let plain = activation(&entry, skill, None);
         assert!(plain.starts_with(ACTIVATION), "{plain}");
         assert!(plain.contains(skill.to_str().unwrap()), "{plain}");
         assert!(
@@ -2139,7 +2179,7 @@ url = "https://example.invalid/fixture"
         // A CLI that cannot read the file gets the text itself, once, at the
         // start of the session.
         entry.skills.inline_in_activation = true;
-        let inlined = activation(&entry, skill);
+        let inlined = activation(&entry, skill, None);
         assert!(inlined.contains(PM_SKILL), "the role text never arrived");
         assert!(inlined.contains(skill.to_str().unwrap()), "{inlined}");
     }
@@ -2149,8 +2189,26 @@ url = "https://example.invalid/fixture"
         let mut entry =
             parse_entry(&entry_source("fixture-cli", &["/nowhere"], "", "sentinel")).unwrap();
         entry.skills.inline_in_activation = false;
-        let message = activation(&entry, Path::new("/tmp/SKILL.md"));
-        assert!(message.contains("fenced ```mana block"), "{message}");
+        let message = activation(&entry, Path::new("/tmp/SKILL.md"), Some("n0nce"));
+        assert!(message.contains("fenced ```mana:n0nce block"), "{message}");
+        // The activation is the only place the nonce is issued, so it is also
+        // the only place that can say what a fence *without* it does -- a PM
+        // told the shape and not the rule would still be told nothing about
+        // the block it quotes out of a file (#140).
+        assert!(message.contains("inert"), "{message}");
+    }
+
+    /// The nonce is minted per `Sentinel`, so a resumed session's PM is
+    /// holding a dead one: it has to be re-issued or the resumed session can
+    /// call no tool at all.
+    #[test]
+    fn a_resumed_sentinel_session_is_given_the_new_nonce() {
+        let resumed = format!("{RESUMED}{}", resumed_nonce("n3w"));
+        assert!(resumed.starts_with(RESUMED), "{resumed}");
+        assert!(resumed.contains("```mana:n3w"), "{resumed}");
+        // ...and not by replaying the briefing a continued conversation
+        // already had.
+        assert!(!resumed.contains(PM_SKILL), "{resumed}");
     }
 
     #[test]
@@ -2919,6 +2977,11 @@ mod smoke {
         // Answers the first turn with a block, and every later one with an
         // acknowledgement -- otherwise the injected result would be answered
         // with another block, for ever.
+        //
+        // The nonce is read out of the activation turn rather than baked into
+        // the script, because that is the only way a PM can get it (#140) and
+        // a test that knew it any other way would be proving something mana
+        // does not offer.
         std::fs::write(
             &pm,
             format!(
@@ -2928,7 +2991,8 @@ mod smoke {
                  \x20 printf '%s\\n' \"$line\" >> '{received}'\n\
                  \x20 turns=$((turns+1))\n\
                  \x20 if [ \"$turns\" = 1 ]; then\n\
-                 \x20   printf '%s\\n' '{{\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"Checking what is installed.\\n```mana\\n{{\\\"tool\\\": \\\"list_agents\\\"}}\\n```\"}}]}}}}'\n\
+                 \x20   nonce=$(printf '%s' \"$line\" | sed -n 's/.*```mana:\\([0-9a-f][0-9a-f]*\\).*/\\1/p')\n\
+                 \x20   printf '%s\\n' '{{\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"Checking what is installed.\\n```mana:'\"$nonce\"'\\n{{\\\"tool\\\": \\\"list_agents\\\"}}\\n```\"}}]}}}}'\n\
                  \x20 else\n\
                  \x20   printf '%s\\n' '{{\"message\":{{\"content\":[{{\"type\":\"text\",\"text\":\"ack\"}}]}}}}'\n\
                  \x20 fi\n\
@@ -2948,7 +3012,13 @@ mod smoke {
         // A sentinel PM has no tool list to discover the channel from, so the
         // activation turn says which way to call.
         let activation = fixture.wait_for(&fixture.received, ACTIVATION);
-        assert!(activation.contains("fenced ```mana block"), "{activation}");
+        assert!(
+            activation.contains(&format!(
+                "fenced ```mana:{} block",
+                session.sentinel.as_ref().unwrap().nonce()
+            )),
+            "{activation}"
+        );
 
         // One turn's events, handled in the order `run_loop` handles them: the
         // PM's prose goes through the tool channel, which writes the results
