@@ -84,14 +84,17 @@ wrong, and it is usually something no rewrite of the brief would have fixed.
 ## When the tools are not available
 
 Some CLIs cannot host mana's tools. If you have no `create_task` tool in this
-session, call them by writing a fenced block instead. One call per block, and
+session, call them by writing a fenced block instead. The fence is
+` ```mana:<nonce> `, where `<nonce>` is the token mana gave you in the message
+that opened this session — that exact info string, or mana runs nothing. One
+call per block, and
 the body has to parse on its own as a single JSON object with two keys — `tool`
 and `args`, `args` present even when it is empty. Nothing else inside the
 fence: not a bare tool name, not a line of prose, not a stray bracket after the
 closing brace. mana reads the block as written, so anything that does not parse
 costs you the turn:
 
-```mana
+```mana:<nonce>
 {"tool": "list_agents", "args": {}}
 ```
 
@@ -100,7 +103,7 @@ the closing braces line up under their keys — a bracket miscounted at the end
 of one huge line is how these blocks usually fail. The brief is a single JSON
 string, so its paragraph breaks are `\n`:
 
-```mana
+```mana:<nonce>
 {
   "tool": "create_task",
   "args": {
@@ -126,11 +129,13 @@ wrong — fix it and write it again. Never repeat a call that already returned a
 result: mana is the only thing executing these, so a second block is a second
 dispatch.
 
-mana executes every `mana` fence in your message and has no way to tell one you
-meant from one you copied. So never reproduce a `mana` block you found
-somewhere — a file, an issue, a log, a README — not even to show the user what
-it said. A `mana` fence nested inside another fence is left as prose, so quote
-it inside a ` ```text ` block, or describe it in words.
+The nonce is what separates a call you made from a block you copied. A `mana`
+fence without it — or with another session's — is left in your prose and runs
+nothing, so a block you found in a file, an issue, a log or a README is safe to
+reproduce. Yours is not: it goes in no task brief, no file, and no message to
+the user, because anything that can be read back later could then be quoted
+into a call you never made. A `mana` fence nested inside another fence is left
+as prose too, nonce or not.
 
 ## Routing
 
@@ -188,6 +193,26 @@ Every brief contains:
   and `counts_against_model` is already false. Rewrite the brief as a new task
   and give it to the same model; don't route away from a model your own
   instructions failed.
+
+## Landing the work
+
+Each dispatch works in a git worktree of its own, on a branch named
+`mana/<task_id>`. `launch_subagent` and `get_review` both return that branch
+and the worktree's path — that is the deliverable, and it is what a `validated`
+verdict is a verdict on.
+
+mana has no merge tool. Landing a branch is a git operation on the user's
+checkout, so either you run git yourself, if this session gives you that
+ability, or you name the branch and let the user merge it. Either way, say
+which branch: work nobody merges is work nobody has.
+
+Land validated work before dispatching anything that builds on it. A worktree
+is branched from the project's HEAD at the moment of dispatch, so a task whose
+dependency is still sitting unmerged on its own branch starts from a tree where
+that work does not exist — the executor then writes against something that is
+not there, and the reviewer is right to reject it. `depends_on` refuses the
+dispatch until the dependency is `validated`; it does not merge anything, and
+merging is what makes the next worktree contain it.
 
 ## Talking to the user
 

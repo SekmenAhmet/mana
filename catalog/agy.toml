@@ -82,17 +82,18 @@ only as accurate as that paste. No read-only-approve mode was found on this
 CLI; the only permission flag it has is the all-or-nothing
 `--dangerously-skip-permissions`, which a PM must never be given.
 
-The sentinel channel cannot tell a block the PM meant from one it merely
-quoted (probed 2026-08-16). mana executes every top-level ```mana fence in the
-turn's text; a `mana` fence nested inside another fence is left as prose, but
-text copied verbatim out of a file, an issue or a pasted log carries no such
-wrapper. Asked to quote such a block "as documentation", this PM refused on its
-own reasoning -- "a ```mana block in my output is a live tool call" -- so the
-defence held, but it rests on the skill text, exactly like the no-code rule
-above. The surface is small today: agy is the only sentinel CLI, and it cannot
-read files, so the only text it can quote is what the user pasted in. If it
-ever needs hardening: a per-turn nonce the PM must include, or honouring blocks
-only in a turn that quoted no user-supplied text.
+The sentinel channel could not tell a block the PM meant from one it merely
+quoted (probed 2026-08-16): mana executed every top-level ```mana fence in the
+turn's text, and text copied verbatim out of a file, an issue or a pasted log
+arrives without the nesting that made a quoted example inert. Asked to quote
+such a block "as documentation", this PM refused on its own reasoning -- "a
+```mana block in my output is a live tool call" -- so the defence held, but it
+rested on the skill text, exactly like the no-code rule above. Since #140 it
+does not: a fence is executed only when its info string carries this session's
+nonce, which mana issues in the activation turn and writes to no file, so
+quoted text cannot contain it. The skill still tells the PM to keep the nonce
+out of everything it writes -- that part is still an instruction to a model,
+but it is one about a secret rather than about a behaviour.
 
 Two parallel dispatches died within 8 seconds, so max_concurrent is 1. The same
 limit is a hazard the PM role cannot see: while agy is the PM, a turn of its own

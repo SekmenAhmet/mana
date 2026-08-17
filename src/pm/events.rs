@@ -651,9 +651,18 @@ mod golden {
                 .collect::<Vec<String>>()
         };
 
+        // The recordings predate the nonce (#140) and could not carry one
+        // anyway: it is minted per session, so no captured frame can hold the
+        // token of the session replaying it. Re-fencing here is what keeps
+        // this test about the *channel* -- the map, the scanner, the executor
+        // -- rather than about a value the recording never had. That a bare
+        // fence does not run is pinned in `sentinel`'s own tests.
+        let authorized =
+            |text: &str| text.replace("```mana\n", &format!("```mana:{}\n", sentinel.nonce()));
+
         // The first turn of the working run: a call, and a sentence of prose
         // that the operator sees without the block in the middle of it.
-        let outcome = sentinel.handle(&answers(AGY_SESSION)[0]);
+        let outcome = sentinel.handle(&authorized(&answers(AGY_SESSION)[0]));
         assert_eq!(
             outcome.log,
             [ToolLine {
@@ -676,16 +685,16 @@ mod golden {
         // The run before the role text was inlined: the PM guessed, and got
         // one corrective message naming what was wrong...
         let guessed = answers(AGY_MALFORMED);
-        let corrected = sentinel.handle(&guessed[1]).reply.unwrap();
+        let corrected = sentinel.handle(&authorized(&guessed[1])).reply.unwrap();
         assert!(corrected.contains("not valid JSON"), "{corrected}");
         assert!(
-            corrected.contains("One call per ```mana block"),
+            corrected.contains("One call per ```mana:<nonce> block"),
             "{corrected}"
         );
 
         // ...after which the very next turn was well-formed, across five
         // lines, and ran.
-        let outcome = sentinel.handle(&guessed[2]);
+        let outcome = sentinel.handle(&authorized(&guessed[2]));
         assert_eq!(
             outcome.log,
             [ToolLine {

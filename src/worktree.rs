@@ -134,7 +134,12 @@ pub fn create(
     })
 }
 
-fn branch_name(task_id: &str) -> String {
+/// The branch a task's work lands on. Public because `mcp` reports it to the
+/// PM at dispatch time -- before `create` has run, and therefore before there
+/// is a `WorktreeInfo` to read it off (#36). Deterministic from the task id
+/// for exactly that reason: a retry rebuilds the same branch from a fresh
+/// base, so the name mana promised at dispatch is still the name afterwards.
+pub fn branch_name(task_id: &str) -> String {
     format!("mana/{task_id}")
 }
 
@@ -155,7 +160,11 @@ pub fn task_dir_name(task_id: &str) -> String {
     task_id.chars().take(TASK_DIR_CHARS).collect()
 }
 
-fn worktree_path(mana_home: &Path, project_root: &Path, task_id: &str) -> PathBuf {
+/// Where a task's worktree is, or will be once `create` runs. Public for the
+/// same reason `branch_name` is: `mcp` tells the PM where its dispatch will
+/// work before the directory exists (#36), and a second builder for this path
+/// would be a second answer to "where is my work".
+pub fn worktree_path(mana_home: &Path, project_root: &Path, task_id: &str) -> PathBuf {
     worktrees_dir(mana_home, &project_name_from_dir(project_root)).join(task_dir_name(task_id))
 }
 

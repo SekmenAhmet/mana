@@ -48,7 +48,7 @@ use crate::project::{
 };
 use crate::review::{self, Decision, Verdict};
 use crate::task::{Role, Task, TaskFrontmatter, read_task, write_task};
-use crate::worktree::WorktreeInfo;
+use crate::worktree::{self, WorktreeInfo};
 use anyhow::{Context, Result, bail};
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::{Json, Parameters};
@@ -533,6 +533,8 @@ impl ManaTools {
                 cli: resolved.cli,
                 model: resolved.model,
             },
+            branch: worktree::branch_name(task_id),
+            worktree: self.worktree_path(task_id),
         })
     }
 
@@ -573,7 +575,11 @@ impl ManaTools {
                 "the verdict for task {task_id} is unusable: {error:#}"
             ))
         })?;
-        Ok(ReviewOut::from(&verdict))
+        Ok(ReviewOut::about(
+            &verdict,
+            worktree::branch_name(task_id),
+            self.worktree_path(task_id),
+        ))
     }
 
     pub(crate) fn list_agents_impl(&self) -> Result<ListAgentsOut, ErrorData> {
@@ -667,6 +673,15 @@ impl ManaTools {
             )));
         }
         Ok(record.worktree_info())
+    }
+
+    /// Where a task's worktree is, or will be. Named here rather than at the
+    /// two call sites so the string mana promises at dispatch and the one it
+    /// repeats at review are the same string `worktree::create` builds.
+    fn worktree_path(&self, task_id: &str) -> String {
+        worktree::worktree_path(&self.mana_home, &self.project_root, task_id)
+            .display()
+            .to_string()
     }
 
     fn paths(&self) -> Result<ProjectPaths, ErrorData> {
@@ -1083,6 +1098,14 @@ pub struct LaunchSubagentOut {
     /// What mana actually picked, which is worth reading back when you asked
     /// for a cost class rather than a model.
     resolved: ResolvedOut,
+    /// The branch this dispatch's work lands on, and the worktree it happens
+    /// in. The PM used to be told neither, and `worktree.rs` says outright
+    /// that "the branch is the deliverable -- the reviewer reads
+    /// `base_ref..HEAD` and the PM merges it": a PM that cannot name the
+    /// branch cannot land it, and one observed session ended with the PM
+    /// asking the user to run `git worktree list` to find its own work (#36).
+    branch: String,
+    worktree: String,
 }
 
 #[derive(Debug, Serialize, schemars::JsonSchema)]
@@ -1109,15 +1132,26 @@ pub struct ReviewOut {
     /// Whether this verdict counts against the model's record. A brief you
     /// wrote badly does not.
     counts_against_model: bool,
+    /// Where the reviewed work is. On a `validated` verdict this is what
+    /// there is to land: mana has no merge tool, so the PM either runs git
+    /// itself or names the branch to the user (#36).
+    branch: String,
+    worktree: String,
 }
 
-impl From<&Verdict> for ReviewOut {
-    fn from(verdict: &Verdict) -> Self {
+impl ReviewOut {
+    /// Not a `From<&Verdict>` any more: a verdict on its own does not know
+    /// which branch it judged, and the whole point of #36 is that the PM is
+    /// told. The two extra arguments come from the task id the caller already
+    /// resolved, so there is no second source of truth for either.
+    fn about(verdict: &Verdict, branch: String, worktree: String) -> Self {
         ReviewOut {
             verdict: verdict.verdict.word().to_string(),
             attribution: verdict.attribution.map(|a| a.word().to_string()),
             issues: verdict.issues.clone(),
             counts_against_model: verdict.counts_against_model(),
+            branch,
+            worktree,
         }
     }
 }
@@ -1604,6 +1638,14 @@ mod tests {
         assert_eq!(review.attribution.as_deref(), Some("code"));
         assert_eq!(review.issues, ["src/a.rs:1 criterion 2 unmet"]);
         assert!(review.counts_against_model);
+        // #36: a verdict is a verdict *on a branch*, and the PM has to be able
+        // to name the thing it is deciding whether to land.
+        assert_eq!(review.branch, format!("mana/{task_id}"));
+        assert!(
+            review.worktree.ends_with(&task_id[..8]),
+            "{}",
+            review.worktree
+        );
 
         // A brief the PM botched must not read as the model's failure.
         std::fs::write(
@@ -2305,6 +2347,12 @@ url = "https://example.invalid/fixture"
             .unwrap();
         assert_eq!(launched.resolved.cli, "fixture");
         assert_eq!(launched.resolved.model, "cheapo");
+        // #36: the branch is the deliverable, and the PM was told neither its
+        // name nor where it is -- one session ended with the PM asking the
+        // user to run `git worktree list`. Asserted against what the dispatch
+        // *actually* created a few lines below, not against a second copy of
+        // the format string.
+        assert_eq!(launched.branch, format!("mana/{task_id}"));
 
         let notifications = wait_for_notifications(&paths, 1);
         assert_eq!(notifications[0].task_id, task_id);
@@ -2324,6 +2372,15 @@ url = "https://example.invalid/fixture"
         assert_eq!(run.cli, "fixture");
         assert_eq!(run.model, "cheapo");
         assert!(run.worktree.join("done.txt").exists());
+        // The path the tool call promised is the path the worktree was made
+        // at, and the branch it named is the branch that carries the commit.
+        assert_eq!(launched.worktree, run.worktree.display().to_string());
+        // Read from the project checkout, which is where the user would
+        // merge from: the branch mana named carries the executor's commit.
+        assert_eq!(
+            repo.git(&["log", "-1", "--format=%s", &launched.branch]),
+            "mana: fixture executor"
+        );
         // The agent worked in its own worktree, not in the project checkout.
         assert!(!repo.project.join("done.txt").exists());
 
