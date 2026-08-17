@@ -292,18 +292,40 @@ pub fn resolve(
     }
 
     // The ordering, and the whole reason this function is not a `.first()`:
-    // most proven first, then least burnt, then alphabetical so two equal
-    // candidates always resolve the same way.
+    // most proven first, then least burnt, then the catalogue's own editorial
+    // preference, then alphabetical so two equal candidates always resolve the
+    // same way.
+    //
+    // The weight sits third rather than first because a maintainer's belief
+    // must yield to what this project has actually seen. It sits above the
+    // alphabetical tiebreak because on a fresh project the two counters are
+    // equal for everything, and a CLI's *name* deciding which agent does the
+    // work is an accident -- one that put every new project's default cheap
+    // dispatch on the least suitable of the four (#145). Alphabetical is not
+    // gone, it is what still separates two entries the catalogue rates the
+    // same, which is the only question it was ever a good answer to.
     available.sort_by_key(|candidate| {
         let stats = observations.stats(&candidate.cli, &candidate.model);
         (
             Reverse(stats.validated),
             stats.quota_failures,
+            Reverse(routing_weight(&pool, &candidate.cli)),
             candidate.cli.clone(),
             candidate.model.clone(),
         )
     });
     Ok(available.remove(0))
+}
+
+/// The editorial weight of the entry a candidate came from. Every candidate
+/// was built out of `pool` a few lines above, so the lookup cannot miss; if it
+/// somehow did, ranking that candidate last is the safe answer -- an
+/// unattributable CLI is the last one to hand an unattended dispatch to, and
+/// aborting the PM's turn over a tiebreak would be worse than any of them.
+fn routing_weight(pool: &[&CliEntry], cli: &str) -> u8 {
+    pool.iter()
+        .find(|entry| entry.cli.id == cli)
+        .map_or(0, |entry| entry.subagent.routing_weight)
 }
 
 /// Resolution when the PM named a model. The CLI is optional because the PM
@@ -691,6 +713,17 @@ pool_scope = "per-model""#,
         )
     }
 
+    /// The same entry with an editorial weight, set after parsing rather than
+    /// written into the fixture's TOML: `entry` builds one string every test
+    /// here shares, and threading a weight through it would make a dozen tests
+    /// that do not care about ordering declare one. The default and the TOML
+    /// spelling are covered where they belong, in `catalog`'s own tests.
+    fn weighted(id: &str, weight: u8) -> CliEntry {
+        let mut entry = shared_pool_entry(id);
+        entry.subagent.routing_weight = weight;
+        entry
+    }
+
     fn installed(ids: &[&str]) -> BTreeSet<String> {
         ids.iter().map(|id| id.to_string()).collect()
     }
@@ -723,8 +756,13 @@ pool_scope = "per-model""#,
         }
     }
 
+    /// The alphabetical rule, demoted by #145 from second tiebreak to last and
+    /// not deleted: it is still the only thing that separates two candidates
+    /// the catalogue rates identically, and it is still what makes a tie
+    /// resolve the same way on every machine.
     #[test]
-    fn with_no_history_the_cheapest_class_resolves_alphabetically() {
+    fn with_no_history_equally_weighted_candidates_resolve_alphabetically() {
+        // Neither fixture declares a routing_weight, so both carry the default.
         let entries = vec![shared_pool_entry("bravo"), shared_pool_entry("alpha")];
         let chosen = resolve(
             &entries,
@@ -737,6 +775,38 @@ pool_scope = "per-model""#,
         // "nano" -- and the catalogue order (bravo first) does not decide it.
         assert_eq!(chosen.cli, "alpha");
         assert_eq!(chosen.model, "mini");
+    }
+
+    /// #145: with no history the first two keys are equal for every candidate,
+    /// so before the catalogue could say anything the CLI's *name* decided
+    /// which agent did the work -- which is how seeding agy's models (#31)
+    /// silently moved every fresh project's default cheap dispatch onto the
+    /// least suitable of the four.
+    #[test]
+    fn a_heavier_entry_wins_over_an_alphabetically_earlier_lighter_one() {
+        let entries = vec![weighted("alpha", 10), weighted("bravo", 90)];
+        let chosen = resolve(
+            &entries,
+            &installed(&["alpha", "bravo"]),
+            &Observations::default(),
+            &request(CostClass::Cheap),
+        )
+        .unwrap();
+        assert_eq!(chosen.cli, "bravo");
+
+        // ...and the weight is a belief, so it yields to evidence: one
+        // validation on the lighter entry takes the dispatch straight back.
+        let chosen = resolve(
+            &entries,
+            &installed(&["alpha", "bravo"]),
+            &synthetic(&[("alpha", "mini", counts(1, 0))]),
+            &request(CostClass::Cheap),
+        )
+        .unwrap();
+        assert_eq!(
+            (chosen.cli.as_str(), chosen.model.as_str()),
+            ("alpha", "mini")
+        );
     }
 
     #[test]
@@ -1330,5 +1400,32 @@ pool_scope = "per-model""#,
                 .iter()
                 .any(|model| model.id == chosen.model && model.cost_class == CostClass::Cheap)
         );
+    }
+
+    /// The concrete regression #145 reports. Seeding agy's `[[models.static]]`
+    /// for #31 was right, but it also gave a fresh project a cheap candidate
+    /// whose CLI id sorts before "claude" -- and with no history to separate
+    /// them, that alone decided. mana's own choice then landed on the entry
+    /// with one concurrency slot the PM's turn may already hold, a print mode
+    /// that denies reads, and a brief that must spell out absolute paths.
+    ///
+    /// Asserted against the shipped files rather than a fixture on purpose:
+    /// the defect was in the data as much as in the sort, so an edit that
+    /// drops claude's weight below agy's has to fail here.
+    #[test]
+    fn the_shipped_catalogue_sends_a_no_history_cheap_task_to_claude() {
+        let catalog = crate::catalog::Catalog::embedded().unwrap();
+        let entries = catalog.entries();
+        let installed: BTreeSet<String> =
+            entries.iter().map(|entry| entry.cli.id.clone()).collect();
+        let chosen = resolve(
+            entries,
+            &installed,
+            &Observations::default(),
+            &request(CostClass::Cheap),
+        )
+        .unwrap();
+        assert_eq!(chosen.cli, "claude", "a fresh project's default dispatch");
+        assert_ne!(chosen.cli, "agy");
     }
 }

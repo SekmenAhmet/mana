@@ -92,6 +92,15 @@ model_args            = ["--model", "{model}"]
 prompt                = "argv"      # placed by the {prompt} template above
 max_concurrent        = 1           # unmeasured; conservative on a 200/mo pool
 cwd_required_in_brief = false
+# Preference when mana routes for itself; higher wins, 50 is the default. Below
+# it because no dispatch has ever completed here -- the account's monthly
+# allowance was already exhausted when this entry was measured -- so the argv
+# above is assembled from --help, max_concurrent is a guess, and the pool is
+# the scarcest of the four (200 premium requests a month, global). Its one
+# model is `expensive`, so this only ever decides an expensive-class tie; the
+# number belongs here anyway, because a re-measured entry will grow cheaper
+# models and would otherwise inherit a preference nobody chose.
+routing_weight        = 30
 
 [models]
 discovery_args = []                 # no models subcommand exists
