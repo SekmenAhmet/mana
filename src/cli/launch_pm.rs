@@ -1504,6 +1504,11 @@ fn notification_message(notification: &Notification) -> String {
     )
 }
 
+// ratatui 0.30 turned `Backend::Error` from `std::io::Error` into an
+// associated type, so `terminal.draw(..)?` no longer converts into `anyhow`
+// on its own: the bound is what says this loop only drives backends whose
+// failures are reportable. Stated here rather than at the one call site
+// because the whole reason this function is generic is the test backend.
 fn run_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     session: &mut Session,
@@ -1511,7 +1516,10 @@ fn run_loop<B: Backend>(
     graph: &mut GraphCache,
     events: &mut dyn EventSource,
     mut update_notice: Option<std::sync::mpsc::Receiver<String>>,
-) -> Result<SessionEnd> {
+) -> Result<SessionEnd>
+where
+    B::Error: std::error::Error + Send + Sync + 'static,
+{
     let started = Instant::now();
     loop {
         let now = Instant::now();
