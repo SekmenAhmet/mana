@@ -351,6 +351,13 @@ url = "https://example.invalid/alpha"
             Some("$.usage")
         );
 
+        // #145: mana's own choice on a project with no history is data, not
+        // an accident of where "agy" and "claude" fall in the alphabet.
+        assert!(
+            claude.subagent.routing_weight > catalog.get("agy").unwrap().subagent.routing_weight,
+            "claude must outrank agy for a dispatch nobody chose"
+        );
+
         let agy = catalog.get("agy").unwrap();
         assert_eq!(agy.pm.driver, PmDriver::OneshotContinue);
         assert_eq!(agy.tools.channel, ToolChannel::Sentinel);
@@ -617,6 +624,21 @@ url = "https://example.invalid/alpha"
         let rendered = format!("{err:#}");
         assert!(rendered.contains("alpha"), "{rendered}");
         assert!(rendered.contains("PATH"), "{rendered}");
+    }
+
+    /// #145 added `routing_weight`, and the default is the whole of what keeps
+    /// that addition safe: a `catalog.local.toml` written before the field
+    /// existed declares none, and must land mid-order rather than be demoted
+    /// under every shipped entry for having said nothing.
+    #[test]
+    fn an_entry_that_declares_no_routing_weight_lands_mid_scale() {
+        assert_eq!(parse_entry(FIXTURE).unwrap().subagent.routing_weight, 50);
+        let declared = parse_entry(&fixture_with(
+            "cwd_required_in_brief = false",
+            "cwd_required_in_brief = false\nrouting_weight = 90",
+        ))
+        .unwrap();
+        assert_eq!(declared.subagent.routing_weight, 90);
     }
 
     /// Routing is "cheapest first, escalate on failure", which only works if

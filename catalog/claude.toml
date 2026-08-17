@@ -104,6 +104,14 @@ model_args            = ["--model", "{model}"]
 prompt                = "argv"
 max_concurrent        = 0          # 0 = unlimited
 cwd_required_in_brief = false
+# Preference when mana routes for itself and nothing has been dispatched yet;
+# higher wins, 50 is what an entry that declares nothing gets. The highest of
+# the four: unlimited concurrency, no cwd caveat, a sub-agent that keeps its
+# full tool set under --dangerously-skip-permissions, and the only entry here
+# whose dispatch path has been measured end to end (the first real M1 dispatch,
+# 2026-08-15). Not higher still because the pool is paid tokens on a 5h window,
+# where opencode's is free -- that is the one axis this entry loses on.
+routing_weight        = 70
 
 [models]
 discovery_args = []                # empty = static list only

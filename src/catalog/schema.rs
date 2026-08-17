@@ -267,6 +267,42 @@ pub struct Subagent {
     /// brief spells out absolute paths. Costly to rediscover (306k tokens
     /// once), so it is recorded.
     pub cwd_required_in_brief: bool,
+    /// How much mana should prefer this CLI when *mana* is choosing -- the PM
+    /// asked for a cost class and named no CLI, and on a project with no
+    /// dispatch history every candidate's record is identical. **Higher
+    /// wins.** The scale is 0-100 by convention and the default is 50, so an
+    /// entry that declares nothing sits in the middle rather than at either
+    /// end: adding this field must not demote a local override written before
+    /// it existed (schema stays 1 for the same reason).
+    ///
+    /// It ranks *below* what this project has actually observed -- validations
+    /// first, then quota failures -- and above the alphabetical tiebreak.
+    /// Editorial preference is what a maintainer believes before any evidence
+    /// exists; the moment evidence does exist it outranks the belief.
+    ///
+    /// Per CLI and not per model on purpose. Within one entry `cost_class`
+    /// already orders the models and the alphabetical tiebreak orders the
+    /// equals, so a per-model number would have to express something else --
+    /// and the only thing left is a quality ranking, which `CostClass`
+    /// deliberately refuses to carry (see its own note).
+    ///
+    /// To pick a value, ask what an unattended dispatch to this CLI costs when
+    /// nobody chose it, from the measurements the entry already records: how
+    /// many sub-agents can run at once (`max_concurrent`, and whether the PM's
+    /// own turn is one of them), whether a sub-agent can read the repository
+    /// it was pointed at, whether a brief has to spell out absolute paths
+    /// (`cwd_required_in_brief`), and whether the pool it burns is free or
+    /// paid. Deliberately one hand-picked number rather than a formula over
+    /// those fields: the fields say what is true, this says what mana should
+    /// do about it, and a formula would need re-tuning every time a CLI whose
+    /// trade-off it never anticipated is added.
+    #[serde(default = "default_routing_weight")]
+    pub routing_weight: u8,
+}
+
+/// Mid-scale, so an entry that says nothing is neither preferred nor avoided.
+fn default_routing_weight() -> u8 {
+    50
 }
 
 #[derive(Deserialize, Debug, Clone, PartialEq)]

@@ -96,9 +96,12 @@ only in a turn that quoted no user-supplied text.
 
 Two parallel dispatches died within 8 seconds, so max_concurrent is 1. The same
 limit is a hazard the PM role cannot see: while agy is the PM, a turn of its own
-and an agy sub-agent dispatch are two agy processes at once. Prefer routing
-sub-agents to a different CLI while agy is the PM; mana builds no avoidance
-machinery for this today, it is recorded so the operator can route around it.
+and an agy sub-agent dispatch are two agy processes at once. Since #145 that is
+one of the reasons [subagent].routing_weight below is the lowest of the four --
+mana still routes here when the PM asks for it, and no longer picks it by
+default. mana does not detect the PM-slot collision itself: it would have to
+know which CLI is running as the PM at routing time, and weighting the entry
+down covers the same case without threading that fact through the router.
 
 A brief without an absolute cwd wasted 306k tokens because this CLI ignores its
 working directory unless the brief spells it out, hence cwd_required_in_brief.
@@ -187,6 +190,17 @@ model_args            = ["--model", "{model}"]
 prompt                = "argv"
 max_concurrent        = 1          # two parallel dispatches died in 8s
 cwd_required_in_brief = true       # 306k tokens wasted without it
+# Preference when mana routes for itself; higher wins, 50 is the default. The
+# lowest of the four, and the reason the field exists (#145): the one slot
+# above is already held by this CLI's own PM turn whenever agy is the PM (#109),
+# print mode denies *reads* as well as writes so a sub-agent here cannot look at
+# the repository it was sent to (#41), and a brief that does not spell out
+# absolute paths is thrown away. Every one of those is acceptable when the PM
+# names agy on purpose -- which still works, cost class and all -- and none of
+# them is acceptable as the choice mana makes when the PM expressed no
+# preference. Not 0: the seed below exists so this quota gets spent (#31), and a
+# floor value would make the entry unreachable again the moment mana routes.
+routing_weight        = 10
 
 [models]
 # Discovery stays authoritative -- `agy models` returns 14 ids across three

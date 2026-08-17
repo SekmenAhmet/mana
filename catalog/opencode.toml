@@ -114,6 +114,14 @@ model_args            = ["--model", "{model}"]   # ids are "provider/model"
 prompt                = "argv"      # `opencode run [message..]`
 max_concurrent        = 0           # 0 = unlimited; two in parallel measured OK
 cwd_required_in_brief = false
+# Preference when mana routes for itself; higher wins, 50 is the default. Above
+# it because the quota this entry burns is free (the OpenCode Zen tier, $0.00
+# over 44 sessions) and two parallel `opencode run` dispatches were measured
+# completing -- spending free quota before paid is what #31 was about. Below
+# claude because almost nothing else about an unattended run here is measured:
+# cwd_required_in_brief above is set from the absence of evidence rather than
+# from a test, and the permission flow has never been exercised at all.
+routing_weight        = 60
 
 [models]
 # Discovery stays authoritative. The static entries below are not a second copy
