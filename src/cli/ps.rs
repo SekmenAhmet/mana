@@ -37,9 +37,10 @@ pub fn run(all: bool, project: Option<&Path>) -> Result<()> {
 }
 
 /// The project a command with no `--all` acts on: the directory named by
-/// `--project`, else the working directory. Only the basename matters —
-/// that is how mana has always keyed project state (`project_name_from_dir`),
-/// and `mana doctor` prints the resolved path so the aliasing is visible.
+/// `--project`, else the working directory. The name is that directory's, and
+/// only that directory's — `project_name_from_dir` qualifies the basename with
+/// a fingerprint of the absolute path, so `--project ../other/api` reports on
+/// the other `api` rather than on this one (#33).
 pub fn resolve_project_name(project: Option<&Path>) -> Result<String> {
     let dir = match project {
         Some(path) => path.to_path_buf(),

@@ -1027,7 +1027,7 @@ cooldown_minutes = 30
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("my-api");
         std::fs::create_dir_all(&project).unwrap();
-        let paths = resolve_project_paths(tmp.path(), "my-api");
+        let paths = resolve_project_paths(tmp.path(), &project_name_from_dir(&project));
         crate::project::ensure_project_structure(&paths).unwrap();
 
         append_record(&paths.subagents_file, &record("agent-1", "task-1", None)).unwrap();
@@ -1051,7 +1051,12 @@ cooldown_minutes = 30
         options.project_root = Some(&project);
         let text = joined(&diagnose(&options).unwrap());
 
-        assert!(text.contains("project 'my-api'"), "{text}");
+        // Named by what the state directory is actually called: the
+        // basename alone stopped being the project's identity in #33.
+        assert!(
+            text.contains(&format!("project '{}'", project_name_from_dir(&project))),
+            "{text}"
+        );
         assert!(text.contains("2 dispatch(es): 0 running, 2 done"), "{text}");
         // Everything finished, so there is no in-flight table -- and a header
         // with no rows under it is worse than no table at all.
@@ -1187,7 +1192,7 @@ mod process_tests {
         let tmp = tempfile::tempdir().unwrap();
         let project = tmp.path().join("my-api");
         std::fs::create_dir_all(&project).unwrap();
-        let paths = resolve_project_paths(tmp.path(), "my-api");
+        let paths = resolve_project_paths(tmp.path(), &project_name_from_dir(&project));
         crate::project::ensure_project_structure(&paths).unwrap();
         append_record(
             &paths.subagents_file,
@@ -1326,7 +1331,7 @@ mod process_tests {
         let dead = worktree::create(&fixture.project, &mana_home, dead_task).unwrap();
         let live = worktree::create(&fixture.project, &mana_home, live_task).unwrap();
 
-        let paths = resolve_project_paths(&mana_home, "project");
+        let paths = resolve_project_paths(&mana_home, &project_name_from_dir(&fixture.project));
         crate::project::ensure_project_structure(&paths).unwrap();
         append_record(
             &paths.subagents_file,

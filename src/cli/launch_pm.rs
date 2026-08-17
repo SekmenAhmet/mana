@@ -42,6 +42,7 @@ use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
 use crate::sentinel::{Sentinel, ToolLine};
+use crate::session_lock;
 use crate::status::{self, DispatchStatus, short};
 use crate::tui::app::{App, Source};
 use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, map_key_event};
@@ -138,6 +139,11 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<u8> {
     // be a genuine defect (design §5).
     let update_notice = crate::cli::upgrade::spawn_check(&home);
     let paths = resolve_project_paths(&home, &project_name_from_dir(&project_root));
+    // Before the PM is chosen and long before it is spawned: a session that is
+    // going to be refused must not have installed a skill, rewritten
+    // `state.toml` or paid for a turn first. Held for the rest of `run`, which
+    // is every way out of it -- see `session_lock`.
+    let _session = session_lock::acquire(&paths, Utc::now())?;
     let agent_cli = resolve_cli(&paths, agent_cli, resume)?;
     let mut session = prepare_session(&home, &project_root, &agent_cli, resume)?;
     let mut app = App::new(&session.cli_name);
@@ -1217,6 +1223,12 @@ fn resolve_skill_dir(path: &str, home: Option<&Path>, project_root: &Path) -> Pa
 /// line. Only *this* project is swept -- another mana in another directory has
 /// its own agents and its own session, and quitting this one says nothing about
 /// them.
+///
+/// Every running dispatch of this project is this session's, which is what
+/// makes sweeping by project the same thing as sweeping your own: `mana
+/// launch` holds `session_lock`, so the second session that used to have its
+/// sub-agents killed here (#42) no longer starts. A dispatch left running by a
+/// *previous* session is fair game too -- nothing is watching it either.
 ///
 /// Never fails: this runs on the way out, after the terminal has been restored,
 /// and a session that already ended cannot be failed any harder. It still says

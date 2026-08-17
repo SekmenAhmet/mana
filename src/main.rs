@@ -8,6 +8,7 @@ mod pm;
 mod project;
 mod review;
 mod sentinel;
+mod session_lock;
 mod spawn;
 mod status;
 mod subprocess;
