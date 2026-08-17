@@ -459,12 +459,17 @@ mod tests {
 
     #[test]
     fn worktree_path_keeps_only_the_first_eight_task_id_chars() {
-        let path = worktree_path(
-            Path::new("/home/u/.mana"),
-            Path::new("/home/u/code/my-api"),
-            TASK_ID,
+        let project = Path::new("/home/u/code/my-api");
+        let path = worktree_path(Path::new("/home/u/.mana"), project, TASK_ID);
+        // The project component is `project_name_from_dir`'s, fingerprint
+        // included (#33) -- spelled out here rather than hard-coded, because
+        // what this test pins is the *task* component's width.
+        assert_eq!(
+            path,
+            Path::new("/home/u/.mana/worktrees")
+                .join(project_name_from_dir(project))
+                .join("3f2a1b6c")
         );
-        assert_eq!(path, Path::new("/home/u/.mana/worktrees/my-api/3f2a1b6c"));
     }
 
     #[test]
@@ -522,7 +527,11 @@ mod tests {
         assert_eq!(info.base_ref, base);
         assert_eq!(
             info.path,
-            fixture.mana_home.join("worktrees/project/3f2a1b6c")
+            fixture
+                .mana_home
+                .join("worktrees")
+                .join(project_name_from_dir(&fixture.project))
+                .join("3f2a1b6c")
         );
 
         // Control: same environment, project checkout, no worktree config.

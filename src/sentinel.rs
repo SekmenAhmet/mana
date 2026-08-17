@@ -345,12 +345,14 @@ mod tests {
             let home = tmp.path().join("mana-home");
             std::fs::create_dir_all(&project).unwrap();
             let catalog = Catalog::embedded().expect("the shipped catalogue must parse");
+            let paths =
+                resolve_project_paths(&home, &crate::project::project_name_from_dir(&project));
             Fixture {
                 sentinel: Sentinel::new(&project, &home, catalog.clone()),
                 // A second handle on the same state, standing in for the MCP
                 // server: same project, same home, same catalogue.
                 tools: ManaTools::new(project, home.clone(), catalog),
-                paths: resolve_project_paths(&home, "demo"),
+                paths,
                 _tmp: tmp,
             }
         }

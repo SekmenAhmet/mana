@@ -23,10 +23,55 @@ pub fn mana_home() -> anyhow::Result<PathBuf> {
     Ok(home.join(".mana"))
 }
 
+/// The directory name a project's state lives under: its basename, qualified
+/// by a fingerprint of its absolute path.
+///
+/// The basename alone was the whole identity until #33, and two unrelated
+/// repositories that happen to share one — `client-a/api` and `client-b/api`,
+/// or two checkouts both called `frontend` — then shared every piece of state
+/// mana keeps: tasks, logs, reviews, the registry `mana ps` lists and `mana
+/// kill` reaches into, the notification file the PM follows, and the
+/// worktrees. That is not an exotic layout; it is how most people arrange
+/// client work.
+///
+/// The suffix is derived, not stored, so nothing has to be looked up before a
+/// project can be named, and every command that resolves the same directory
+/// resolves the same name. It is FNV-1a rather than `DefaultHasher` because
+/// this value names a directory on disk: `DefaultHasher`'s output is
+/// explicitly not stable across Rust releases, so a toolchain upgrade would
+/// quietly move every project's state somewhere new.
+///
+/// The path is canonicalised first — `.`, `..`, a relative `--project`
+/// argument and a symlinked checkout all have to reach the same name. A path
+/// that cannot be canonicalised (it no longer exists, or is not readable) is
+/// fingerprinted as given: a name that is merely unshared with anything else
+/// is a better answer than a failure, and this function has no way to report
+/// one.
+///
+/// ponytail: state written by a mana older than this lands under the bare
+/// basename and is no longer found. Nothing is lost — the files are still
+/// there — and no migration is written because there is no released version
+/// to migrate from.
 pub fn project_name_from_dir(dir: &Path) -> String {
-    dir.file_name()
+    let absolute = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let basename = absolute
+        .file_name()
         .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "unknown-project".to_string())
+        .unwrap_or_else(|| "unknown-project".to_string());
+    format!("{basename}-{}", fingerprint(&absolute))
+}
+
+/// Eight hex chars of FNV-1a over the path's bytes. The same budget a task
+/// directory and a `mana ps` row spend on a UUID, for the same reason: it is
+/// short enough to read in a directory listing, and a collision needs two
+/// paths on one machine to agree in 32 bits.
+fn fingerprint(path: &Path) -> String {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in path.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100_0000_01b3);
+    }
+    format!("{hash:016x}")[..8].to_string()
 }
 
 pub fn resolve_project_paths(mana_home: &Path, project_name: &str) -> ProjectPaths {
@@ -107,6 +152,23 @@ pub fn open_append(path: &Path) -> std::io::Result<std::fs::File> {
     private_options().append(true).open(path)
 }
 
+/// Creates a file that must not already exist, owner-only.
+///
+/// The `AlreadyExists` error is the point rather than a nuisance: the create
+/// is atomic, so it is what `crate::session_lock` claims a project with (two
+/// mana processes racing for one project cannot both win). Kept here with its
+/// siblings so every creation under `~/.mana` still goes through this module.
+pub fn create_new(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
 fn private_options() -> std::fs::OpenOptions {
     let mut options = std::fs::OpenOptions::new();
     options.create(true);
@@ -123,9 +185,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn project_name_from_dir_takes_basename() {
-        let dir = Path::new("/Users/user/projects/my-api");
-        assert_eq!(project_name_from_dir(dir), "my-api");
+    fn project_name_from_dir_keeps_the_basename_readable() {
+        let name = project_name_from_dir(Path::new("/Users/user/projects/my-api"));
+        assert!(name.starts_with("my-api-"), "{name}");
+        assert_eq!(name.len(), "my-api-".len() + 8);
+    }
+
+    /// The defect #33 filed: two client checkouts both called `api` shared
+    /// every task, log, review and registry row mana keeps.
+    #[test]
+    fn two_directories_with_the_same_basename_get_different_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let team_a = tmp.path().join("team-a/api");
+        let team_b = tmp.path().join("team-b/api");
+        std::fs::create_dir_all(&team_a).unwrap();
+        std::fs::create_dir_all(&team_b).unwrap();
+        assert_ne!(
+            project_name_from_dir(&team_a),
+            project_name_from_dir(&team_b)
+        );
+    }
+
+    /// One project, however it was spelled on the command line: `mana ps
+    /// --project ./api` and `mana launch` from inside it must reach the same
+    /// state.
+    #[test]
+    fn the_same_directory_spelled_differently_gets_one_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("api");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        assert_eq!(
+            project_name_from_dir(&project),
+            project_name_from_dir(&project.join("src/..")),
+        );
     }
 
     #[test]

@@ -124,6 +124,13 @@ pub fn serve(project_root: &Path) -> Result<()> {
 /// prove a dispatch is live is written only *after* the spawn — by which time
 /// a second dispatch against a `max_concurrent = 1` CLI has already killed
 /// both (agy, 8s).
+///
+/// Counting in one process's memory is only the project's true count because
+/// a project has one session: `mana launch` takes `session_lock` and a second
+/// launch on the same project is refused. Before that lock, two sessions meant
+/// two servers, two counters and two dispatches against a cap of one (#35).
+/// Anything that ever lets two servers serve one project has to move this
+/// count onto disk with them.
 #[derive(Clone)]
 pub struct ManaTools {
     project_root: PathBuf,
@@ -1174,7 +1181,7 @@ mod tests {
             let project = tmp.path().join("demo");
             let mana_home = tmp.path().join("mana-home");
             std::fs::create_dir_all(&project).unwrap();
-            let paths = resolve_project_paths(&mana_home, "demo");
+            let paths = resolve_project_paths(&mana_home, &project_name_from_dir(&project));
             Fixture {
                 tools: ManaTools::new(
                     project,
@@ -2333,7 +2340,7 @@ url = "https://example.invalid/fixture"
         assert_eq!(registry.records[0].agent_id, launched.agent_id);
         assert_eq!(run.agent_id, launched.agent_id);
         assert!(
-            crate::status::dispatches_in(&repo.mana_home, "project")
+            crate::status::dispatches_in(&repo.mana_home, &project_name_from_dir(&repo.project))
                 .unwrap()
                 .iter()
                 .any(|dispatch| dispatch.record.agent_id == launched.agent_id),

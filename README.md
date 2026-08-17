@@ -230,6 +230,13 @@ TUI:
 themselves, and forwarding it was a v1 mistake that killed the whole PM
 session when a user only meant to interrupt one runaway answer.
 
+One session per project: a second `mana launch` on a project that already has
+one is refused, naming the process that holds it. The two would not get a
+workspace each — they share the project's registry, its worktrees, its
+notifications, the per-CLI concurrency limit each counts in its own memory,
+and the sweep that stops every running sub-agent on quit. A lock left by a
+session that crashed is taken over automatically.
+
 ![The graph pane](docs/assets/graph-pane.png)
 
 *The graph pane (Ctrl+G): one node per dispatched sub-agent, labeled with its
