@@ -16,9 +16,11 @@ yanked = "deny"
 # `advisory-not-detected` (a warning, not an error — hence the flag, without
 # which a stale entry sits here unnoticed).
 ignore = [
-    # paste (unmaintained) comes via ratatui 0.29; revisit at the TUI v2
-    # rework (task 2.4), which bumps ratatui anyway.
-    "RUSTSEC-2024-0436",
+    # RUSTSEC-2024-0436 (paste, unmaintained) used to be listed here, carried
+    # by ratatui 0.29. Its stated exit path was the ratatui bump, and that is
+    # what removed it: 0.30 does not use paste, `cargo deny check advisories`
+    # reported the entry as `advisory-not-detected`, so it was removed
+    # (2026-08-17).
     # RUSTSEC-2025-0119 (number_prefix, unmaintained) used to be listed here.
     # self_update 0.44 moved to indicatif 0.18, which replaced number_prefix
     # with unit-prefix, and the crate left the tree:
