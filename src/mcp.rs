@@ -46,7 +46,7 @@ use crate::dispatch::{self, DispatchOutcome};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
-use crate::review::{self, Verdict};
+use crate::review::{self, Decision, Verdict};
 use crate::task::{Role, Task, TaskFrontmatter, read_task, write_task};
 use crate::worktree::WorktreeInfo;
 use anyhow::{Context, Result, bail};
@@ -345,6 +345,23 @@ impl ManaTools {
         params: CreateTaskParams,
     ) -> Result<CreateTaskOut, ErrorData> {
         let paths = self.paths()?;
+        // The caller is a language model, so this is where a brief first has
+        // to be real (#45). An empty one is accepted by the schema, dispatches
+        // like any other, and spends a full paid run on a sub-agent inventing
+        // what it was for -- and the empty *title* is what the PM, `mana ps`
+        // and the user identify that run by afterwards. Named field by field
+        // because the fix differs: a title is one line, a prompt is the whole
+        // brief, and "invalid arguments" would leave the PM guessing which.
+        for (field, value) in [("title", &params.title), ("prompt", &params.prompt)] {
+            if value.trim().is_empty() {
+                return Err(invalid(format!(
+                    "create_task was given an empty {field}. Send the call again with a real \
+                     one: `title` is the single line naming what the task delivers, `prompt` \
+                     is the brief the sub-agent works from and it sees nothing else."
+                )));
+            }
+        }
+
         let depends_on = params.depends_on.unwrap_or_default();
         // Every dependency must already exist, since ids only come into being
         // when `create_task` returns one. Checked now rather than at dispatch:
@@ -408,6 +425,24 @@ impl ManaTools {
                 ))
             }
         })?;
+
+        // `depends_on` was recorded and never enforced (#40), while the skill
+        // told the PM a `validated` verdict "unblocks its dependents" -- a
+        // promise mana did not keep, so the PM planned around ordering it
+        // believed was held for it and dispatched out of order. The executor
+        // then works in a worktree branched off a base its dependency never
+        // landed in, which is a full paid run against a tree missing the thing
+        // it was told to build on.
+        //
+        // A refusal, not a scheduler: nothing is queued and nothing is woken
+        // (that is v3). The verdicts are already on disk, `get_review` already
+        // reads them, and declining the one dispatch that cannot succeed is
+        // the whole of it. Executors only -- a reviewer judges work that
+        // already exists, and refusing it would strand a dispatch that has
+        // been paid for with no verdict anyone can read.
+        if role == Role::Executor {
+            self.unmet_dependency(&paths, &task)?;
+        }
 
         // Checked here and not on the dispatch thread: "the executor has not
         // finished" is the PM's mistake to fix, and it has to come back as a
@@ -497,7 +532,7 @@ impl ManaTools {
     pub(crate) fn get_review_impl(&self, params: TaskRef) -> Result<ReviewOut, ErrorData> {
         let paths = self.paths()?;
         let task_id = validated_task_id(&params.task_id)?;
-        let path = paths.reviews.join(format!("{task_id}.json"));
+        let path = review_path(&paths, task_id);
         if !path.exists() {
             // Two different mistakes with two different fixes: an id that was
             // never issued, versus a real task nobody has reviewed yet.
@@ -564,6 +599,37 @@ impl ManaTools {
                 })
                 .collect(),
         })
+    }
+
+    /// `Ok(())` when every task this one declares a dependency on has been
+    /// validated, and the refusal naming the first one that has not otherwise.
+    ///
+    /// The message has to leave the PM with a move, not just a "no": which
+    /// dependency, what state it is actually in, and what would satisfy it --
+    /// otherwise the PM's next act is to call again, identically, because
+    /// nothing told it what changed the answer.
+    fn unmet_dependency(&self, paths: &ProjectPaths, task: &Task) -> Result<(), ErrorData> {
+        for dependency in &task.frontmatter.depends_on {
+            // Validated on the way back out of the file as well as on the way
+            // in: `create_task` wrote it, but a task file is plain text on
+            // disk and this id is about to become a path.
+            let dependency = validated_task_id(dependency)?;
+            let state = match review::read_verdict(&review_path(paths, dependency)) {
+                Ok(verdict) if verdict.verdict == Decision::Validated => continue,
+                // A rejection and a malformed verdict need the same next move
+                // (get that task finished), so they get the same sentence with
+                // the state that distinguishes them.
+                Ok(verdict) => format!("its verdict is {}", verdict.verdict.word()),
+                Err(_) => "it has no usable verdict yet".to_string(),
+            };
+            return Err(invalid(format!(
+                "task {} depends on task {dependency}, and {state}. Finish that one first -- \
+                 executor, then reviewer, then get_review -- and launch this one when it comes \
+                 back validated. Nothing is queued in the meantime: send this call again then.",
+                task.frontmatter.id
+            )));
+        }
+        Ok(())
     }
 
     /// The worktree a reviewer will run in, or the reason there is none yet.
@@ -648,6 +714,7 @@ impl BackgroundDispatch {
         let outcome = match &self.worktree {
             None => dispatch::dispatch_executor(&assignment).map(|run| {
                 let summary = describe(&run.outcome);
+                let tail = failure_tail(&run.outcome);
                 let record = RunRecord {
                     task_id: task_id.clone(),
                     agent_id: self.agent_id.clone(),
@@ -658,8 +725,10 @@ impl BackgroundDispatch {
                     base_ref: run.worktree.base_ref.clone(),
                     succeeded: run.outcome.succeeded(),
                     outcome: summary.clone(),
+                    output_tail: tail.clone(),
                     finished_at: crate::log::now_iso8601(),
                 };
+                let summary = with_tail(summary, tail);
                 match runs::write_run(&paths, &record) {
                     Ok(()) => summary,
                     // A lost run record means the reviewer will be refused, so
@@ -668,7 +737,9 @@ impl BackgroundDispatch {
                 }
             }),
             Some(worktree) => dispatch::dispatch_reviewer(&assignment, worktree, None).map(|run| {
-                let summary = describe(&run.outcome);
+                // A reviewer writes no run record, so the notification is the
+                // only place its own output can survive at all (#32).
+                let summary = with_tail(describe(&run.outcome), failure_tail(&run.outcome));
                 // A reviewer that exits 0 without writing its verdict is the
                 // failure `review.rs` names as the likeliest one there is, and
                 // reporting only the exit code hides it completely: the PM
@@ -719,6 +790,77 @@ fn describe(outcome: &DispatchOutcome) -> String {
     match next_step(outcome) {
         Some(step) => format!("{} -- {step}", dispatch::describe(outcome)),
         None => dispatch::describe(outcome),
+    }
+}
+
+/// How many lines of a failed run's output are worth keeping, and the hard
+/// byte ceiling under them.
+///
+/// A cap rather than the whole streams, deliberately: a sub-agent gets fifteen
+/// minutes and can print megabytes in them, this text is re-read from the run
+/// record on every reviewer dispatch, and the notification carrying it is
+/// injected straight into the PM's context, where every line is paid for on
+/// each subsequent turn. What is worth that price is the end -- a CLI's last
+/// words are what it died of ("model 'x' does not exist", "not logged in") --
+/// so the tail is kept and the run itself is not. Both bounds are needed: the
+/// line count is the useful unit, and the byte ceiling is what holds when a
+/// CLI prints one megabyte-long JSON line, which is exactly the shape of
+/// output these CLIs produce.
+const TAIL_LINES: usize = 20;
+const TAIL_BYTES: usize = 2000;
+
+/// The end of what a failed dispatch printed, or `None` when it succeeded or
+/// said nothing.
+///
+/// This closes the gap the failure signatures made obvious (#32): the
+/// catalogue matches its regexes against exactly these two strings and then
+/// they are dropped with the `DispatchOutcome`, leaving `{succeeded: false,
+/// outcome: "exit 1 in 3.5s"}` as the entire record of the run. A PM handed
+/// that diagnosed "systematic issue (likely worktree setup or CLI config)"
+/// while the real cause -- a model id that did not exist -- was one line the
+/// CLI had already printed.
+///
+/// Both streams, each labelled: a CLI puts its refusal on whichever one it
+/// feels like, and the catalogue's own signatures match copilot's quota
+/// refusal on *stdout*. Only on failure, because a successful run's output is
+/// the work, not evidence.
+fn failure_tail(outcome: &DispatchOutcome) -> Option<String> {
+    if outcome.succeeded() {
+        return None;
+    }
+    let tail: Vec<String> = [("stderr", &outcome.stderr), ("stdout", &outcome.stdout)]
+        .into_iter()
+        .filter_map(|(stream, text)| Some(format!("{stream}: {}", tail_of(text)?)))
+        .collect();
+    (!tail.is_empty()).then(|| tail.join("\n"))
+}
+
+/// The last `TAIL_LINES` lines of `text`, then its last `TAIL_BYTES` bytes.
+fn tail_of(text: &str) -> Option<String> {
+    let text = text.trim_end();
+    if text.is_empty() {
+        return None;
+    }
+    let mut lines: Vec<&str> = text.lines().rev().take(TAIL_LINES).collect();
+    lines.reverse();
+    let kept = lines.join("\n");
+    if kept.len() <= TAIL_BYTES {
+        return Some(kept);
+    }
+    // Forward to the next char boundary rather than slicing at the byte
+    // offset: this is a model's output, and one multi-byte character
+    // straddling the cut would panic the dispatch thread over a log line.
+    let cut = (kept.len() - TAIL_BYTES..kept.len())
+        .find(|index| kept.is_char_boundary(*index))
+        .unwrap_or(kept.len());
+    Some(format!("[...] {}", &kept[cut..]))
+}
+
+/// Puts the failure tail under the one-line summary, where the PM reads both.
+fn with_tail(summary: String, tail: Option<String>) -> String {
+    match tail {
+        Some(tail) => format!("{summary}\nlast output:\n{tail}"),
+        None => summary,
     }
 }
 
@@ -795,6 +937,12 @@ fn installed_ids(entries: &[CliEntry]) -> BTreeSet<String> {
 
 fn task_path(paths: &ProjectPaths, task_id: &str) -> PathBuf {
     paths.tasks.join(format!("{task_id}.md"))
+}
+
+/// Where a reviewer is told to write its verdict, and so where both
+/// `get_review` and the `depends_on` gate look for one.
+fn review_path(paths: &ProjectPaths, task_id: &str) -> PathBuf {
+    paths.reviews.join(format!("{task_id}.json"))
 }
 
 /// Task ids come back from a language model, and this is where they first
@@ -1241,6 +1389,43 @@ mod tests {
         assert_eq!(task.body, "# Brief\n\nCreate done.txt.\n");
     }
 
+    /// The caller is a model, so an empty brief is an ordinary thing for it to
+    /// send -- and the task it minted used to be dispatchable, which spends a
+    /// real run on nothing (#45). The refusal has to name the field, since the
+    /// PM cannot fix what it is not told about.
+    #[test]
+    fn create_task_refuses_an_empty_title_or_prompt_and_says_which() {
+        let fixture = Fixture::new();
+        // Whitespace-only too: " " is empty to everyone who reads it.
+        for (title, prompt, empty) in [
+            ("", "brief", "title"),
+            ("   \n\t", "brief", "title"),
+            ("Title", "", "prompt"),
+            ("Title", "  ", "prompt"),
+        ] {
+            let error = fixture
+                .tools
+                .create_task_impl(CreateTaskParams {
+                    title: title.to_string(),
+                    prompt: prompt.to_string(),
+                    depends_on: None,
+                })
+                .unwrap_err();
+            assert!(
+                error.message.contains(&format!("empty {empty}")),
+                "{title:?}/{prompt:?} was not refused by name: {}",
+                error.message
+            );
+        }
+        // ...and nothing was written for any of them.
+        assert!(
+            std::fs::read_dir(&fixture.paths.tasks)
+                .map(|entries| entries.count())
+                .unwrap_or(0)
+                == 0
+        );
+    }
+
     #[test]
     fn create_task_keeps_the_declared_dependencies() {
         let fixture = Fixture::new();
@@ -1479,6 +1664,7 @@ mod tests {
                 base_ref: "abc123".to_string(),
                 succeeded: false,
                 outcome: "exit 2 in 3.4s".to_string(),
+                output_tail: None,
                 finished_at: crate::log::now_iso8601(),
             },
         )
@@ -1512,6 +1698,17 @@ mod tests {
         killed: bool,
         failure_means: Option<FailureMeans>,
     ) -> DispatchOutcome {
+        printed(exit_code, timed_out, killed, failure_means, "", "")
+    }
+
+    fn printed(
+        exit_code: Option<i32>,
+        timed_out: bool,
+        killed: bool,
+        failure_means: Option<FailureMeans>,
+        stdout: &str,
+        stderr: &str,
+    ) -> DispatchOutcome {
         DispatchOutcome {
             agent_id: "agent-1".to_string(),
             exit_code,
@@ -1519,8 +1716,8 @@ mod tests {
             killed,
             duration: Duration::from_secs(12),
             failure_means,
-            stdout: String::new(),
-            stderr: String::new(),
+            stdout: stdout.to_string(),
+            stderr: stderr.to_string(),
             log_path: PathBuf::from("/tmp/logs/agent-1.jsonl"),
             bookkeeping_error: None,
         }
@@ -1572,6 +1769,114 @@ mod tests {
             broken.contains("fix the brief and relaunch the executor"),
             "{broken}"
         );
+    }
+
+    /// The reason a failure had, kept and bounded (#32). These two strings had
+    /// the catalogue's failure signatures matched against them and were then
+    /// dropped, which is how "model 'nope' does not exist" reached the PM as
+    /// "exit 1 in 3.5s" and got diagnosed as a broken worktree.
+    #[test]
+    fn a_failure_keeps_the_end_of_what_it_printed_and_no_more() {
+        // A clean run's output is the work, not evidence.
+        assert_eq!(
+            failure_tail(&printed(Some(0), false, false, None, "all done", "")),
+            None
+        );
+
+        let tail = failure_tail(&printed(
+            Some(1),
+            false,
+            false,
+            None,
+            "",
+            "error: model 'nope' does not exist",
+        ))
+        .unwrap();
+        assert_eq!(tail, "stderr: error: model 'nope' does not exist");
+
+        // Both streams, labelled: copilot's quota refusal is on stdout, and
+        // the catalogue matches its signatures against either one.
+        let both = failure_tail(&printed(Some(1), false, false, None, "402", "a warning")).unwrap();
+        assert!(both.contains("stdout: 402"), "{both}");
+        assert!(both.contains("stderr: a warning"), "{both}");
+
+        // A talkative run is cut to its end, by lines...
+        let many: String = (0..500).map(|n| format!("line {n}\n")).collect();
+        let tail = failure_tail(&printed(Some(1), false, false, None, "", &many)).unwrap();
+        assert!(tail.contains("line 499"), "{tail}");
+        assert!(!tail.contains("line 479"), "{tail}");
+        assert!(tail.lines().count() <= TAIL_LINES, "{tail}");
+
+        // ...and by bytes, which is the bound that holds when a CLI prints its
+        // megabyte as a single JSON line. Multi-byte characters and all: the
+        // cut must not panic a dispatch thread over a log line.
+        let huge = "é".repeat(100_000);
+        let tail = failure_tail(&printed(Some(1), false, false, None, "", &huge)).unwrap();
+        assert!(tail.len() < TAIL_BYTES + 64, "{} bytes kept", tail.len());
+        assert!(tail.ends_with('é'), "{tail}");
+    }
+
+    /// #40: `depends_on` was recorded and never enforced while the skill told
+    /// the PM a `validated` verdict unblocked dependents. Enforced here as a
+    /// refusal (not a queue), and only for executors.
+    #[test]
+    fn an_executor_is_refused_until_its_dependency_is_validated() {
+        let fixture = Fixture::new();
+        let first = fixture.create("First", "brief", None);
+        let second = fixture.create("Second", "brief", Some(vec![first.clone()]));
+
+        // A CLI id no catalogue knows, so a call that gets past the gate is
+        // refused by the router instead of dispatching for real -- which is
+        // also how this test proves the gate is checked *before* routing.
+        let launch = |task_id: &str, role: RoleParam| {
+            fixture.tools.launch_subagent_impl(LaunchSubagentParams {
+                task_id: task_id.to_string(),
+                role,
+                cli: Some("not-a-cli".to_string()),
+                model: None,
+                cost_class: None,
+            })
+        };
+
+        let error = launch(&second, RoleParam::Executor).unwrap_err();
+        assert!(error.message.contains(&first), "{}", error.message);
+        assert!(
+            error.message.contains("no usable verdict"),
+            "{}",
+            error.message
+        );
+        // What would satisfy it, so the PM has a move and not just a "no".
+        assert!(error.message.contains("reviewer"), "{}", error.message);
+        assert!(error.message.contains("validated"), "{}", error.message);
+
+        // A rejection is not a pass, and reads as itself.
+        let verdict = review_path(&fixture.paths, &first);
+        std::fs::write(
+            &verdict,
+            r#"{"verdict":"rejected","attribution":"code","issues":[]}"#,
+        )
+        .unwrap();
+        let error = launch(&second, RoleParam::Executor).unwrap_err();
+        assert!(
+            error.message.contains("verdict is rejected"),
+            "{}",
+            error.message
+        );
+
+        // A reviewer is never held back by a dependency: it judges work that
+        // already exists, so what refuses it is its own missing executor.
+        let error = launch(&second, RoleParam::Reviewer).unwrap_err();
+        assert!(
+            error.message.contains("no executor has finished"),
+            "{}",
+            error.message
+        );
+
+        // Validated, and the gate is out of the way -- what refuses now is the
+        // router, on the CLI id.
+        std::fs::write(&verdict, r#"{"verdict":"validated","issues":[]}"#).unwrap();
+        let error = launch(&second, RoleParam::Executor).unwrap_err();
+        assert!(error.message.contains("unknown CLI"), "{}", error.message);
     }
 
     /// The drop guard exists so a panicking dispatch cannot permanently eat a
@@ -2117,6 +2422,62 @@ url = "https://example.invalid/fixture"
         let observations =
             Observations::gather(&paths, tools.catalog.entries(), chrono::Utc::now()).unwrap();
         assert_eq!(observations.stats("fixture", "cheapo").validated, 1);
+    }
+
+    /// #32 end to end: the CLI's own complaint has to survive the dispatch,
+    /// into the record a diagnosis is made from and into the notification the
+    /// PM reads. It used to reach the PM as "exit 1 in 3.5s" and nothing else.
+    #[test]
+    fn a_failed_executor_keeps_the_reason_it_failed() {
+        let repo = Repo::new();
+        let failing = repo.script(
+            "failing-cli",
+            "echo \"error: model 'nope' does not exist\" >&2\nexit 1\n",
+        );
+        let tools = tools_for(&repo, &failing);
+        let paths = repo.paths();
+
+        let task_id = tools
+            .create_task_impl(CreateTaskParams {
+                title: "Doomed".to_string(),
+                prompt: "# Brief\n".to_string(),
+                depends_on: None,
+            })
+            .unwrap()
+            .task_id;
+        tools
+            .launch_subagent_impl(LaunchSubagentParams {
+                task_id: task_id.clone(),
+                role: RoleParam::Executor,
+                cli: Some("fixture".to_string()),
+                model: None,
+                cost_class: None,
+            })
+            .unwrap();
+
+        let notifications = wait_for_notifications(&paths, 1);
+        assert!(
+            notifications[0].outcome.contains("exit 1 in"),
+            "{}",
+            notifications[0].outcome
+        );
+        assert!(
+            notifications[0]
+                .outcome
+                .contains("model 'nope' does not exist"),
+            "{}",
+            notifications[0].outcome
+        );
+
+        let run = runs::read_run(&paths, &task_id).unwrap().unwrap();
+        assert!(!run.succeeded);
+        assert!(
+            run.output_tail
+                .as_deref()
+                .is_some_and(|tail| tail.contains("model 'nope' does not exist")),
+            "{:?}",
+            run.output_tail
+        );
     }
 
     #[test]

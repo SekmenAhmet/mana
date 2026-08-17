@@ -84,7 +84,7 @@ pub const TERMINAL_DEFAULT: Color = Color::Reset;
 /// The identity mark, permanently in the chat pane's top-left corner.
 ///
 /// U+25C6 BLACK DIAMOND: a geometric shape every monospace font in practical
-/// use carries, and the same family as the ◉/○ the graph pane already ships.
+/// use carries, and the same family as the ◐/○ the graph pane already ships.
 /// Its East Asian width is "ambiguous", so a terminal configured for CJK may
 /// draw it double-wide and nudge the rest of the title one cell right -- which
 /// is why it lives in a title and not in a column that has to line up.

@@ -15,7 +15,7 @@
 //! success or failure, and `mana kill` appends one too. That is the only
 //! per-dispatch completion signal mana has.
 //!
-//! It is deliberately *not* `runs/<task_id>.json` nor `notifications.jsonl`:
+//! It is deliberately *not* `runs/<task_id>.jsonl` nor `notifications.jsonl`:
 //! both are keyed on the task, and both carry the *PM's* agent id, which is a
 //! different UUID from the registry's (`mcp.rs` mints one for the tool reply,
 //! `dispatch.rs` mints another for the registry row). A second executor on a
