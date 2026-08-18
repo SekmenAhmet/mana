@@ -4103,4 +4103,23 @@ mod teardown_tests {
         assert!(sweep.lines.is_empty());
         assert!(sweep.clean);
     }
+
+    /// The PM skill must describe what a worktree is branched from at relaunch
+    /// time. Issue #173: the old text claimed it started from the same point as
+    /// the original dispatch, which misled PMs to create new tasks instead of
+    /// relaunching when a dependency had since merged. Mirrors src/worktree.rs
+    /// line 117: `git branch --force` rebuilds the branch from HEAD at relaunch.
+    #[test]
+    fn pm_skill_says_relaunch_rebuilds_from_current_head() {
+        // The skill must not claim "same starting point" -- that was the bug.
+        assert!(
+            !PM_SKILL.contains("same starting point"),
+            "PM skill claims relaunch uses the same starting point, which is wrong"
+        );
+        // The corrected skill must say the worktree is rebuilt from current HEAD.
+        assert!(
+            PM_SKILL.contains("rebuilt from the project's HEAD at the moment of the relaunch"),
+            "PM skill does not describe worktree rebuild from current HEAD at relaunch time"
+        );
+    }
 }

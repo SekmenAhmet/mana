@@ -183,12 +183,15 @@ Every brief contains:
 - `validated` — mark the task done. Anything that declared it in `depends_on`
   becomes dispatchable now; mana was refusing those until this verdict landed.
 - `rejected` with `attribution: code` — a task's brief cannot be edited once
-  it exists, and relaunching the same `task_id` re-runs the identical brief in
-  a worktree built fresh from the same starting point. So call `create_task`
-  again with the original brief plus the review's issues, and dispatch that.
-  A fresh attempt with concrete issues beats arguing with the old one. After
-  three rejected attempts at the same piece of work, stop and bring it to the
-  user — it may be misconceived.
+  it exists, but relaunching the same `task_id` re-runs the identical brief in
+  a worktree rebuilt from the project's HEAD at the moment of the relaunch. So
+  if what was missing has since landed — a merged dependency, a fix on
+  `develop` — a relaunch is the right move and costs less than a new task. If
+  the brief itself needs to say more, call `create_task` again with the
+  original brief plus the review's issues, and dispatch that. A fresh attempt
+  with concrete issues beats arguing with the old one. After three rejected
+  attempts at the same piece of work, stop and bring it to the user — it may
+  be misconceived.
 - `rejected` with `attribution: brief` — the fault is yours, not the model's,
   and `counts_against_model` is already false. Rewrite the brief as a new task
   and give it to the same model; don't route away from a model your own
