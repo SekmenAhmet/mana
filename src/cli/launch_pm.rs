@@ -62,6 +62,7 @@ use std::io::{IsTerminal, Read, Seek, SeekFrom, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// The PM role text, embedded so it ships and versions with the tools it
 /// teaches (design §6).
@@ -1666,7 +1667,20 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
         AppEvent::AnswerPermission(allow) => answer_permission(allow, app, session),
         AppEvent::Key(c) => app.input.push(c),
         AppEvent::Backspace => {
-            app.input.pop();
+            // One keypress, one glyph. `String::pop` takes a code point, and a
+            // glyph is often several -- a ZWJ emoji, a base plus a combining
+            // mark, a flag -- so popping one left a *different* valid glyph
+            // behind rather than deleting anything, and the operator could send
+            // it without seeing that the text had changed under them (#182).
+            // Truncating at the last boundary deletes the cluster whole; on an
+            // empty buffer there is no boundary and 0 is the same no-op `pop`
+            // already was.
+            let boundary = app
+                .input
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(at, _)| at);
+            app.input.truncate(boundary);
         }
         AppEvent::Enter => {
             let message = std::mem::take(&mut app.input);
@@ -3398,6 +3412,38 @@ mod smoke {
             label: id.to_string(),
             allows,
         }
+    }
+
+    /// One keypress deletes one *glyph*. A ZWJ sequence is several code
+    /// points and every prefix of one is itself a valid emoji, so a delete
+    /// that took a code point turned the operator's family into a couple, then
+    /// into a man -- each step looking deliberate in the input box, and any of
+    /// them sendable to the PM without the operator seeing anything wrong
+    /// (#182).
+    #[test]
+    fn backspace_deletes_a_whole_grapheme_not_a_code_point() {
+        let fixture = Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        let mut app = App::new(&session.cli_name);
+
+        // Five code points, four glyphs: three ASCII and one man-woman-boy.
+        app.input = "abc\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}".to_string();
+        apply_app_event(AppEvent::Backspace, &mut app, &mut session);
+        assert_eq!(app.input, "abc");
+
+        // The same failure with no emoji in sight: `e` followed by a combining
+        // acute renders as one `\u{e9}`, and half of it is not a character.
+        app.input = "cafe\u{301}".to_string();
+        apply_app_event(AppEvent::Backspace, &mut app, &mut session);
+        assert_eq!(app.input, "caf");
+
+        // An empty buffer is not an error, and never was.
+        app.input.clear();
+        apply_app_event(AppEvent::Backspace, &mut app, &mut session);
+        assert!(app.input.is_empty());
+
+        session.shutdown().unwrap();
     }
 
     /// The stream transport never asks for permission, so answering one has

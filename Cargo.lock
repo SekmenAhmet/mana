@@ -1590,6 +1590,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "unicode-segmentation",
  "uuid",
  "which",
 ]
