@@ -18,9 +18,9 @@ latest model"), so they track vendor releases without catalogue edits.
 
 Verified live (2026-08-15, headless probe with this exact argv): the mana MCP
 server connects and its four tools are callable under the mcp__mana__ prefix
-without a permission prompt, while a Write attempt is refused with "requested
-permissions ... but you haven't granted it" and no file appears. The PM is
-mechanically read-only, as [pm].permission_args intends.
+without a permission prompt. The same probe showed a Write refused under the
+allowlist this entry used to carry; that allowlist is gone (see [pm].args), so
+the refusal no longer describes what mana launches.
 
 `--continue` was measured on this machine on 2026-08-15, twice, because
 [pm].resume_args rests on it:
@@ -55,22 +55,34 @@ version_args = ["--version"]
 
 [pm]
 driver = "stream"                  # acp | stream | oneshot-continue
+# `--dangerously-skip-permissions` is here and not in [pm].permission_args on
+# purpose: that field means "flags that restrict the PM", and `mana doctor`
+# reads it being empty as "the no-code rule is prompt-only here" (doctor.rs,
+# `degradations`). Filing an auto-approve flag under it would silence that
+# warning while granting the opposite of what it claims.
 args   = ["-p", "--input-format", "stream-json",
-          "--output-format", "stream-json", "--verbose"]
+          "--output-format", "stream-json", "--verbose",
+          "--dangerously-skip-permissions"]
 prompt = "stdin-jsonl"             # argv | stdin | stdin-jsonl
 # `mana launch claude --continue` -- appended after args, measured above.
 resume_args = ["--continue"]
 
-# The PM must be mechanically unable to write code (design §6). An allowlist is
-# the only enforcement this CLI offers, so it gets one: mana's four
-# orchestration tools (`mcp__mana__*`, the MCP server registers under the name
-# `mana`), plus the three read-only tools a planner needs to look at the project
-# before writing a brief. Edit, Write, Bash and Task are absent, so an attempt
-# to implement the work itself fails at the tool layer instead of quietly
-# burning the expensive quota this whole design exists to spend on judgment.
+# Empty on purpose. This entry used to carry
+# `--allowedTools mcp__mana__*,Read,Grep,Glob`, which made design §6's no-code
+# rule mechanical here -- and only here, since no other catalogued CLI offers an
+# equivalent flag. It also cost the PM every tool that is not writing code: it
+# could not read a GitHub issue, run `git log`, or land a validated branch, so
+# both ends of the loop fell back on the user. The allowlist was dropped for
+# that reason (operator decision, 2026-08-18); the no-code rule now rests on
+# assets/roles/pm/SKILL.md on all four CLIs, and `mana doctor` says so.
+#
+# Restoring enforcement without re-breaking the ends means naming the tools the
+# PM legitimately needs rather than banning the category -- an allowlist that
+# also grants Bash is not enforcement, so that is a catalogue question, not a
+# flag to flip back.
 #
 # Not `--tools`: see the note above about what that flag does to the context.
-permission_args = ["--allowedTools", "mcp__mana__*,Read,Grep,Glob"]
+permission_args = []
 
 [pm.events]                        # non-ACP drivers only; 3 fields MAX (design §4)
 # `$.type=='assistant'` is not decoration: this CLI echoes a loaded skill back
