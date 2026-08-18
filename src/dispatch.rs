@@ -996,6 +996,26 @@ mod tests {
     }
 
     #[test]
+    fn executor_and_reviewer_templates_agree_on_test_scope() {
+        // Ensures executor permission and reviewer exception stay in sync.
+        // Failure: executor says tests that cover the brief are OK, but reviewer
+        // rejects them as scope violations (out-of-sync templates cost a rerun).
+        let executor_body = template_body(EXECUTOR_TEMPLATE, "executor.md").unwrap();
+        let reviewer_body = template_body(REVIEWER_TEMPLATE, "reviewer.md").unwrap();
+
+        assert!(
+            executor_body.contains("You may add tests that")
+                && executor_body.contains("cover what this brief changed"),
+            "executor template must grant permission for tests that cover the brief's changes"
+        );
+        assert!(
+            reviewer_body.contains("A test the executor added")
+                && reviewer_body.contains("is not a scope violation"),
+            "reviewer template must exempt tests that cover this task's changes from scope violation rejection"
+        );
+    }
+
+    #[test]
     fn argv_is_base_then_auto_approve_then_model_then_the_prompt() {
         let entry = fixture_entry(
             "fixture",

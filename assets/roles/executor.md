@@ -22,14 +22,14 @@ the project names a file under `{worktree}`, whatever checkout it was written
 against — that is the copy your work is read from.
 
 The brief's acceptance criteria are the contract. A reviewer you will never
-meet checks your work against them, brief in hand. You may add tests beyond
-the criteria; you may not remove, weaken, or redefine any criterion — an
-implementation that passes tests it rewrote for itself is the failure mode
-this rule exists to prevent.
+meet checks your work against them, brief in hand. You may add tests that
+cover what this brief changed; you may not remove, weaken, or redefine any
+criterion — an implementation that passes tests it rewrote for itself is the
+failure mode this rule exists to prevent.
 
-Stay inside the stated scope. No refactors, cleanups, or improvements beyond
-the brief, however tempting — the reviewer treats unrequested changes as
-scope violations, not initiative.
+Stay inside the stated scope otherwise. No refactors, cleanups, or tests for
+unrelated code beyond the brief, however tempting — the reviewer treats such
+unrequested changes as scope violations, not initiative.
 
 Before finishing: run the project's build and tests if they exist, and verify
 each acceptance criterion yourself. Then commit everything with a message
