@@ -45,11 +45,12 @@ use crate::sentinel::{Sentinel, ToolLine};
 use crate::session_lock;
 use crate::status::{self, DispatchStatus, short};
 use crate::tui::app::{App, Source};
-use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, map_key_event};
+use crate::tui::event::{AppEvent, CrosstermEventSource, EventSource, RawEvent, map_key_event};
 use crate::tui::graph::GraphCache;
 use crate::tui::render;
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Utc};
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -421,7 +422,7 @@ impl TerminalGuard {
             terminal: Terminal::new(CrosstermBackend::new(std::io::stdout()))?,
         };
         enable_raw_mode()?;
-        execute!(guard.terminal.backend_mut(), EnterAlternateScreen)?;
+        write_enter_sequence(guard.terminal.backend_mut())?;
         // Last, and only now that there is something to undo: a panic before
         // this line has nothing to restore and deserves the plain hook.
         //
@@ -450,7 +451,32 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// The three steps that give the user their shell back, in the order they need
+/// The escape sequences `TerminalGuard::enter` sends, factored out of it so a
+/// test can assert on the bytes: `execute!` needs a `Write`, and `Stdout` is
+/// not one a test can inspect, but any `Vec<u8>` is.
+///
+/// Bracketed paste is enabled here, alongside the alternate screen, rather
+/// than as its own fallible step -- a terminal that does not understand the
+/// sequence just ignores it, the same as it would ignore any other escape
+/// code it does not support, so there is nothing here for it to fail (#160).
+fn write_enter_sequence(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(writer, EnterAlternateScreen, EnableBracketedPaste)
+}
+
+/// The reverse of `write_enter_sequence`, in reverse order: bracketed paste
+/// was the last thing enabled, so it is the first thing disabled. Leaving it
+/// on would hand every future paste in that shell to the terminal as literal
+/// `\x1b[200~`/`\x1b[201~` bytes instead of the app that asked for it (#160).
+fn write_restore_sequence(writer: &mut impl std::io::Write) -> std::io::Result<()> {
+    execute!(
+        writer,
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )
+}
+
+/// The steps that give the user their shell back, in the order they need
 /// them, on the process's own stdout rather than through the guard -- the
 /// panic hook cannot borrow a value the unwinding stack still owns.
 ///
@@ -459,11 +485,7 @@ impl Drop for TerminalGuard {
 /// Every step is idempotent, which is what lets the hook and `Drop` both run.
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        std::io::stdout(),
-        LeaveAlternateScreen,
-        crossterm::cursor::Show
-    );
+    let _ = write_restore_sequence(&mut std::io::stdout());
 }
 
 /// Set by the termination handler, read by the run loop.
@@ -1686,11 +1708,16 @@ where
             return Ok(SessionEnd::PmExited { code });
         }
 
-        if let Some(key) = events.poll_key(TICK)?
-            && let Some(app_event) = map_key_event(key.code, key.modifiers)
-            && !apply_app_event(app_event, app, session)
-        {
-            return Ok(SessionEnd::UserQuit);
+        if let Some(raw) = events.poll_event(TICK)? {
+            let app_event = match raw {
+                RawEvent::Key(key) => map_key_event(key.code, key.modifiers),
+                RawEvent::Paste(text) => Some(AppEvent::Paste(text)),
+            };
+            if let Some(app_event) = app_event
+                && !apply_app_event(app_event, app, session)
+            {
+                return Ok(SessionEnd::UserQuit);
+            }
         }
     }
 }
@@ -1708,6 +1735,10 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
         AppEvent::ToggleRaw => app.toggle_raw(),
         AppEvent::AnswerPermission(allow) => answer_permission(allow, app, session),
         AppEvent::Key(c) => app.input.push(c),
+        // Appended whole, newlines included: bracketed paste exists so the
+        // terminal tells mana "this is one paste", and splitting it back up
+        // here would recreate the one-turn-per-line bug it fixes (#160).
+        AppEvent::Paste(text) => app.input.push_str(&text),
         AppEvent::Backspace => {
             // One keypress, one glyph. `String::pop` takes a code point, and a
             // glyph is often several -- a ZWJ emoji, a base plus a combining
@@ -1821,6 +1852,37 @@ mod tests {
         // attached the query itself fails, which is the same answer -- there
         // was no raw mode to leave on.
         assert_ne!(crossterm::terminal::is_raw_mode_enabled().ok(), Some(true));
+    }
+
+    /// `entering_the_terminal_is_all_or_nothing` above proves raw mode is
+    /// undone, but that check is a query against the real terminal and
+    /// cannot see bracketed paste the same way. What can be observed is the
+    /// bytes `TerminalGuard::enter` and `restore_terminal` write -- both
+    /// funnel through `write_enter_sequence`/`write_restore_sequence`, which
+    /// take any `Write`, so a `Vec<u8>` stands in for the terminal here.
+    ///
+    /// Not covered by this or any test: that `enter`/`restore_terminal`
+    /// actually call these two functions on the real stdout/backend at the
+    /// right moments (panic hook, `Drop`, the normal return). That wiring has
+    /// no terminal-independent seam -- it is exercised only by running mana
+    /// against a real terminal.
+    #[test]
+    fn bracketed_paste_enable_and_disable_are_symmetric() {
+        let mut entered = Vec::new();
+        write_enter_sequence(&mut entered).unwrap();
+        let entered = String::from_utf8(entered).unwrap();
+        assert!(
+            entered.contains("\x1b[?2004h"),
+            "enter sequence did not enable bracketed paste: {entered:?}"
+        );
+
+        let mut restored = Vec::new();
+        write_restore_sequence(&mut restored).unwrap();
+        let restored = String::from_utf8(restored).unwrap();
+        assert!(
+            restored.contains("\x1b[?2004l"),
+            "restore sequence did not disable bracketed paste: {restored:?}"
+        );
     }
 
     /// A PM that said nothing on stderr still gets quoted: stdout is the
@@ -3294,7 +3356,7 @@ mod smoke {
     }
 
     impl EventSource for Idle {
-        fn poll_key(&mut self, timeout: Duration) -> Result<Option<crossterm::event::KeyEvent>> {
+        fn poll_event(&mut self, timeout: Duration) -> Result<Option<RawEvent>> {
             if Instant::now() > self.deadline {
                 bail!("the loop never ended on its own");
             }
@@ -3888,6 +3950,47 @@ mod smoke {
             app.lines().any(|line| line.text == "ho"),
             "the typed turn was never echoed"
         );
+        session.shutdown().unwrap();
+    }
+
+    /// The bug this task fixes: without bracketed paste a multi-line paste
+    /// arrives as one key event per character, and each embedded newline is
+    /// indistinguishable from a typed Enter -- so a five-line brief became
+    /// five separate submitted turns (#160). Driving the loop with
+    /// `RawEvent::Paste` proves the text lands whole in the input buffer and
+    /// that none of its newlines submitted anything on their own.
+    #[test]
+    fn a_pasted_block_lands_in_the_input_whole_and_its_newlines_do_not_submit() {
+        use crate::tui::event::RawEvent;
+        use crate::tui::event::test_support::FakeEventSource;
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        session.settle();
+        let mut app = App::new(&session.cli_name);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let mut events = FakeEventSource::new([
+            RawEvent::Paste("line one\nline two\nline three".to_string()),
+            RawEvent::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)),
+        ]);
+
+        let end = run_loop(
+            &mut terminal,
+            &mut session,
+            &mut app,
+            &mut GraphCache::new(),
+            &mut events,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(end, SessionEnd::UserQuit);
+        // One input, all three lines, still sitting unsent in the buffer --
+        // nothing was submitted by the newlines the paste carried.
+        assert_eq!(app.input, "line one\nline two\nline three");
         session.shutdown().unwrap();
     }
 
