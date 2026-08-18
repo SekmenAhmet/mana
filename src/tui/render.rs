@@ -450,14 +450,33 @@ fn key_hint(pending: &PendingPermission, allow: bool, key: &str) -> String {
     }
 }
 
+/// The input line: one row that follows its own tail, with the cursor on it.
+///
+/// Scrolled rather than wrapped because the box is three rows by layout and
+/// growing it is a layout change this fix does not need. Without the scroll
+/// the box simply stopped drawing past its width (#162), and since backspace
+/// kept editing the invisible tail there was no way to know what would be sent
+/// until it landed in the transcript.
+///
+/// The cursor is the other half. `Terminal::draw` hides it on any frame that
+/// does not set it, so before this the interface had none at all -- and the
+/// input pane is the one place in it where a cursor is the affordance. One
+/// cell is reserved for it past the text, which is what keeps it inside the
+/// border on a full line rather than on top of it.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+    let caret = "› ";
+    let inner_width = inner_size(area).0;
+    let wanted = cells(caret) + cells(&app.input);
+    let overflow = (wanted + 1).saturating_sub(inner_width);
+    let column = u16::try_from(wanted - overflow).unwrap_or(u16::MAX);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             // The caret is the accent; what is typed next to it is not. The
             // same split as the chat pane's gutter, for the same reason.
-            Span::styled("› ", theme::INPUT_CARET),
+            Span::styled(caret, theme::INPUT_CARET),
             Span::styled(app.input.clone(), theme::INPUT_TEXT),
         ]))
+        .scroll((0, u16::try_from(overflow).unwrap_or(u16::MAX)))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -466,6 +485,11 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         ),
         area,
     );
+    // A box with no interior has nowhere to put a cursor, and leaving it unset
+    // hides it -- better than parking it on the frame of a terminal that small.
+    if area.width >= 2 && area.height >= 2 {
+        frame.set_cursor_position((area.x + 1 + column, area.y + 1));
+    }
 }
 
 /// A bordered block's usable interior, in characters.
@@ -1089,6 +1113,49 @@ mod tests {
         // The hard break counts cells too, and a pane narrower than one
         // character still has to make progress through it.
         assert_eq!(wrap("日本語", 1), ["日", "本", "語"]);
+    }
+
+    /// Past the width of the box the operator was typing blind (#162): no
+    /// scroll, no cursor, no ellipsis, and backspace still editing an
+    /// invisible tail. The input pane is the one place in the interface where
+    /// a cursor is the affordance.
+    #[test]
+    fn the_input_line_follows_its_tail_and_carries_the_cursor() {
+        let mut app = App::new("Claude Code");
+        app.input = ('a'..='z').chain('a'..='z').collect();
+        assert_eq!(app.input.chars().count(), 52);
+
+        // Width 30 -> 28 cells inside the border, for a caret and 52 characters.
+        let (width, height) = (30, 8);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        let rendered = dump(&rows_of(terminal.backend().buffer(), width, height));
+
+        // The tail is what is being typed, so the tail is what is on screen.
+        assert!(
+            rendered.contains("zabcdefghijklmnopqrstuvwxyz"),
+            "{rendered}"
+        );
+        // And the cursor sits on the last column inside the box, one row below
+        // its top border -- where the next character will land.
+        assert_eq!(terminal.get_cursor_position().unwrap(), (28, 6).into());
+    }
+
+    /// A line that fits is not scrolled, and the cursor still says where the
+    /// next character goes (#162).
+    #[test]
+    fn a_short_input_is_not_scrolled_and_still_shows_the_cursor() {
+        let mut app = App::new("Claude Code");
+        app.input = "and a test".to_string();
+
+        let (width, height) = (30, 8);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        let rendered = dump(&rows_of(terminal.backend().buffer(), width, height));
+
+        assert!(rendered.contains("› and a test"), "{rendered}");
+        // Border, caret, then the ten characters typed.
+        assert_eq!(terminal.get_cursor_position().unwrap(), (13, 6).into());
     }
 
     #[test]
