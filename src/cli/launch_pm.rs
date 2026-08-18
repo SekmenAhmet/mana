@@ -930,11 +930,13 @@ fn prepare_session(
     };
 
     let tracks_turns = pm.tracks_turn_end();
+    let mut startup = skill.notes;
+    startup.extend(degradation_notice(entry));
     let mut session = Session {
         pm,
         cli_name: entry.cli.name.clone(),
         skill_path: skill.path,
-        startup: skill.notes,
+        startup,
         notifications: NotificationTail::new(notifications_path(&paths)),
         sentinel,
         project,
@@ -952,6 +954,26 @@ fn prepare_session(
         .send_internal(&opening)
         .context("sending the opening message to the PM")?;
     Ok(session)
+}
+
+/// What `mana doctor` already knows about this CLI, said once at launch.
+///
+/// Same list, computed by the same function: `doctor` is where an operator
+/// looks *before* choosing a CLI, and this is where they find out after
+/// choosing one -- but only ever from `doctor::degradations`, so the two can
+/// never drift. Empty entry, empty block: a CLI that declares no degradation
+/// says nothing at all here.
+fn degradation_notice(entry: &CliEntry) -> Vec<String> {
+    let degradations = crate::cli::doctor::degradations(entry);
+    if degradations.is_empty() {
+        return Vec::new();
+    }
+    let mut lines = vec![format!(
+        "[mana] {} runs degraded here (`mana doctor` has the detail):",
+        entry.cli.name
+    )];
+    lines.extend(degradations.iter().map(|line| format!("[mana]   - {line}")));
+    lines
 }
 
 /// Which CLI this launch is for.
@@ -1899,6 +1921,27 @@ url = "https://example.invalid/fixture"
 
     fn entry(skills: &[&str]) -> CliEntry {
         parse_entry(&entry_source("fixture-cli", skills, "", "mcp")).unwrap()
+    }
+
+    /// `mana doctor` has always known this; until now only `doctor` said it,
+    /// and the operator who can act on it is the one starting the session.
+    #[test]
+    fn the_launch_reports_what_doctor_knows_about_the_cli_it_is_starting() {
+        let mut entry = entry(&["~/.fixture/skills"]);
+        // The one degradation this test is about, so the fixture's own missing
+        // auto-approve flag does not stand in for it.
+        entry.subagent.auto_approve_args = vec!["--yes".to_string()];
+        assert!(entry.pm.permission_args.is_empty());
+
+        let notice = degradation_notice(&entry).join("\n");
+        assert!(
+            notice.contains("no PM permission flags declared"),
+            "{notice}"
+        );
+
+        // Declared flags, nothing else degraded: silence.
+        entry.pm.permission_args = vec!["--no-write".to_string()];
+        assert!(degradation_notice(&entry).is_empty());
     }
 
     fn paths_in(home: &Path) -> ProjectPaths {

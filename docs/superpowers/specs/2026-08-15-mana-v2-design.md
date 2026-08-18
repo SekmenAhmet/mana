@@ -186,10 +186,18 @@ bin          = "claude"            # optional [cli.bin_overrides] per OS
 version_args = ["--version"]
 
 [pm]
-driver = "stream"                  # acp | stream | oneshot-continue
-args   = ["-p", "--input-format", "stream-json",
-          "--output-format", "stream-json", "--verbose"]
-prompt = "stdin-jsonl"             # argv | stdin | stdin-jsonl
+driver          = "stream"         # acp | stream | oneshot-continue
+args            = ["-p", "--input-format", "stream-json",
+                   "--output-format", "stream-json", "--verbose"]
+permission_args = []               # argv appended after args that takes the write tools
+                                   # off the PM; empty = no such flag on this CLI, and the
+                                   # no-code rule is prompt-only here
+resume_args     = ["--continue"]   # argv appended after args for `mana launch -c`; read by
+                                   # the stream driver, and `acp` resumes inside the
+                                   # protocol (session/load) instead; empty = `-c` refuses
+# first_args    = [...]            # oneshot-continue only: the first turn of a session
+# continue_args = [...]            # oneshot-continue only: every turn after the first
+prompt          = "stdin-jsonl"    # argv | stdin | stdin-jsonl
 
 [pm.events]                        # non-ACP drivers only; 3 fields MAX (see §4)
 text  = "$.message.content[?@.type=='text'].text"
@@ -206,6 +214,8 @@ model_args            = ["--model", "{model}"]
 prompt                = "argv"
 max_concurrent        = 0          # 0 = unlimited
 cwd_required_in_brief = false
+routing_weight        = 70         # how much mana prefers this CLI when *mana* picks and
+                                   # the project has no history; higher wins, 50 = default
 
 [models]
 discovery_args = []                # empty = static list only
@@ -224,11 +234,15 @@ pool_scope = "global"              # global | per-model
 
 [[failure]]                        # ordered; first match wins
 means            = "rate_limited"  # quota_exhausted | rate_limited | auth_expired
+# exit_codes     = [1]             # match only these exit codes; absent = not checked
+# stderr_regex   = "rate.?limit"   # regex over the run's stderr; absent = not checked
 stdout_regex     = "rate.?limit"
 cooldown_minutes = 60
 
 [skills]
-dirs = ["~/.claude/skills", "~/.agents/skills"]
+dirs                 = ["~/.claude/skills", "~/.agents/skills"]
+inline_in_activation = false       # true = also send the role text in the activation turn,
+                                   # for a CLI that cannot read the SKILL.md mana wrote
 
 [install]
 url = "https://claude.com/claude-code"
