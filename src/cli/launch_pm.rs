@@ -290,14 +290,10 @@ fn finish_session(
     let _ = session.shutdown();
     // Quitting with turns still waiting is the operator's own decision, but it
     // is one they may have forgotten they made: the queue lives in a status
-    // bar that has just disappeared. Printed after the alternate screen is
-    // gone, where it can actually be read.
-    for queued in session.flush_queue() {
-        println!(
-            "never sent -- you ended the session first: {}",
-            first_line(&queued.text)
-        );
-    }
+    // bar that has just disappeared. Recorded rather than printed here, so the
+    // loop below says it after the alternate screen is gone *and* the exit
+    // code below counts it (#181).
+    session.flush_queue("you ended the session first");
     // Said again, out here: during the session these were lines in a chat pane
     // that no longer exists, so a session that lost every notification read on
     // the way out exactly like one that lost nothing (#96).
@@ -708,14 +704,29 @@ impl Session {
         self.queue.len()
     }
 
-    /// Empties the queue, for a session that is over.
+    /// Empties the queue, for a session that is over, and hands back one line
+    /// per message it will now never send.
     ///
-    /// The messages come back rather than being dropped: somebody typed them,
-    /// they were never sent, and a queue that vanished silently would leave
-    /// the operator believing the PM had read them.
-    fn flush_queue(&mut self) -> Vec<Queued> {
+    /// Through `record_loss` rather than into a caller's own `println!`: a
+    /// message the PM never received is precisely what `lost` is for, and the
+    /// queue was the one channel that went around it -- so the notice died
+    /// with the alternate screen on the path that only wrote it to the chat
+    /// pane, and the exit guards, which count `lost`, called both paths clean
+    /// (#181).
+    fn flush_queue(&mut self, reason: &str) -> Vec<String> {
         self.turn_open = false;
-        self.queue.drain(..).collect()
+        // Drained first: `record_loss` borrows all of `self`, and the queue is
+        // part of it.
+        let waiting: Vec<Queued> = self.queue.drain(..).collect();
+        waiting
+            .into_iter()
+            .map(|queued| {
+                self.record_loss(format!(
+                    "[mana] never sent -- {reason}: {}",
+                    first_line(&queued.text)
+                ))
+            })
+            .collect()
     }
 
     fn answer_permission(&mut self, id: u64, option_id: &str) -> Result<()> {
@@ -795,7 +806,8 @@ impl Session {
 
     /// Waits for the PM to go idle, doing what `run_loop` does with the events
     /// it finds on the way: `TurnEnded` releases the queue, `Exited` empties
-    /// it. Returns whatever was still waiting when the PM died.
+    /// it. Returns the loss lines for whatever was still waiting when the PM
+    /// died.
     ///
     /// For the smoke tests, which drive a real session without a terminal and
     /// would otherwise race the shell script standing in for a CLI. The
@@ -803,7 +815,7 @@ impl Session {
     /// leaves until that turn is over -- which is the behaviour under test as
     /// much as it is a precondition for it.
     #[cfg(all(test, unix))]
-    fn settle(&mut self) -> Vec<Queued> {
+    fn settle(&mut self) -> Vec<String> {
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut never_sent = Vec::new();
         while self.turn_open && Instant::now() < deadline {
@@ -812,7 +824,9 @@ impl Session {
                     PmEvent::TurnEnded => {
                         self.release_next();
                     }
-                    PmEvent::Exited { .. } => never_sent.extend(self.flush_queue()),
+                    PmEvent::Exited { .. } => {
+                        never_sent.extend(self.flush_queue("the PM is gone"));
+                    }
                     _ => {}
                 }
             }
@@ -1594,15 +1608,10 @@ where
                 // Nothing queued will ever be sent now. Said out loud, with
                 // the words in it: the operator typed them, and a queue that
                 // emptied itself quietly would leave them believing the PM had
-                // read them.
-                for queued in session.flush_queue() {
-                    app.push(
-                        Source::Mana,
-                        &format!(
-                            "[mana] never sent -- the PM is gone: {}",
-                            first_line(&queued.text)
-                        ),
-                    );
+                // read them. Kept as losses too, because this pane is about to
+                // be torn down (#181).
+                for line in session.flush_queue("the PM is gone") {
+                    app.push(Source::Mana, &line);
                 }
             }
         }
@@ -2692,9 +2701,13 @@ mod smoke {
         /// A PM that takes one turn and dies without answering it: the shape
         /// that leaves a turn open for ever, and so the only one that shows
         /// what happens to a queue nobody is coming back for.
-        fn write_mute_pm(&self) {
+        fn write_mute_pm(&self, code: i32) {
             let path = self.home.join("mute-pm");
-            std::fs::write(&path, "#!/bin/sh\nhead -n 1 > /dev/null\nexit 3\n").unwrap();
+            std::fs::write(
+                &path,
+                format!("#!/bin/sh\nhead -n 1 > /dev/null\nexit {code}\n"),
+            )
+            .unwrap();
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
             self.write_override(&path.to_string_lossy());
         }
@@ -3270,7 +3283,7 @@ mod smoke {
     #[test]
     fn a_pm_that_dies_hands_back_everything_it_never_read() {
         let fixture = Fixture::new();
-        fixture.write_mute_pm();
+        fixture.write_mute_pm(3);
         let mut session =
             prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         assert_eq!(
@@ -3283,11 +3296,11 @@ mod smoke {
         let never_sent = session.settle();
         assert_eq!(
             never_sent,
-            [Queued {
-                text: "are you there".to_string(),
-                typed: true
-            }]
+            ["[mana] never sent -- the PM is gone: are you there"]
         );
+        // ...and they come back as losses, which is what survives the screen
+        // and what the exit code is counted from (#181).
+        assert_eq!(session.lost, never_sent);
         assert_eq!(session.queued(), 0);
     }
 
@@ -3298,7 +3311,7 @@ mod smoke {
         use ratatui::backend::TestBackend;
 
         let fixture = Fixture::new();
-        fixture.write_mute_pm();
+        fixture.write_mute_pm(3);
         let mut session =
             prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
         assert_eq!(
@@ -3330,6 +3343,104 @@ mod smoke {
             "{lines:?}"
         );
         assert_eq!(app.queued, 0);
+    }
+
+    /// ...and that notice has to outlive the pane it was written into. The
+    /// queue was the one loss channel #96's fix did not cover: it was drained
+    /// into the chat pane alone, so the notice was torn down with the
+    /// alternate screen and a session that swallowed the operator's turn still
+    /// exited 0 (#181).
+    #[test]
+    fn a_message_a_dead_pm_never_read_outlives_the_screen_and_fails_the_exit() {
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new();
+        // Exit 0: a PM that failed says so with its own code, and what is under
+        // test is the loss only mana knows about.
+        fixture.write_mute_pm(0);
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        assert_eq!(
+            session.send_typed("please refactor the parser").unwrap(),
+            Delivery::Queued
+        );
+
+        let mut app = App::new(&session.cli_name);
+        app.push_pending(Source::User, "please refactor the parser");
+        let mut terminal = Terminal::new(TestBackend::new(80, 12)).unwrap();
+        let end = run_loop(
+            &mut terminal,
+            &mut session,
+            &mut app,
+            &mut GraphCache::new(),
+            &mut Idle {
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(end, SessionEnd::PmExited { code: Some(0) });
+
+        // `lost` is the only thing `finish_session` reprints once the screen is
+        // gone, so being in it *is* reaching the operator's terminal.
+        assert!(
+            session
+                .lost
+                .iter()
+                .any(|line| line.contains("please refactor the parser")),
+            "{:?}",
+            session.lost
+        );
+        let error = format!(
+            "{:#}",
+            finish_session(
+                &fixture.home,
+                &mut session,
+                &app,
+                Ok(SessionEnd::PmExited { code: Some(0) })
+            )
+            .unwrap_err()
+        );
+        assert!(
+            error.contains("1 message(s) that never reached it"),
+            "{error}"
+        );
+    }
+
+    /// The same loss with the other cause: the operator quit with a turn still
+    /// in flight. That notice did reach stdout, but over an exit code of 0 --
+    /// which is the only half of it a wrapper script can read (#181).
+    #[test]
+    fn quitting_with_a_turn_still_queued_is_not_a_clean_exit() {
+        let fixture = Fixture::new();
+        // Never answers, so the activation's turn stays open and the next turn
+        // can only queue.
+        fixture.write_mute_pm(3);
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        assert_eq!(
+            session.send_typed("important brief").unwrap(),
+            Delivery::Queued
+        );
+
+        let app = App::new(&session.cli_name);
+        let error = format!(
+            "{:#}",
+            finish_session(&fixture.home, &mut session, &app, Ok(SessionEnd::UserQuit))
+                .unwrap_err()
+        );
+        assert!(
+            error.contains("1 message(s) that never reached the PM"),
+            "{error}"
+        );
+        assert!(
+            session
+                .lost
+                .iter()
+                .any(|line| line.contains("important brief")),
+            "{:?}",
+            session.lost
+        );
     }
 
     /// A dead PM must not take the interface down with it: the user typed
