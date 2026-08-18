@@ -51,8 +51,12 @@ use crate::task::{Role, Task, TaskFrontmatter, read_task, write_task};
 use crate::worktree::{self, WorktreeInfo};
 use anyhow::{Context, Result, bail};
 use rmcp::handler::server::router::tool::ToolRouter;
+use rmcp::handler::server::tool::IntoCallToolResult;
 use rmcp::handler::server::wrapper::{Json, Parameters};
-use rmcp::model::{ErrorData, Implementation, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResponse, CallToolResult, ContentBlock, ErrorCode, ErrorData, Implementation,
+    ServerCapabilities, ServerInfo,
+};
 use rmcp::transport::io::stdio;
 use rmcp::{ServerHandler, ServiceExt, schemars, tool, tool_handler, tool_router};
 use routing::{Observations, Request, Stats};
@@ -277,8 +281,10 @@ impl ManaTools {
     async fn create_task(
         &self,
         params: Parameters<CreateTaskParams>,
-    ) -> Result<Json<CreateTaskOut>, ErrorData> {
-        self.create_task_impl(params.0).map(Json)
+    ) -> Result<Json<CreateTaskOut>, Refusal> {
+        self.create_task_impl(params.0)
+            .map(Json)
+            .map_err(Refusal::of)
     }
 
     /// Dispatch a task to a sub-agent and return immediately -- the run takes
@@ -291,8 +297,10 @@ impl ManaTools {
     async fn launch_subagent(
         &self,
         params: Parameters<LaunchSubagentParams>,
-    ) -> Result<Json<LaunchSubagentOut>, ErrorData> {
-        self.launch_subagent_impl(params.0).map(Json)
+    ) -> Result<Json<LaunchSubagentOut>, Refusal> {
+        self.launch_subagent_impl(params.0)
+            .map(Json)
+            .map_err(Refusal::of)
     }
 
     /// Read the reviewer's verdict for a task: `validated`, or `rejected` with
@@ -300,8 +308,10 @@ impl ManaTools {
     /// appended to the brief, `brief` means the fault is yours to fix and the
     /// model is not penalised.
     #[tool]
-    async fn get_review(&self, params: Parameters<TaskRef>) -> Result<Json<ReviewOut>, ErrorData> {
-        self.get_review_impl(params.0).map(Json)
+    async fn get_review(&self, params: Parameters<TaskRef>) -> Result<Json<ReviewOut>, Refusal> {
+        self.get_review_impl(params.0)
+            .map(Json)
+            .map_err(Refusal::of)
     }
 
     /// The installed CLIs, their models with an ordinal cost class, and the
@@ -310,8 +320,8 @@ impl ManaTools {
     /// Call it before routing decisions -- it is always current, your memory of
     /// it may not be.
     #[tool]
-    async fn list_agents(&self) -> Result<Json<ListAgentsOut>, ErrorData> {
-        self.list_agents_impl().map(Json)
+    async fn list_agents(&self) -> Result<Json<ListAgentsOut>, Refusal> {
+        self.list_agents_impl().map(Json).map_err(Refusal::of)
     }
 }
 
@@ -1051,6 +1061,10 @@ fn validated_task_id(task_id: &str) -> Result<&str, ErrorData> {
 
 /// A failure the PM can fix by calling again with different arguments: an
 /// unknown id, a model that does not exist, a reviewer launched too early.
+///
+/// Every one of these leaves the server as a *tool execution error* -- see
+/// `Refusal`, which is where that translation happens and where the rule for
+/// choosing between the two channels is written down.
 fn invalid(message: String) -> ErrorData {
     ErrorData::invalid_params(message, None)
 }
@@ -1060,6 +1074,59 @@ fn invalid(message: String) -> ErrorData {
 /// not their prompt that was wrong.
 fn internal(error: &anyhow::Error, doing: &str) -> ErrorData {
     ErrorData::internal_error(format!("mana failed while {doing}: {error:#}"), None)
+}
+
+/// Which of MCP's two failure channels a refused tool call goes out on (#196).
+///
+/// **The rule: if the PM could plausibly fix it by calling again differently,
+/// it is `Recoverable`; only a failure the PM can do nothing about is
+/// `Protocol`. When in doubt, `Recoverable`** -- a message the model can read
+/// costs nothing, and a refusal it never sees costs a stalled session.
+///
+/// The spec draws the same line. JSON-RPC errors are for what a model cannot
+/// fix (an unknown method, a malformed request); input validation and business
+/// logic belong in a result with `isError: true`, which clients are required to
+/// surface *to the model* so it can correct itself. Several of mana's refusals
+/// are written as instructions -- "send this call again then", "launch an
+/// executor first" -- and on the JSON-RPC channel whether the PM ever reads
+/// them is the client's decision, not mana's.
+///
+/// The two constructors above already encode the rule, so the classification
+/// is read off them rather than restated at each of their call sites:
+/// `invalid` (`-32602`) is recoverable by construction, `internal` (`-32603`)
+/// is mana failing at its own state and is not.
+///
+/// `src/sentinel.rs` needs no equivalent: that channel has no error channel to
+/// choose between, and it already renders `ErrorData::message` -- the same text
+/// this puts in the `isError` result -- into its `[mana] tool results` turn.
+enum Refusal {
+    /// Comes back as a tool result with `isError: true`, carrying the message.
+    Recoverable(String),
+    /// Comes back as a JSON-RPC error, unchanged.
+    Protocol(ErrorData),
+}
+
+impl Refusal {
+    fn of(error: ErrorData) -> Refusal {
+        if error.code == ErrorCode::INVALID_PARAMS {
+            Refusal::Recoverable(error.message.into_owned())
+        } else {
+            Refusal::Protocol(error)
+        }
+    }
+}
+
+impl IntoCallToolResult for Refusal {
+    fn into_call_tool_result(self) -> Result<CallToolResponse, ErrorData> {
+        match self {
+            // `isError` is stamped on by rmcp's own `Result` conversion, which
+            // is what marks the tool call failed once this returns `Ok`.
+            Refusal::Recoverable(message) => {
+                Ok(CallToolResult::success(vec![ContentBlock::text(message)]).into())
+            }
+            Refusal::Protocol(error) => Err(error),
+        }
+    }
 }
 
 // -- wire types -------------------------------------------------------------
@@ -1366,6 +1433,17 @@ mod tests {
         }
     }
 
+    /// Drives one of the `#[tool]` methods to completion. They are async only
+    /// because the SDK's trait is; the work behind them is the synchronous
+    /// `*_impl` the other tests call directly. Going through them here is the
+    /// point: the envelope a client sees is decided in that layer.
+    fn block_on<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+            .block_on(future)
+    }
+
     /// Every schema mana serves, in both directions, walked for `format`
     /// annotations.
     ///
@@ -1662,6 +1740,96 @@ mod tests {
                 error.message
             );
         }
+    }
+
+    /// #196, the case that exists to be acted on. The unmet-dependency refusal
+    /// spells out the move -- finish the dependency, then "send this call again
+    /// then" -- and on the JSON-RPC error channel whether the PM ever reads it
+    /// is up to the client. It has to come back as a *tool* error: a result the
+    /// spec requires clients to hand to the model, carrying the same sentence.
+    #[test]
+    fn an_unmet_dependency_comes_back_as_a_tool_error_carrying_its_own_sentence() {
+        let fixture = Fixture::new();
+        let blocker = fixture.create("First", "do the first thing", None);
+        let blocked = fixture.create("Second", "do the next thing", Some(vec![blocker.clone()]));
+
+        let response = block_on(
+            fixture
+                .tools
+                .launch_subagent(Parameters(LaunchSubagentParams {
+                    task_id: blocked.clone(),
+                    role: RoleParam::Executor,
+                    cli: None,
+                    model: None,
+                    cost_class: None,
+                })),
+        )
+        .into_call_tool_result()
+        .expect("a refusal the PM is meant to act on must not go out as a JSON-RPC error");
+
+        let result = match response {
+            CallToolResponse::Complete(result) => result,
+            _ => panic!("a refused tool call completes with a result"),
+        };
+        let wire = serde_json::to_value(&result).unwrap();
+        assert_eq!(wire["isError"], true, "{wire}");
+        let text = wire["content"][0]["text"].as_str().unwrap();
+        // Word for word what the impl says -- this task changed the envelope,
+        // not the words.
+        assert_eq!(
+            text,
+            fixture
+                .tools
+                .launch_subagent_impl(LaunchSubagentParams {
+                    task_id: blocked.clone(),
+                    role: RoleParam::Executor,
+                    cli: None,
+                    model: None,
+                    cost_class: None,
+                })
+                .unwrap_err()
+                .message
+                .as_ref()
+        );
+        assert!(
+            text.contains(&format!(
+                "task {blocked} depends on task {blocker}, and it has no usable verdict yet."
+            )),
+            "{text}"
+        );
+        assert!(text.contains("send this call again then."), "{text}");
+    }
+
+    /// The other side of the split. mana failing at its own state -- it cannot
+    /// create the project's directories -- is the one thing the PM can do
+    /// nothing about, so it stays a JSON-RPC error: there is no argument to
+    /// change and nothing for the model to correct, and dressing it up as a
+    /// tool result would invite the PM to retry a call that cannot succeed.
+    ///
+    /// Nothing that reaches `invalid` is on this channel any more; what is left
+    /// here is `internal`, and this is a call that goes through it.
+    #[test]
+    fn mana_failing_at_its_own_state_still_goes_out_on_the_json_rpc_channel() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("demo");
+        std::fs::create_dir_all(&project).unwrap();
+        // A *file* where the state directory has to be: every path under it is
+        // uncreatable, so `paths()` fails before any tool logic runs.
+        let home = tmp.path().join("mana-home");
+        std::fs::write(&home, "not a directory").unwrap();
+        let tools = ManaTools::new(
+            project,
+            home,
+            Catalog::embedded().expect("the shipped catalogue must parse"),
+        );
+
+        let error = block_on(tools.get_review(Parameters(TaskRef {
+            task_id: "a0000000-0000-4000-8000-000000000000".to_string(),
+        })))
+        .into_call_tool_result()
+        .expect_err("a failure of mana's own state is not the PM's to correct");
+        assert_eq!(error.code, ErrorCode::INTERNAL_ERROR, "{error:?}");
+        assert!(error.message.contains("mana failed while"), "{error:?}");
     }
 
     #[test]

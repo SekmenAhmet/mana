@@ -951,6 +951,68 @@ mod tests {
         assert!(sentinel.reply.unwrap().contains(&mcp.to_string()));
     }
 
+    /// #196 pinned from this side: the MCP channel now returns a recoverable
+    /// refusal as a tool execution result rather than a JSON-RPC error, and
+    /// this channel -- which has no error channel at all -- must still put the
+    /// very same sentence in front of the PM. The text below is what mana
+    /// replied before that change, copied verbatim.
+    #[test]
+    fn an_unmet_dependency_reaches_a_sentinel_pm_with_the_same_words_as_before() {
+        let fixture = Fixture::new();
+        let blocker = fixture
+            .tools
+            .create_task_impl(
+                serde_json::from_value(
+                    serde_json::json!({"title": "First", "prompt": "do the first thing"}),
+                )
+                .unwrap(),
+            )
+            .map(|out| {
+                serde_json::to_value(out).unwrap()["task_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .unwrap();
+        let blocked = fixture
+            .tools
+            .create_task_impl(
+                serde_json::from_value(serde_json::json!({
+                    "title": "Second",
+                    "prompt": "do the next thing",
+                    "depends_on": [blocker.clone()],
+                }))
+                .unwrap(),
+            )
+            .map(|out| {
+                serde_json::to_value(out).unwrap()["task_id"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .unwrap();
+
+        let outcome = fixture.sentinel.handle(&fixture.block(&format!(
+            r#"{{"tool": "launch_subagent", "args": {{"task_id": "{blocked}", "role": "executor"}}}}"#
+        )));
+        let reply = outcome.reply.unwrap();
+        assert!(
+            reply.contains(&format!(
+                "launch_subagent failed: task {blocked} depends on task {blocker}, and it has no \
+                 usable verdict yet. Finish that one first -- executor, then reviewer, then \
+                 get_review -- and launch this one when it comes back validated. Nothing is \
+                 queued in the meantime: send this call again then."
+            )),
+            "{reply}"
+        );
+        // ...and the pane still calls it a failure, not a completed call.
+        assert!(
+            outcome.log.iter().all(|line| line.failed),
+            "{:?}",
+            outcome.log
+        );
+    }
+
     /// #179: on this channel a tool's answer travels back to the PM as text
     /// -- `get_review`'s issues, JSON-encoded inside the reply. A reviewer's
     /// line that starts with `[mana]` must stay delimited through that
