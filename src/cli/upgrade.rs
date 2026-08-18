@@ -568,23 +568,36 @@ mod tests {
         );
     }
 
-    /// `release.yml` holds `contents: write` and is triggered by pushing a
-    /// tag, so the tag name is attacker-controlled input right up until the
-    /// `guard` job's own name check runs. Interpolating it straight into a
-    /// `run:` block (`${{ github.ref_name }}` or a `needs.plan.outputs.tag*`
-    /// that carries it) turns that name into shell source text instead of
-    /// data — mana issue #176. `outputs:`/`if:`/`with:`/`env:` contexts are
-    /// not shell, so those may keep the expression; only `run:` bodies may
-    /// not.
-    #[test]
-    fn release_workflow_does_not_interpolate_tag_derived_expressions_in_run_blocks() {
-        let workflow = include_str!("../../.github/workflows/release.yml");
-        let banned = [
-            "github.ref_name",
-            "needs.plan.outputs.tag",
-            "needs.plan.outputs.tag-flag",
-        ];
+    /// Whether `rest` (the text on a `run:` line after the colon) is a YAML
+    /// block scalar header — `|` or `>`, in either order followed by a
+    /// chomping indicator (`-`/`+`) and/or an explicit indentation indicator
+    /// (`1`-`9`) — meaning the following indented lines are the step's shell
+    /// body rather than an inline command.
+    ///
+    /// Chosen over failing loudly on a form this scanner does not recognise
+    /// (the other option the task allowed): every block scalar header YAML
+    /// permits is just `|`/`>` plus two optional single-character modifiers,
+    /// so enumerating them is a few lines, not a parser. Refusing unknown
+    /// forms instead would have bought nothing here and would have made the
+    /// test fail the moment a workflow used `>` for a long `run:` command —
+    /// a false alarm on a form that was easy to just handle.
+    fn is_block_scalar_header(rest: &str) -> bool {
+        let mut chars = rest.trim().chars();
+        match chars.next() {
+            Some('|') | Some('>') => {}
+            _ => return false,
+        }
+        chars.all(|c| c == '-' || c == '+' || ('1'..='9').contains(&c))
+    }
 
+    /// Scans `workflow` for tag-derived expressions interpolated straight
+    /// into a `run:` step's shell body. `run:` bodies are shell — `outputs:`,
+    /// `if:`, `with:` and `env:` are not — so an expression is only unsafe
+    /// inside `run:`; this walks every `run:` step, both inline and block
+    /// scalar forms (see `is_block_scalar_header`), and returns one message
+    /// per offending line. An empty result means the scan found nothing.
+    fn tag_expressions_in_run_blocks(workflow: &str, banned: &[&str]) -> Vec<String> {
+        let mut violations = Vec::new();
         let mut in_block_run = false;
         let mut body_indent: Option<usize> = None;
 
@@ -608,27 +621,142 @@ mod tests {
 
             if in_block_run {
                 for expr in banned {
-                    assert!(
-                        !line.contains(expr),
-                        "run: block interpolates `{expr}` directly: {line}"
-                    );
+                    if line.contains(expr) {
+                        violations
+                            .push(format!("run: block interpolates `{expr}` directly: {line}"));
+                    }
                 }
             } else {
                 let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
                 if let Some(rest) = key.strip_prefix("run:") {
                     for expr in banned {
-                        assert!(
-                            !rest.contains(expr),
-                            "run: block interpolates `{expr}` directly: {line}"
-                        );
+                        if rest.contains(expr) {
+                            violations
+                                .push(format!("run: block interpolates `{expr}` directly: {line}"));
+                        }
                     }
-                    if rest.trim() == "|" {
+                    if is_block_scalar_header(rest) {
                         in_block_run = true;
                         body_indent = None;
                     }
                 }
             }
         }
+
+        violations
+    }
+
+    /// `release.yml` holds `contents: write` and is triggered by pushing a
+    /// tag, so the tag name is attacker-controlled input right up until the
+    /// `guard` job's own name check runs. Interpolating it straight into a
+    /// `run:` block (`${{ github.ref_name }}` or a `needs.plan.outputs.tag*`
+    /// that carries it) turns that name into shell source text instead of
+    /// data — mana issue #176. `outputs:`/`if:`/`with:`/`env:` contexts are
+    /// not shell, so those may keep the expression; only `run:` bodies may
+    /// not.
+    #[test]
+    fn release_workflow_does_not_interpolate_tag_derived_expressions_in_run_blocks() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let banned = [
+            "github.ref_name",
+            "needs.plan.outputs.tag",
+            "needs.plan.outputs.tag-flag",
+        ];
+
+        let violations = tag_expressions_in_run_blocks(workflow, &banned);
+        assert!(violations.is_empty(), "{}", violations.join("\n"));
+    }
+
+    #[test]
+    fn run_folded_block_scalar_still_catches_a_banned_expression() {
+        let workflow = "\
+jobs:
+  j:
+    steps:
+      - run: >
+          echo ${{ github.ref_name }}
+";
+        let violations = tag_expressions_in_run_blocks(workflow, &["github.ref_name"]);
+        assert!(!violations.is_empty(), "`run: >` body was not scanned");
+    }
+
+    #[test]
+    fn run_literal_block_scalar_with_strip_chomping_still_catches_a_banned_expression() {
+        let workflow = "\
+jobs:
+  j:
+    steps:
+      - run: |-
+          echo ${{ needs.plan.outputs.tag }}
+";
+        let violations = tag_expressions_in_run_blocks(workflow, &["needs.plan.outputs.tag"]);
+        assert!(!violations.is_empty(), "`run: |-` body was not scanned");
+    }
+
+    #[test]
+    fn env_binding_carrying_the_expression_is_accepted_when_run_reads_it_as_a_variable() {
+        let workflow = "\
+jobs:
+  j:
+    steps:
+      - env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          echo \"$TAG\"
+";
+        let violations = tag_expressions_in_run_blocks(workflow, &["github.ref_name"]);
+        assert!(
+            violations.is_empty(),
+            "env: binding should not be scanned as a run: body: {violations:?}"
+        );
+    }
+
+    #[test]
+    fn outputs_if_and_with_contexts_carrying_the_expression_are_accepted() {
+        let workflow = "\
+jobs:
+  j:
+    outputs:
+      tag: ${{ github.ref_name }}
+    if: ${{ needs.plan.outputs.tag-flag != '' }}
+    steps:
+      - with:
+          tag: ${{ needs.plan.outputs.tag }}
+        run: |
+          echo \"$TAG\"
+";
+        let violations = tag_expressions_in_run_blocks(
+            workflow,
+            &[
+                "github.ref_name",
+                "needs.plan.outputs.tag",
+                "needs.plan.outputs.tag-flag",
+            ],
+        );
+        assert!(
+            violations.is_empty(),
+            "outputs:/if:/with: are not shell and should not be scanned: {violations:?}"
+        );
+    }
+
+    /// `RELEASING.md` documents the tag naming convention `guard` enforces by
+    /// quoting its pattern; this is the one place an exact-string assertion
+    /// belongs, since the value being checked is a pattern, not prose, and
+    /// the two are meant to never drift apart.
+    #[test]
+    fn releasing_doc_states_the_exact_tag_pattern_guard_enforces() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let releasing = include_str!("../../RELEASING.md");
+        let pattern = r"^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$";
+
+        assert!(
+            workflow.contains(pattern),
+            "guard job's tag pattern changed in release.yml; update RELEASING.md and this test together"
+        );
+        assert!(
+            releasing.contains(pattern),
+            "RELEASING.md's documented tag pattern has drifted from the one guard enforces"
+        );
     }
 
     #[test]

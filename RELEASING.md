@@ -71,6 +71,13 @@ suffix), checked with a shell `grep` against `$GITHUB_REF_NAME`, not a
 checks after any `dist generate`; `guard` is the first job in the file and
 `plan` depends on it, which is what gates every other job.
 
+A release tag's name must therefore match
+`^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$` — the leading `v` is mandatory.
+The workflow's own trigger (`**[0-9]+.[0-9]+.[0-9]+*`) is deliberately wider
+than that, so a tag the trigger fires on can still be one `guard` refuses;
+that is by design, not a gap — a malformed name fails safe, with an explicit
+`::error::` message, instead of being silently ignored or, worse, released.
+
 The second is that every `run:` step which needs the tag reads it from an
 `env:` binding (`TAG` / `TAG_FLAG`) as a quoted shell variable, instead of
 `dist generate`'s default of interpolating `${{ github.ref_name }}` or
@@ -220,7 +227,9 @@ about.
    the next push to `main` re-open the PR from that baseline. This is the only
    tag anyone ever creates by hand, and it exists to give the robot a starting
    point. Tag anything else and `release.yml`'s `guard` job refuses the run:
-   the tagged commit has to be an ancestor of `main`.
+   the tagged commit has to be an ancestor of `main`, and the tag's name has
+   to match `^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$` — `v0.1.0` above
+   already does.
 
 Note that `CHANGELOG.md` does not exist yet either. release-plz creates it on
 the first Release PR, with the header configured in `release-plz.toml`; it is
