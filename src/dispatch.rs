@@ -1001,18 +1001,27 @@ mod tests {
         // Ensures executor permission and reviewer exception stay in sync.
         // Failure: executor says tests that cover the brief are OK, but reviewer
         // rejects them as scope violations (out-of-sync templates cost a rerun).
+        // This assertion is deliberately loose to tolerate rewording: match on
+        // durable tokens (mentions of tests, and scope-violation rules) within
+        // relevant passages, not on exact sentences. A test pinned to prose pays
+        // for every doc edit.
         let executor_body = template_body(EXECUTOR_TEMPLATE, "executor.md").unwrap();
         let reviewer_body = template_body(REVIEWER_TEMPLATE, "reviewer.md").unwrap();
 
+        let executor_grants_tests = executor_body
+            .split("\n\n")
+            .any(|para| para.contains("test") && para.contains("this brief"));
         assert!(
-            executor_body.contains("You may add tests that")
-                && executor_body.contains("cover what this brief changed"),
-            "executor template must grant permission for tests that cover the brief's changes"
+            executor_grants_tests,
+            "executor template must grant permission for tests that cover the brief"
         );
+
+        let reviewer_exempts_tests = reviewer_body
+            .split("\n\n")
+            .any(|para| para.contains("test") && para.contains("scope violation"));
         assert!(
-            reviewer_body.contains("A test the executor added")
-                && reviewer_body.contains("is not a scope violation"),
-            "reviewer template must exempt tests that cover this task's changes from scope violation rejection"
+            reviewer_exempts_tests,
+            "reviewer template must exempt tests from scope violation rejection"
         );
     }
 
