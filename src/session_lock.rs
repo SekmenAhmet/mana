@@ -23,8 +23,9 @@
 //! race-free part, holding the pid that owns it. A lock left behind by a
 //! session that crashed is taken over rather than obeyed: the pid is probed
 //! the same way `mana ps` probes a dispatch, and a dead holder's file is
-//! removed. A holder mana cannot decide about is treated as live, and the
-//! refusal names the file so the operator can settle it.
+//! removed. That is the only lock ever removed: a holder mana cannot decide
+//! about, and a lock mana cannot read at all, are both treated as live, and
+//! the refusal names the file so the operator can settle it.
 //!
 //! ponytail: `mana dev` and a hand-started `mana mcp-server` take no lock —
 //! they are the developer paths that drive the pipeline by hand, and locking
@@ -86,9 +87,10 @@ pub fn acquire(paths: &ProjectPaths, now: DateTime<Utc>) -> Result<SessionLock> 
                 if let Some(reason) = refusal(&path, now) {
                     bail!(reason);
                 }
-                // Stale, or unreadable enough that no session can be behind
-                // it. Removing it is what makes a crashed session recoverable
-                // without the operator being told to delete a file.
+                // Stale: a holder record that parsed, naming a pid that is
+                // gone. Removing it is what makes a crashed session
+                // recoverable without the operator being told to delete a
+                // file. It is the only lock ever removed -- see `refusal`.
                 let _ = std::fs::remove_file(&path);
             }
             Err(error) => {
@@ -104,9 +106,27 @@ pub fn acquire(paths: &ProjectPaths, now: DateTime<Utc>) -> Result<SessionLock> 
 
 /// Why the existing lock stands, or `None` when it does not.
 fn refusal(path: &Path, now: DateTime<Utc>) -> Option<String> {
-    let holder: Holder = std::fs::read_to_string(path)
+    let Some(holder) = std::fs::read_to_string(path)
         .ok()
-        .and_then(|text| serde_json::from_str(&text).ok())?;
+        .and_then(|text| serde_json::from_str::<Holder>(&text).ok())
+    else {
+        // A lock mana cannot read used to mean "no session can be behind
+        // this", and the caller deleted it. But the claim is created and
+        // written in two steps, so that is exactly what a claim being made
+        // right now looks like from the outside -- zero bytes -- and a second
+        // launch reading it there deleted the winner's file and took the
+        // project: two PMs on one registry (#200, reviving #35 and #42).
+        // Unreadable is live until an operator says otherwise. The wrong
+        // guess this way costs one stuck project and names the file to
+        // unstick it; the wrong guess the other way costs the guarantee the
+        // lock exists for.
+        return Some(format!(
+            "this project has a mana session lock mana cannot read ({}). Either a session is \
+             claiming the project right now -- run `mana launch` again -- or one died while \
+             claiming it, in which case delete that file.",
+            path.display()
+        ));
+    };
     let liveness = probe(holder.pid);
     if liveness == Liveness::Dead {
         return None;
@@ -230,15 +250,49 @@ mod tests {
         }
     }
 
-    /// A file that is not a lock record cannot be a session, so it is not
-    /// allowed to lock anybody out.
+    /// A lock mana cannot read is not a lock mana can clear (#200): the
+    /// unreadable state is what a claim in progress looks like from the
+    /// outside, so clearing it is how a second session used to take a live
+    /// project.
     #[test]
-    fn an_unreadable_lock_is_cleared_rather_than_obeyed() {
+    fn an_unreadable_lock_is_refused_rather_than_stolen() {
         let tmp = tempfile::tempdir().unwrap();
         let paths = paths(tmp.path());
         crate::project::ensure_project_structure(&paths).unwrap();
-        crate::project::write(&paths.root.join(LOCK_FILE), "not json").unwrap();
-        acquire(&paths, Utc::now()).unwrap();
+        let path = paths.root.join(LOCK_FILE);
+        crate::project::write(&path, "not json").unwrap();
+        let error = acquire(&paths, Utc::now()).unwrap_err().to_string();
+        assert!(error.contains(LOCK_FILE), "{error}");
+        assert!(path.exists(), "the lock mana could not read was deleted");
+    }
+
+    /// Exactly the window in the middle of a claim: `create_new` has
+    /// published the name and the holder record is not written yet, so the
+    /// file another launch reads is zero bytes (#200).
+    #[test]
+    fn a_zero_byte_lock_is_refused_rather_than_stolen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        crate::project::ensure_project_structure(&paths).unwrap();
+        let path = paths.root.join(LOCK_FILE);
+        crate::project::write(&path, "").unwrap();
+        let error = acquire(&paths, Utc::now()).unwrap_err().to_string();
+        assert!(error.contains(LOCK_FILE), "{error}");
+        assert!(path.exists(), "the lock mana could not read was deleted");
+    }
+
+    /// The same window one byte later: a record half on disk parses no
+    /// better than none of it, and means no less that a session is there.
+    #[test]
+    fn a_truncated_lock_is_refused_rather_than_stolen() {
+        let tmp = tempfile::tempdir().unwrap();
+        let paths = paths(tmp.path());
+        crate::project::ensure_project_structure(&paths).unwrap();
+        let path = paths.root.join(LOCK_FILE);
+        crate::project::write(&path, "{\"pid\":4242,\"started_").unwrap();
+        let error = acquire(&paths, Utc::now()).unwrap_err().to_string();
+        assert!(error.contains(LOCK_FILE), "{error}");
+        assert!(path.exists(), "the lock mana could not read was deleted");
     }
 
     /// The lock the session did not take is the lock it must not delete.
