@@ -356,11 +356,7 @@ fn finish_session(
             // The explanation is printed rather than returned, because for a
             // non-zero child the *code* is what a wrapper script reads and
             // anyhow's own exit code (1) would overwrite it.
-            let reason = app
-                .last_raw
-                .as_deref()
-                .map(|line| format!("\nits last output was: {line}"))
-                .unwrap_or_default();
+            let reason = death_reason(app);
             match code {
                 Some(code) => {
                     eprintln!(
@@ -381,6 +377,21 @@ fn finish_session(
             }
         }
     }
+}
+
+/// What a PM that died said last, for the one line the operator is left with
+/// once the alternate screen is gone.
+///
+/// stderr first, and stdout only when there was none: a dying CLI explains
+/// itself on stderr, while stdout carries the routine frames of every turn.
+/// Taking whichever pipe spoke last handed the operator an `init` frame's cwd
+/// and tool list instead of the error (#189).
+fn death_reason(app: &App) -> String {
+    app.last_stderr
+        .as_deref()
+        .or(app.last_raw.as_deref())
+        .map(|line| format!("\nits last output was: {line}"))
+        .unwrap_or_default()
 }
 
 /// The terminal state mana changes, owned by one value so that the restore is
@@ -1788,6 +1799,27 @@ mod tests {
         // attached the query itself fails, which is the same answer -- there
         // was no raw mode to leave on.
         assert_ne!(crossterm::terminal::is_raw_mode_enabled().ok(), Some(true));
+    }
+
+    /// A PM that said nothing on stderr still gets quoted: stdout is the
+    /// second-best explanation there is, and no explanation at all is the
+    /// worst one. Only the *preference* changed with #189.
+    #[test]
+    fn the_death_report_falls_back_to_stdout_when_stderr_said_nothing() {
+        let mut app = App::new("Fake Agy");
+        assert_eq!(death_reason(&app), "");
+
+        app.apply(&PmEvent::Raw("panic: index out of range".to_string()));
+        assert_eq!(
+            death_reason(&app),
+            "\nits last output was: panic: index out of range"
+        );
+
+        app.apply(&PmEvent::Stderr("boom: no credentials".to_string()));
+        assert_eq!(
+            death_reason(&app),
+            "\nits last output was: boom: no credentials"
+        );
     }
 
     /// The handler does one thing, and doing anything more inside it would be
@@ -3651,7 +3683,66 @@ mod smoke {
 
         assert_eq!(end, SessionEnd::PmExited { code: Some(7) });
         // The reason is kept for the message printed after the TUI is gone.
-        assert_eq!(app.last_raw.as_deref(), Some("boom: no credentials found"));
+        assert_eq!(
+            app.last_stderr.as_deref(),
+            Some("boom: no credentials found")
+        );
+    }
+
+    /// ...and it has to be the *right* line. A PM explains itself on stderr,
+    /// which is what the report promises to quote, but `last_raw` took
+    /// whichever pipe spoke last -- and on a real agent that is the routine
+    /// frame every turn opens with, so the one line the operator is left with
+    /// was the cwd and the tool list instead of the error (#189).
+    #[test]
+    fn the_death_report_quotes_the_stderr_line_not_a_routine_stdout_frame() {
+        use ratatui::backend::TestBackend;
+
+        let fixture = Fixture::new();
+        let dying = fixture.home.join("noisy-dying-pm");
+        // The routine frame is written after the activation has been read, so
+        // it is certainly the last raw line here. In production the same
+        // inversion comes for free: the stdout path parses and runs two
+        // JSONPath queries before it forwards a frame written earlier.
+        std::fs::write(
+            &dying,
+            "#!/bin/sh\n\
+             echo 'claude: Invalid API key - please run /login' >&2\n\
+             head -n 1 > /dev/null\n\
+             echo '{\"event\":\"init\",\"cwd\":\"/tmp\",\"tools\":[\"a\",\"b\"]}'\n\
+             exit 9\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&dying, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.write_override(&dying.to_string_lossy());
+
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        let mut app = App::new(&session.cli_name);
+        let mut terminal = Terminal::new(TestBackend::new(60, 12)).unwrap();
+        let end = run_loop(
+            &mut terminal,
+            &mut session,
+            &mut app,
+            &mut GraphCache::new(),
+            &mut Idle {
+                deadline: Instant::now() + Duration::from_secs(10),
+            },
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(end, SessionEnd::PmExited { code: Some(9) });
+        let reason = death_reason(&app);
+        assert!(reason.contains("Invalid API key"), "{reason}");
+        assert!(!reason.contains("\"event\":\"init\""), "{reason}");
+        // The frame is still shown -- degraded, never silent. It is only not
+        // the explanation.
+        let lines: Vec<&str> = app.lines().map(|line| line.text.as_str()).collect();
+        assert!(
+            lines.iter().any(|line| line.contains("\"event\":\"init\"")),
+            "{lines:?}"
+        );
     }
 
     #[test]

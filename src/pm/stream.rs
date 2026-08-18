@@ -627,7 +627,7 @@ mod process_tests {
         assert_eq!(events.last(), Some(&PmEvent::Exited { code: Some(7) }));
         assert_eq!(
             events.first(),
-            Some(&PmEvent::Raw("boom: no credentials found".to_string()))
+            Some(&PmEvent::Stderr("boom: no credentials found".to_string()))
         );
     }
 
@@ -644,7 +644,7 @@ mod process_tests {
         let events = drain_to_exit(&driver);
         assert_eq!(
             events.first(),
-            Some(&PmEvent::Raw(
+            Some(&PmEvent::Stderr(
                 "argv: --from-catalogue --mcp-config /tmp/mana-mcp.json".to_string()
             ))
         );
@@ -671,7 +671,7 @@ mod process_tests {
         let fresh = drain_to_exit(&StreamDriver::start(&entry, &extra, None).unwrap());
         assert_eq!(
             fresh.first(),
-            Some(&PmEvent::Raw(
+            Some(&PmEvent::Stderr(
                 "argv: --from-catalogue --mcp-config /tmp/mana-mcp.json".to_string()
             ))
         );
@@ -681,7 +681,7 @@ mod process_tests {
             drain_to_exit(&StreamDriver::start(&entry, &extra, Some(Resume::default())).unwrap());
         assert_eq!(
             resumed.first(),
-            Some(&PmEvent::Raw(
+            Some(&PmEvent::Stderr(
                 "argv: --from-catalogue --continue --mcp-config /tmp/mana-mcp.json".to_string()
             ))
         );
