@@ -333,17 +333,6 @@ impl AcpDriver {
             events,
         })
     }
-
-    fn write(&self, frame: &str) -> Result<()> {
-        let mut guard = self.stdin.lock().unwrap();
-        let stdin = guard.as_mut().ok_or_else(|| {
-            anyhow!("the PM session is closed: its stdin was shut down, so nothing can be sent")
-        })?;
-        stdin.write_all(frame.as_bytes())?;
-        stdin.write_all(b"\n")?;
-        stdin.flush()?;
-        Ok(())
-    }
 }
 
 impl Drop for AcpDriver {
@@ -373,7 +362,7 @@ impl PmTransport for AcpDriver {
                 "prompt": [{"type": "text", "text": text}],
             }),
         );
-        self.write(&frame)
+        write_line_or_err(&self.stdin, &frame)
             // Almost always EPIPE: the PM died between turns. The `Exited`
             // event says so too, but the caller who typed this deserves an
             // answer now rather than on the next poll.
@@ -407,8 +396,7 @@ impl PmTransport for AcpDriver {
             "result": {"outcome": {"outcome": "selected", "optionId": option_id}},
         }))
         .expect("a reply built from plain JSON values");
-        self.write(&frame)
-            .context("answering the PM's permission request")?;
+        write_line_or_err(&self.stdin, &frame).context("answering the PM's permission request")?;
         self.pending.lock().unwrap().remove(&id);
         Ok(())
     }
@@ -1054,9 +1042,9 @@ fn write_line(stdin: &SharedStdin, frame: &str) {
 
 fn write_line_or_err(stdin: &SharedStdin, frame: &str) -> Result<()> {
     let mut guard = stdin.lock().unwrap();
-    let stdin = guard
-        .as_mut()
-        .ok_or_else(|| anyhow!("the PM session's stdin is closed"))?;
+    let stdin = guard.as_mut().ok_or_else(|| {
+        anyhow!("the PM session is closed: its stdin was shut down, so nothing can be sent")
+    })?;
     stdin.write_all(frame.as_bytes())?;
     stdin.write_all(b"\n")?;
     stdin.flush()?;

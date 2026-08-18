@@ -219,11 +219,20 @@ impl PmTransport for StreamDriver {
         })?;
         let frame = match prompt {
             PromptMode::StdinJsonl => user_frame(text),
-            // A CLI that reads plain lines from a persistent stdin. No such
-            // entry ships today; supporting it costs one arm of this match and
-            // keeps the driver decided by catalogue data rather than by which
-            // CLIs happened to exist when it was written.
-            PromptMode::Stdin => format!("{text}\n"),
+            // Speculative, and wrong today: no catalogue entry selects this
+            // mode for this driver, and this driver's stdin is line-delimited
+            // one line per turn -- so writing `{text}\n` verbatim would slice
+            // a multi-line prompt (the activation message always is one) into
+            // as many turns as it has lines, not send it as one. Refuse
+            // rather than silently mangle the first prompt that hits this.
+            // Write this arm for real the day a catalogue entry needs it, and
+            // get right what this stub didn't: joining or escaping embedded
+            // newlines before the line goes to the child.
+            PromptMode::Stdin => bail!(
+                "[pm].prompt is 'stdin', which this driver does not support: its stdin is \
+                 line-delimited one line per turn, so a multi-line prompt would be split \
+                 into multiple turns instead of sent as one"
+            ),
             PromptMode::Argv => unreachable!("rejected at start"),
         };
         stdin
@@ -685,6 +694,24 @@ mod process_tests {
                 "argv: --from-catalogue --continue --mcp-config /tmp/mana-mcp.json".to_string()
             ))
         );
+    }
+
+    /// The guard against the exact bug this arm used to be: a silent
+    /// `format!("{text}\n")` would turn one multi-line prompt into as many
+    /// turns as it has lines. This fails if that line is ever restored.
+    #[test]
+    fn a_stdin_prompt_mode_refuses_a_multiline_turn_instead_of_splitting_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = script(tmp.path(), "cat > /dev/null");
+        let entry = fixture::entry(&bin, &[], "stdin", TEXT_PATH, None);
+        let mut driver = StreamDriver::start(&entry, &[], None).unwrap();
+
+        let err = driver.send_user("line one\nline two").unwrap_err();
+        let rendered = format!("{err:#}");
+        assert!(rendered.contains("'stdin'"), "{rendered}");
+        assert!(rendered.contains("does not support"), "{rendered}");
+
+        driver.shutdown().unwrap();
     }
 
     #[test]
