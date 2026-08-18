@@ -219,6 +219,29 @@ impl AcpDriver {
         // agent holding a quota slot is exactly the v1 zombie.
         let outcome = (|| -> Result<(String, BufReader<ChildStdout>)> {
             let initialized = handshake.call(1, "initialize", initialize_params())?;
+            // The agent's answer *is* the negotiation (#197): ACP v1 makes an
+            // agent that no longer speaks the requested version reply with the
+            // latest it does, and asks the client to stop there. v2 went to
+            // Draft on 2026-07-20 and its breaking changes -- patch semantics
+            // with stable ids, permissions decoupled from tool calls,
+            // structured file changes -- are exactly what `decode` parses, so
+            // carrying on would turn every notification into `Decoded::raw`:
+            // a screen of JSON where one sentence belongs. A missing field is
+            // not a *different* version and is left alone; both agents measured
+            // on 2026-08-15 answer with the number.
+            if let Some(spoken) = initialized["protocolVersion"].as_u64()
+                && spoken != u64::from(PROTOCOL_VERSION)
+            {
+                bail!(
+                    "{} speaks ACP v{spoken} and mana speaks v{PROTOCOL_VERSION}: its \
+                     `initialize` answer named a protocol this driver cannot decode, so the \
+                     session stops here rather than showing you raw JSON for the rest of it. \
+                     Use a build of {} that still serves v{PROTOCOL_VERSION}, or launch it \
+                     under a driver other than `acp`.",
+                    entry.cli.name,
+                    entry.cli.name
+                );
+            }
             let servers = mcp_servers(entry, project)?;
             // Resuming asks the agent to reopen a session it stored, so the
             // method is `session/load` rather than `session/new` -- and it is
@@ -1760,6 +1783,10 @@ while IFS= read -r line; do
         loadable)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"fake"}}}\n' "$id"
           ;;
+        v2)
+          # The spec-mandated answer from an agent that has dropped v1 (#197).
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"agentInfo":{"name":"fake"}}}\n' "$id"
+          ;;
         *)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"fake"}}}\n' "$id"
           ;;
@@ -2222,6 +2249,33 @@ done
         };
         assert!(rendered.contains("authentication required"), "{rendered}");
         assert!(rendered.contains("run fake login"), "{rendered}");
+    }
+
+    /// The version the agent answers with *is* the negotiation (#197).
+    ///
+    /// ACP v1 makes an agent that no longer speaks the requested version reply
+    /// with the latest it does, and asks the client to stop there. v2 went to
+    /// Draft on 2026-07-20 and its breaking changes are exactly what this
+    /// driver parses, so accepting the answer would decode v2 notifications
+    /// against a v1 parser: every one falling through to `Decoded::raw`, a
+    /// screen of JSON where one sentence belongs.
+    #[test]
+    fn an_agent_answering_with_another_protocol_version_is_refused() {
+        let fixture = Fixture::new();
+        let rendered = match fixture.start("v2") {
+            Ok(_) => panic!("mana kept speaking v1 to an agent that answered v2"),
+            Err(error) => format!("{error:#}"),
+        };
+        // Both halves named, because "version mismatch" tells the operator
+        // nothing about which build to reach for.
+        assert!(rendered.contains("Fake ACP CLI"), "{rendered}");
+        assert!(rendered.contains("v2"), "{rendered}");
+        assert!(rendered.contains("v1"), "{rendered}");
+
+        // And the handshake stopped there: no session opened behind the refusal.
+        let sent = fixture.wait_for_sent(1);
+        assert_eq!(sent.len(), 1, "{sent:#?}");
+        assert_eq!(sent[0]["method"], "initialize");
     }
 
     /// The v1 zombie, structurally: an agent that ignores the polite exit is
