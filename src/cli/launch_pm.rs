@@ -473,7 +473,7 @@ extern "C" fn on_terminate(_signal: libc::c_int) {
     TERMINATED.store(true, Ordering::Relaxed);
 }
 
-/// Traps the two signals that end a session mana did not ask to end: `kill`,
+/// Traps the four signals that end a session mana did not ask to end: `kill`,
 /// a closed terminal emulator, an ssh drop, a logout. Untrapped, every one of
 /// them killed mana with the default disposition -- terminal left in raw mode
 /// on the alternate screen, and the in-flight sub-agents left running with
@@ -484,8 +484,12 @@ extern "C" fn on_terminate(_signal: libc::c_int) {
 /// costs nothing either -- crossterm reports an interrupted wait as "no key",
 /// so that tick just ends early and the next one reads the flag.
 ///
-/// SIGINT is deliberately not trapped: crossterm delivers Ctrl+C as a key
-/// event, and `apply_app_event` already ends the session on it.
+/// SIGINT and SIGQUIT are trapped too. The reason they once were not held only
+/// for the keyboard: raw mode clears `ISIG`, so crossterm delivers Ctrl+C as a
+/// key event and no keystroke here ever becomes a signal. `kill -INT` from
+/// another window is not a keystroke, and it is the reflex way to stop a
+/// foreground process -- it was landing on the default disposition and leaving
+/// a shell that needed `reset` (#180).
 #[cfg(unix)]
 fn trap_termination() {
     // SAFETY: `on_terminate` is async-signal-safe -- one relaxed store to a
@@ -494,6 +498,8 @@ fn trap_termination() {
         let handler = on_terminate as *const () as libc::sighandler_t;
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGHUP, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGQUIT, handler);
     }
 }
 
@@ -1524,7 +1530,7 @@ where
     loop {
         let now = Instant::now();
 
-        // A trapped SIGTERM/SIGHUP leaves by the door Ctrl+C uses, so the
+        // A trapped termination signal leaves by the door Ctrl+C uses, so the
         // terminal is restored, the PM reaped and the in-flight sub-agents
         // swept by the one piece of code that already does all three. Taken
         // rather than read: a session that survived somebody else's signal
@@ -1762,18 +1768,25 @@ mod tests {
     }
 
     /// The handler does one thing, and doing anything more inside it would be
-    /// undefined behaviour. Proved by sending mana the signal that used to
+    /// undefined behaviour. Proved by sending mana every signal that used to
     /// kill it outright: the process survives, and the flag the loop reads is
-    /// set.
+    /// set. A signal left untrapped kills this test binary here exactly the
+    /// way it killed a session -- no `Drop`, no restore (#84, #180).
     #[cfg(unix)]
     #[test]
-    fn a_trapped_termination_signal_only_sets_the_flag() {
+    fn every_trapped_termination_signal_only_sets_the_flag() {
         trap_termination();
-        // `raise` delivers to the calling thread and returns only once the
-        // handler has run, so the flag can be taken back immediately -- and it
-        // has to be, before a run loop in a parallel test reads it as its own.
-        unsafe { libc::raise(libc::SIGTERM) };
-        assert!(TERMINATED.swap(false, Ordering::Relaxed));
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+            // `raise` delivers to the calling thread and returns only once the
+            // handler has run, so the flag can be taken back immediately -- and
+            // it has to be, before a run loop in a parallel test reads it as
+            // its own.
+            unsafe { libc::raise(signal) };
+            assert!(
+                TERMINATED.swap(false, Ordering::Relaxed),
+                "signal {signal} reached the default disposition"
+            );
+        }
     }
 
     /// A complete entry for a CLI that does not exist, built through the real
