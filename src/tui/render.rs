@@ -233,8 +233,44 @@ fn decoration(source: Source) -> Decoration {
     }
 }
 
+/// How wide `text` renders, in terminal cells.
+///
+/// Code points are the wrong unit and were the bug (#159): a terminal lays out
+/// in cells, and the two disagree for every CJK character, most emoji and
+/// every combining sequence. `Span::width` is ratatui's own measurement -- the
+/// same unicode-width the renderer lays the buffer out with -- so measuring
+/// with it measures what will actually be drawn, and costs no dependency.
+fn cells(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// The longest prefix of `word` that fits in `width` cells.
+///
+/// Never empty and never split mid-character: a pane one cell wide still has
+/// to make progress through a two-cell character, and a head of nothing would
+/// spin the hard-break loop below forever (#159). Such a character overflows
+/// its row by one cell rather than stalling the frame.
+fn head_within(word: &str, width: usize) -> String {
+    let mut head = String::new();
+    let mut used = 0;
+    let mut buffer = [0u8; 4];
+    for character in word.chars() {
+        let cell = cells(character.encode_utf8(&mut buffer));
+        if !head.is_empty() && used + cell > width {
+            break;
+        }
+        head.push(character);
+        used += cell;
+    }
+    head
+}
+
 /// Greedy word wrap, falling back to a hard break for a word longer than the
 /// pane (a path, a URL, a base64 blob -- all things an agent prints).
+///
+/// Measured in display cells, not code points: a row built to a width the pane
+/// does not have is cut by `Paragraph` rather than re-wrapped, so the overflow
+/// never reaches any frame at all (#159).
 fn wrap(text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
@@ -244,8 +280,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     for word in text.split(' ') {
         let mut word = word;
         loop {
-            let free = width.saturating_sub(row.chars().count());
-            let needed = word.chars().count() + usize::from(!row.is_empty());
+            let free = width.saturating_sub(cells(&row));
+            let needed = cells(word) + usize::from(!row.is_empty());
             if needed <= free {
                 if !row.is_empty() {
                     row.push(' ');
@@ -258,19 +294,40 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
                 continue;
             }
             // An empty row that still cannot hold the word: split it.
-            let head: String = word.chars().take(width).collect();
+            let head = head_within(word, width);
             let consumed = head.len();
             rows.push(head);
             word = &word[consumed..];
         }
     }
-    rows.push(row);
+    // A hard break that consumed the whole word leaves nothing in hand, and a
+    // character wider than the pane always ends that way (#159). Pushing it
+    // would spend a row of the pane on a blank continuation line. The
+    // `rows.is_empty()` arm keeps whitespace-only text one empty row, as
+    // `wrap("", _)` already returns.
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
     rows
 }
 
+/// The graph pane: one row per dispatch, windowed to the newest that fit.
+///
+/// The window is the fix for #161 and not a design: `Paragraph` renders from
+/// the top and drops whatever runs past the pane, silently. There is one node
+/// per dispatch mana ever made for this project -- `subagents.jsonl` is
+/// append-only across sessions -- and `build_nodes` sorts them oldest-first,
+/// so an unwindowed pane showed finished history and hid the running node the
+/// operator opened Ctrl+G for. Keeping the tail is the same policy the chat
+/// pane already has (`visible_lines`), which is the point: two panes in one
+/// frame should not disagree about which end of a list matters.
+///
+/// Deliberately still a list. #152 wants this pane rebuilt around the real
+/// dependency DAG; that rework inherits the overflow unless the windowing
+/// lands first, and it is free to choose its own window then.
 fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
     let running = running_frame(app.started_at.elapsed(), SPINNER_INTERVAL);
-    let rows: Vec<Line> = if nodes.is_empty() {
+    let mut rows: Vec<Line> = if nodes.is_empty() {
         vec![Line::styled("no dispatches yet", theme::GRAPH_EMPTY)]
     } else {
         nodes
@@ -292,6 +349,8 @@ fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
             })
             .collect()
     };
+    let height = inner_size(area).1;
+    rows.drain(..rows.len().saturating_sub(height));
     frame.render_widget(
         Paragraph::new(rows).block(
             Block::default()
@@ -391,14 +450,33 @@ fn key_hint(pending: &PendingPermission, allow: bool, key: &str) -> String {
     }
 }
 
+/// The input line: one row that follows its own tail, with the cursor on it.
+///
+/// Scrolled rather than wrapped because the box is three rows by layout and
+/// growing it is a layout change this fix does not need. Without the scroll
+/// the box simply stopped drawing past its width (#162), and since backspace
+/// kept editing the invisible tail there was no way to know what would be sent
+/// until it landed in the transcript.
+///
+/// The cursor is the other half. `Terminal::draw` hides it on any frame that
+/// does not set it, so before this the interface had none at all -- and the
+/// input pane is the one place in it where a cursor is the affordance. One
+/// cell is reserved for it past the text, which is what keeps it inside the
+/// border on a full line rather than on top of it.
 fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
+    let caret = "› ";
+    let inner_width = inner_size(area).0;
+    let wanted = cells(caret) + cells(&app.input);
+    let overflow = (wanted + 1).saturating_sub(inner_width);
+    let column = u16::try_from(wanted - overflow).unwrap_or(u16::MAX);
     frame.render_widget(
         Paragraph::new(Line::from(vec![
             // The caret is the accent; what is typed next to it is not. The
             // same split as the chat pane's gutter, for the same reason.
-            Span::styled("› ", theme::INPUT_CARET),
+            Span::styled(caret, theme::INPUT_CARET),
             Span::styled(app.input.clone(), theme::INPUT_TEXT),
         ]))
+        .scroll((0, u16::try_from(overflow).unwrap_or(u16::MAX)))
         .block(
             Block::default()
                 .borders(Borders::ALL)
@@ -407,6 +485,11 @@ fn draw_input(frame: &mut Frame, app: &App, area: Rect) {
         ),
         area,
     );
+    // A box with no interior has nowhere to put a cursor, and leaving it unset
+    // hides it -- better than parking it on the frame of a terminal that small.
+    if area.width >= 2 && area.height >= 2 {
+        frame.set_cursor_position((area.x + 1 + column, area.y + 1));
+    }
 }
 
 /// A bordered block's usable interior, in characters.
@@ -938,6 +1021,34 @@ mod tests {
         assert!(rendered.contains("no dispatches yet"), "{rendered}");
     }
 
+    /// `subagents.jsonl` is append-only across every session and `build_nodes`
+    /// sorts it oldest-first, so an unwindowed `Paragraph` shows the oldest
+    /// finished work and hides the running node the operator pressed Ctrl+G
+    /// to watch (#161). The chat pane in the same frame already windows to the
+    /// newest; the graph pane has to agree.
+    #[test]
+    fn the_graph_pane_keeps_the_newest_nodes_when_it_runs_out_of_rows() {
+        let mut app = App::new("Claude Code");
+        app.toggle_graph();
+        let nodes: Vec<GraphNode> = (0..10)
+            .map(|index| {
+                node(
+                    Role::Executor,
+                    &format!("node-{index:02}"),
+                    Some(Status::Done),
+                    None,
+                )
+            })
+            .collect();
+
+        // Height 12 -> 8 rows of pane -> 6 rows inside the border, for 10 nodes.
+        let rendered = dump(&screen(&app, &nodes, 100, 12));
+        assert!(rendered.contains("node-09"), "{rendered}");
+        assert!(rendered.contains("node-04"), "{rendered}");
+        assert!(!rendered.contains("node-03"), "{rendered}");
+        assert!(!rendered.contains("node-00"), "{rendered}");
+    }
+
     /// The newest line is the one that must always be on screen -- the reason
     /// wrapping happens before the window is chosen rather than after.
     #[test]
@@ -983,6 +1094,68 @@ mod tests {
     #[test]
     fn wrap_hard_breaks_on_character_boundaries() {
         assert_eq!(wrap("ééééé", 2), ["éé", "éé", "é"]);
+    }
+
+    /// Code points are not display cells (#159). A row built to 36 CJK
+    /// characters is 72 cells wide in a 36-cell pane, and `Paragraph` (no
+    /// `Wrap`) cuts the overflow instead of re-wrapping it -- the text leaves
+    /// the frame entirely rather than scrolling off it.
+    #[test]
+    fn wrap_measures_display_cells_so_wide_text_is_never_cut() {
+        let mut app = App::new("Claude Code");
+        app.push(Source::Pm, &"日".repeat(60));
+        // Width 40 -> inner 38 -> 36 cells of text: 18 characters a row.
+        let rendered = dump(&screen(&app, &[], 40, 12));
+        assert_eq!(rendered.matches('日').count(), 60, "{rendered}");
+
+        // Two cells each: three characters do not fit in four cells.
+        assert_eq!(wrap("日本語", 4), ["日本", "語"]);
+        // The hard break counts cells too, and a pane narrower than one
+        // character still has to make progress through it.
+        assert_eq!(wrap("日本語", 1), ["日", "本", "語"]);
+    }
+
+    /// Past the width of the box the operator was typing blind (#162): no
+    /// scroll, no cursor, no ellipsis, and backspace still editing an
+    /// invisible tail. The input pane is the one place in the interface where
+    /// a cursor is the affordance.
+    #[test]
+    fn the_input_line_follows_its_tail_and_carries_the_cursor() {
+        let mut app = App::new("Claude Code");
+        app.input = ('a'..='z').chain('a'..='z').collect();
+        assert_eq!(app.input.chars().count(), 52);
+
+        // Width 30 -> 28 cells inside the border, for a caret and 52 characters.
+        let (width, height) = (30, 8);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        let rendered = dump(&rows_of(terminal.backend().buffer(), width, height));
+
+        // The tail is what is being typed, so the tail is what is on screen.
+        assert!(
+            rendered.contains("zabcdefghijklmnopqrstuvwxyz"),
+            "{rendered}"
+        );
+        // And the cursor sits on the last column inside the box, one row below
+        // its top border -- where the next character will land.
+        assert_eq!(terminal.get_cursor_position().unwrap(), (28, 6).into());
+    }
+
+    /// A line that fits is not scrolled, and the cursor still says where the
+    /// next character goes (#162).
+    #[test]
+    fn a_short_input_is_not_scrolled_and_still_shows_the_cursor() {
+        let mut app = App::new("Claude Code");
+        app.input = "and a test".to_string();
+
+        let (width, height) = (30, 8);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| draw(frame, &app, &[])).unwrap();
+        let rendered = dump(&rows_of(terminal.backend().buffer(), width, height));
+
+        assert!(rendered.contains("› and a test"), "{rendered}");
+        // Border, caret, then the ten characters typed.
+        assert_eq!(terminal.get_cursor_position().unwrap(), (13, 6).into());
     }
 
     #[test]

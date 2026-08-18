@@ -520,7 +520,11 @@ fn utc(stamp: &str) -> Option<DateTime<Utc>> {
         .map(|at| at.with_timezone(&Utc))
 }
 
-fn cooling_means(wire: &str) -> Option<FailureMeans> {
+/// The meaning behind a logged wire name, when it is one a cooldown answers.
+/// `log::counters` asks the same question of the same list, so
+/// `quota_failures` counts exactly what gets rested rather than a shorter list
+/// of its own (#158).
+pub fn cooling_means(wire: &str) -> Option<FailureMeans> {
     // Matched through the dispatcher's own wire names so the log format has
     // exactly one spelling, defined in one place.
     COOLING_MEANS
@@ -1311,6 +1315,37 @@ pool_scope = "per-model""#,
         assert!(observations.cooldown_until("alpha", "mini").is_none());
         // The failure itself is still counted -- only the rest period expired.
         assert_eq!(observations.stats("alpha", "mini").quota_failures, 1);
+    }
+
+    /// #158: the counter behind the second sort key used to match
+    /// `quota_exhausted` alone, so a `rate_limited` model -- the only
+    /// signature claude declares -- looked untouched to the router however
+    /// often it had been throttled, and the alphabetically first model kept
+    /// the dispatch. The cooldown here is expired on purpose: a resting model
+    /// is filtered out before the sort ever runs, so the only place this
+    /// counter can change an outcome is after the rest period.
+    #[test]
+    fn a_rate_limited_model_loses_the_tiebreak_to_an_untouched_sibling() {
+        let fixture = Fixture::new();
+        let entries = vec![per_model_entry("alpha", "")];
+        let now = Utc::now();
+        fixture.dispatch("a1", "alpha", "mini", "task-1", Role::Executor);
+        fixture.exit("a1", now - TimeDelta::minutes(61), Some("rate_limited"));
+
+        let observations = Observations::gather(&fixture.paths, &entries, now).unwrap();
+        assert_eq!(observations.stats("alpha", "mini").quota_failures, 1);
+        assert!(observations.cooldown_until("alpha", "mini").is_none());
+
+        let chosen = resolve(
+            &entries,
+            &installed(&["alpha"]),
+            &observations,
+            &request(CostClass::Cheap),
+        )
+        .unwrap();
+        // "mini" is alphabetically first and equally validated; the burn is
+        // the only thing that can send the work to "nano".
+        assert_eq!(chosen.model, "nano");
     }
 
     #[test]

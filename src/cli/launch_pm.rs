@@ -62,6 +62,7 @@ use std::io::{IsTerminal, Read, Seek, SeekFrom, Stdout};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
+use unicode_segmentation::UnicodeSegmentation;
 
 /// The PM role text, embedded so it ships and versions with the tools it
 /// teaches (design §6).
@@ -473,7 +474,7 @@ extern "C" fn on_terminate(_signal: libc::c_int) {
     TERMINATED.store(true, Ordering::Relaxed);
 }
 
-/// Traps the two signals that end a session mana did not ask to end: `kill`,
+/// Traps the four signals that end a session mana did not ask to end: `kill`,
 /// a closed terminal emulator, an ssh drop, a logout. Untrapped, every one of
 /// them killed mana with the default disposition -- terminal left in raw mode
 /// on the alternate screen, and the in-flight sub-agents left running with
@@ -484,8 +485,12 @@ extern "C" fn on_terminate(_signal: libc::c_int) {
 /// costs nothing either -- crossterm reports an interrupted wait as "no key",
 /// so that tick just ends early and the next one reads the flag.
 ///
-/// SIGINT is deliberately not trapped: crossterm delivers Ctrl+C as a key
-/// event, and `apply_app_event` already ends the session on it.
+/// SIGINT and SIGQUIT are trapped too. The reason they once were not held only
+/// for the keyboard: raw mode clears `ISIG`, so crossterm delivers Ctrl+C as a
+/// key event and no keystroke here ever becomes a signal. `kill -INT` from
+/// another window is not a keystroke, and it is the reflex way to stop a
+/// foreground process -- it was landing on the default disposition and leaving
+/// a shell that needed `reset` (#180).
 #[cfg(unix)]
 fn trap_termination() {
     // SAFETY: `on_terminate` is async-signal-safe -- one relaxed store to a
@@ -494,6 +499,8 @@ fn trap_termination() {
         let handler = on_terminate as *const () as libc::sighandler_t;
         libc::signal(libc::SIGTERM, handler);
         libc::signal(libc::SIGHUP, handler);
+        libc::signal(libc::SIGINT, handler);
+        libc::signal(libc::SIGQUIT, handler);
     }
 }
 
@@ -1524,7 +1531,7 @@ where
     loop {
         let now = Instant::now();
 
-        // A trapped SIGTERM/SIGHUP leaves by the door Ctrl+C uses, so the
+        // A trapped termination signal leaves by the door Ctrl+C uses, so the
         // terminal is restored, the PM reaped and the in-flight sub-agents
         // swept by the one piece of code that already does all three. Taken
         // rather than read: a session that survived somebody else's signal
@@ -1660,7 +1667,20 @@ fn apply_app_event(event: AppEvent, app: &mut App, session: &mut Session) -> boo
         AppEvent::AnswerPermission(allow) => answer_permission(allow, app, session),
         AppEvent::Key(c) => app.input.push(c),
         AppEvent::Backspace => {
-            app.input.pop();
+            // One keypress, one glyph. `String::pop` takes a code point, and a
+            // glyph is often several -- a ZWJ emoji, a base plus a combining
+            // mark, a flag -- so popping one left a *different* valid glyph
+            // behind rather than deleting anything, and the operator could send
+            // it without seeing that the text had changed under them (#182).
+            // Truncating at the last boundary deletes the cluster whole; on an
+            // empty buffer there is no boundary and 0 is the same no-op `pop`
+            // already was.
+            let boundary = app
+                .input
+                .grapheme_indices(true)
+                .next_back()
+                .map_or(0, |(at, _)| at);
+            app.input.truncate(boundary);
         }
         AppEvent::Enter => {
             let message = std::mem::take(&mut app.input);
@@ -1762,18 +1782,25 @@ mod tests {
     }
 
     /// The handler does one thing, and doing anything more inside it would be
-    /// undefined behaviour. Proved by sending mana the signal that used to
+    /// undefined behaviour. Proved by sending mana every signal that used to
     /// kill it outright: the process survives, and the flag the loop reads is
-    /// set.
+    /// set. A signal left untrapped kills this test binary here exactly the
+    /// way it killed a session -- no `Drop`, no restore (#84, #180).
     #[cfg(unix)]
     #[test]
-    fn a_trapped_termination_signal_only_sets_the_flag() {
+    fn every_trapped_termination_signal_only_sets_the_flag() {
         trap_termination();
-        // `raise` delivers to the calling thread and returns only once the
-        // handler has run, so the flag can be taken back immediately -- and it
-        // has to be, before a run loop in a parallel test reads it as its own.
-        unsafe { libc::raise(libc::SIGTERM) };
-        assert!(TERMINATED.swap(false, Ordering::Relaxed));
+        for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT, libc::SIGQUIT] {
+            // `raise` delivers to the calling thread and returns only once the
+            // handler has run, so the flag can be taken back immediately -- and
+            // it has to be, before a run loop in a parallel test reads it as
+            // its own.
+            unsafe { libc::raise(signal) };
+            assert!(
+                TERMINATED.swap(false, Ordering::Relaxed),
+                "signal {signal} reached the default disposition"
+            );
+        }
     }
 
     /// A complete entry for a CLI that does not exist, built through the real
@@ -3385,6 +3412,38 @@ mod smoke {
             label: id.to_string(),
             allows,
         }
+    }
+
+    /// One keypress deletes one *glyph*. A ZWJ sequence is several code
+    /// points and every prefix of one is itself a valid emoji, so a delete
+    /// that took a code point turned the operator's family into a couple, then
+    /// into a man -- each step looking deliberate in the input box, and any of
+    /// them sendable to the PM without the operator seeing anything wrong
+    /// (#182).
+    #[test]
+    fn backspace_deletes_a_whole_grapheme_not_a_code_point() {
+        let fixture = Fixture::new();
+        let mut session =
+            prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap();
+        let mut app = App::new(&session.cli_name);
+
+        // Five code points, four glyphs: three ASCII and one man-woman-boy.
+        app.input = "abc\u{1F468}\u{200D}\u{1F469}\u{200D}\u{1F466}".to_string();
+        apply_app_event(AppEvent::Backspace, &mut app, &mut session);
+        assert_eq!(app.input, "abc");
+
+        // The same failure with no emoji in sight: `e` followed by a combining
+        // acute renders as one `\u{e9}`, and half of it is not a character.
+        app.input = "cafe\u{301}".to_string();
+        apply_app_event(AppEvent::Backspace, &mut app, &mut session);
+        assert_eq!(app.input, "caf");
+
+        // An empty buffer is not an error, and never was.
+        app.input.clear();
+        apply_app_event(AppEvent::Backspace, &mut app, &mut session);
+        assert!(app.input.is_empty());
+
+        session.shutdown().unwrap();
     }
 
     /// The stream transport never asks for permission, so answering one has

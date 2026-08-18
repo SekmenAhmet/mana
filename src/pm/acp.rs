@@ -219,6 +219,29 @@ impl AcpDriver {
         // agent holding a quota slot is exactly the v1 zombie.
         let outcome = (|| -> Result<(String, BufReader<ChildStdout>)> {
             let initialized = handshake.call(1, "initialize", initialize_params())?;
+            // The agent's answer *is* the negotiation (#197): ACP v1 makes an
+            // agent that no longer speaks the requested version reply with the
+            // latest it does, and asks the client to stop there. v2 went to
+            // Draft on 2026-07-20 and its breaking changes -- patch semantics
+            // with stable ids, permissions decoupled from tool calls,
+            // structured file changes -- are exactly what `decode` parses, so
+            // carrying on would turn every notification into `Decoded::raw`:
+            // a screen of JSON where one sentence belongs. A missing field is
+            // not a *different* version and is left alone; both agents measured
+            // on 2026-08-15 answer with the number.
+            if let Some(spoken) = initialized["protocolVersion"].as_u64()
+                && spoken != u64::from(PROTOCOL_VERSION)
+            {
+                bail!(
+                    "{} speaks ACP v{spoken} and mana speaks v{PROTOCOL_VERSION}: its \
+                     `initialize` answer named a protocol this driver cannot decode, so the \
+                     session stops here rather than showing you raw JSON for the rest of it. \
+                     Use a build of {} that still serves v{PROTOCOL_VERSION}, or launch it \
+                     under a driver other than `acp`.",
+                    entry.cli.name,
+                    entry.cli.name
+                );
+            }
             let servers = mcp_servers(entry, project)?;
             // Resuming asks the agent to reopen a session it stored, so the
             // method is `session/load` rather than `session/new` -- and it is
@@ -278,6 +301,17 @@ impl AcpDriver {
                     .into_iter()
                     .all(|event| sender.send(event).is_ok())
             });
+            // Whatever the PM had said since its last newline (#157). ACP
+            // agents chunk prose token by token -- opencode sent nine chunks
+            // for "MANA-TOOLS-OK 2", not a newline among them -- so a turn
+            // that never reached its `stopReason` (the agent fell over, a
+            // quota kill landed, `shutdown()` closed stdin) has its whole
+            // partial answer sitting in `state`, which is dropped here. Flushed
+            // ahead of the stderr drain so it reads in the order it happened:
+            // what the PM was saying, then why it stopped, then the code.
+            for event in state.flush() {
+                let _ = sender.send(event);
+            }
             // stdout is at EOF, so every write end is closed and the child is
             // on its way out. Drain stderr before reporting the exit: when a PM
             // dies, the reason is on stderr and it must reach the user ahead of
@@ -1749,6 +1783,10 @@ while IFS= read -r line; do
         loadable)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":true},"agentInfo":{"name":"fake"}}}\n' "$id"
           ;;
+        v2)
+          # The spec-mandated answer from an agent that has dropped v1 (#197).
+          printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":2,"agentInfo":{"name":"fake"}}}\n' "$id"
+          ;;
         *)
           printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentInfo":{"name":"fake"}}}\n' "$id"
           ;;
@@ -1774,6 +1812,14 @@ while IFS= read -r line; do
       case "$mode" in
         die)
           echo 'boom: the agent fell over' >&2
+          exit 9
+          ;;
+        die-midline)
+          # One chunk with no newline in its text -- the shape opencode streams
+          # prose in -- and then death, so the turn never reaches its
+          # `stopReason` (#157).
+          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"half a sen"}}}}\n'
+          echo 'boom: the agent fell over mid-sentence' >&2
           exit 9
           ;;
         noisy)
@@ -2140,6 +2186,29 @@ done
         assert!(!format!("{error:#}").is_empty());
     }
 
+    /// The other half of the same death: what the PM had already said (#157).
+    ///
+    /// ACP agents chunk prose token by token -- `catalog/opencode.toml` records
+    /// nine chunks reading "MAN","A","-","TO","OLS","-","OK"," ","2", not a
+    /// newline among them -- so a turn only becomes text when something flushes
+    /// the buffer. The `stopReason` response does; an agent that falls over
+    /// mid-sentence never sends one, and EOF used to drop `TurnState` with the
+    /// whole partial answer still in it. Stderr and an exit code where the
+    /// answer belongs is the silent failure `src/pm/mod.rs` forbids.
+    #[test]
+    fn an_agent_that_dies_mid_sentence_still_reports_what_it_had_said() {
+        let fixture = Fixture::new();
+        let mut driver = fixture.driver("die-midline");
+        driver.send_user("go on then").unwrap();
+
+        let events = drain_to_exit(&driver);
+        assert!(
+            events.contains(&PmEvent::Text("half a sen".to_string())),
+            "{events:#?}"
+        );
+        assert_eq!(events.last(), Some(&PmEvent::Exited { code: Some(9) }));
+    }
+
     /// One line on the PM's stderr is one line in the pane. Once.
     ///
     /// The v2.0 capture showed every opencode stderr line twice, and the
@@ -2180,6 +2249,33 @@ done
         };
         assert!(rendered.contains("authentication required"), "{rendered}");
         assert!(rendered.contains("run fake login"), "{rendered}");
+    }
+
+    /// The version the agent answers with *is* the negotiation (#197).
+    ///
+    /// ACP v1 makes an agent that no longer speaks the requested version reply
+    /// with the latest it does, and asks the client to stop there. v2 went to
+    /// Draft on 2026-07-20 and its breaking changes are exactly what this
+    /// driver parses, so accepting the answer would decode v2 notifications
+    /// against a v1 parser: every one falling through to `Decoded::raw`, a
+    /// screen of JSON where one sentence belongs.
+    #[test]
+    fn an_agent_answering_with_another_protocol_version_is_refused() {
+        let fixture = Fixture::new();
+        let rendered = match fixture.start("v2") {
+            Ok(_) => panic!("mana kept speaking v1 to an agent that answered v2"),
+            Err(error) => format!("{error:#}"),
+        };
+        // Both halves named, because "version mismatch" tells the operator
+        // nothing about which build to reach for.
+        assert!(rendered.contains("Fake ACP CLI"), "{rendered}");
+        assert!(rendered.contains("v2"), "{rendered}");
+        assert!(rendered.contains("v1"), "{rendered}");
+
+        // And the handshake stopped there: no session opened behind the refusal.
+        let sent = fixture.wait_for_sent(1);
+        assert_eq!(sent.len(), 1, "{sent:#?}");
+        assert_eq!(sent[0]["method"], "initialize");
     }
 
     /// The v1 zombie, structurally: an agent that ignores the polite exit is

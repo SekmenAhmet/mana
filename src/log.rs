@@ -196,7 +196,19 @@ pub fn counters(
 
         let log_path = logs_dir.join(format!("{}.jsonl", record.agent_id));
         if let Some(exit) = read_last_exit(&log_path)? {
-            if exit.failure_means.as_deref() == Some("quota_exhausted") {
+            // Every meaning a cooldown answers, asked of routing's own list
+            // instead of spelled again here. A literal `quota_exhausted` used
+            // to be the whole test, so claude — whose only declared signature
+            // is `rate_limited` — reported `quota_failures: 0` beside a live
+            // cooldown, and the routing tiebreak that reads this counter could
+            // never separate two claude models (#158). The two lists drifted
+            // precisely because they were two.
+            if exit
+                .failure_means
+                .as_deref()
+                .and_then(crate::mcp::routing::cooling_means)
+                .is_some()
+            {
                 acc.quota_failures += 1;
             }
             if let Some(ms) = exit.duration_ms {
@@ -469,6 +481,41 @@ mod tests {
         assert_eq!(agy_default.dispatched, 1);
         assert_eq!(agy_default.quota_failures, 0);
         assert_eq!(agy_default.avg_duration_ms, Some(3000));
+    }
+
+    /// #158: routing cools on two meanings and this counted one, so a claude
+    /// model — whose only declared signature is `rate_limited` — reported
+    /// `quota_failures: 0` next to a live cooldown, and the routing tiebreak
+    /// that reads this counter could never separate two of them. `auth_expired`
+    /// stays out for the reason the cooldown policy skips it too: it is not a
+    /// quota event, and waiting is not what fixes it.
+    #[test]
+    fn counters_count_every_failure_a_cooldown_answers_not_only_quota_exhausted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let logs_dir = tmp.path().join("logs");
+
+        let registry = Registry::from_records(vec![
+            record("agent-1", "claude", "sonnet"),
+            record("agent-2", "claude", "sonnet"),
+        ]);
+
+        append_log(
+            &logs_dir.join("agent-1.jsonl"),
+            &sample_exit(Some(1000), Some("rate_limited")),
+        )
+        .unwrap();
+        append_log(
+            &logs_dir.join("agent-2.jsonl"),
+            &sample_exit(Some(1000), Some("auth_expired")),
+        )
+        .unwrap();
+
+        let result = counters(&logs_dir, &registry).unwrap();
+        let claude_sonnet = result
+            .get(&("claude".to_string(), "sonnet".to_string()))
+            .unwrap();
+        assert_eq!(claude_sonnet.dispatched, 2);
+        assert_eq!(claude_sonnet.quota_failures, 1);
     }
 
     #[test]
