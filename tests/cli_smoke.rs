@@ -62,6 +62,64 @@ fn doctor_exits_zero_on_a_home_where_nothing_has_happened() {
     assert!(stdout.contains("catalogue --"), "{stdout}");
 }
 
+/// Issue #167: `status::dispatches_in` prints the registry's skipped-line
+/// warnings, and `src/status.rs` promises one is said "exactly once per
+/// command" -- which is what `mana ps` does. `mana doctor` derived project
+/// state twice and said it twice.
+#[test]
+fn doctor_warns_about_a_corrupt_registry_line_exactly_once() {
+    let home = tempfile::tempdir().unwrap();
+    let mana_home = home.path().join(".mana");
+    let project = home.path().join("my-api");
+    std::fs::create_dir_all(&project).unwrap();
+
+    // Where the state lives is mana's own answer, not this test's: the project
+    // name fingerprints the absolute path (#33), and rebuilding that rule here
+    // would be a second copy of it. `mana ps` prints the registry path.
+    let listing = Command::cargo_bin("mana")
+        .unwrap()
+        .args(["ps", "--project"])
+        .arg(&project)
+        .env("MANA_HOME", &mana_home)
+        .output()
+        .unwrap();
+    let listing = String::from_utf8_lossy(&listing.stdout).into_owned();
+    let registry = std::path::PathBuf::from(
+        listing
+            .rsplit_once('(')
+            .expect("`mana ps` names the registry file")
+            .1
+            .trim()
+            .trim_end_matches(')'),
+    );
+    let state_dir = registry.parent().unwrap();
+    std::fs::create_dir_all(state_dir).unwrap();
+    std::fs::write(&registry, "{ not a record }\n").unwrap();
+    // The worktrees directory has to exist, or doctor's worktree section
+    // returns before the second derivation this test is about.
+    std::fs::create_dir_all(
+        mana_home
+            .join("worktrees")
+            .join(state_dir.file_name().unwrap()),
+    )
+    .unwrap();
+
+    let output = Command::cargo_bin("mana")
+        .unwrap()
+        .args(["doctor", "--project"])
+        .arg(&project)
+        .env("MANA_HOME", &mana_home)
+        .output()
+        .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        stderr.matches("warning:").count(),
+        1,
+        "one corrupt line, one warning: {stderr}"
+    );
+}
+
 /// The other half of the exit-code contract: `mana kill` fails loudly on an id
 /// it cannot find, rather than exiting 0 having done nothing.
 #[test]

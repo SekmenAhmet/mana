@@ -65,6 +65,11 @@ const MODELS_SHOWN: usize = 6;
 /// How much of an entry's `notes` the capability hint keeps.
 const NOTE_HINT_CHARS: usize = 100;
 
+/// How many worktree rows the report prints before it stops naming them and
+/// counts the rest instead. 200 leftovers made a 265-line report (#194), and
+/// the 201st directory name tells a reader nothing the count does not.
+const WORKTREES_SHOWN: usize = 10;
+
 /// What the whole report came to: the lines to print, and the subset of
 /// findings that make the exit code 1.
 pub struct Report {
@@ -229,10 +234,30 @@ pub fn diagnose(options: &Options<'_>) -> Result<Report> {
         None => None,
     };
 
+    // Derived once for the whole report, and not because it is expensive
+    // (though it is: `classify` probes every unfinished pid, and on Windows
+    // that shells out to `tasklist`). `status::dispatches_in` prints the
+    // registry's skipped-line warnings as it reads, so deriving it twice said
+    // every corruption twice -- against the "exactly once per command"
+    // contract `src/status.rs` states (#167).
+    let dispatches = match &project {
+        Some((_, _, name)) => status::dispatches_in(options.mana_home, name)?,
+        None => Vec::new(),
+    };
+
     catalogue_section(options, observations.as_ref(), &mut report);
     if let Some((root, paths, name)) = &project {
-        project_section(options, paths, name, observations.as_ref(), &mut report)?;
-        worktree_section(options, root, name, &mut report)?;
+        project_section(
+            options,
+            root,
+            paths,
+            name,
+            &dispatches,
+            observations.as_ref(),
+            &mut report,
+        )?;
+        worktree_section(options, root, name, &dispatches, &mut report)?;
+        branch_section(root, &dispatches, &mut report);
     }
     Ok(report)
 }
@@ -600,15 +625,16 @@ fn args_line(args: &[String]) -> String {
 
 fn project_section(
     options: &Options<'_>,
+    project_root: &Path,
     paths: &ProjectPaths,
     name: &str,
+    dispatches: &[Dispatch],
     observations: Option<&Observations>,
     report: &mut Report,
 ) -> Result<()> {
     report.say("");
     report.say(format!("project '{name}' -- {}", paths.root.display()));
 
-    let dispatches = status::dispatches_in(options.mana_home, name)?;
     if dispatches.is_empty() {
         report.say("  no dispatches recorded yet");
         return Ok(());
@@ -638,10 +664,15 @@ fn project_section(
         }
     }
     if stale > 0 {
+        // Qualified with the project, because `mana kill` resolves against the
+        // *working* directory and since #33 the project name fingerprints the
+        // absolute path: unqualified, this remedy is a dead end everywhere but
+        // here (#166). Same shape `mana dev` prints since #128.
         report.broken(format!(
             "  BROKEN: {stale} stale dispatch(es) -- their process is gone and no exit record \
              was ever written, so the PM is still waiting on them. Clear each with \
-             `mana kill <agent-id>`."
+             `mana kill <agent-id>` (in {}).",
+            project_root.display()
         ));
     }
 
@@ -747,13 +778,13 @@ fn worktree_section(
     options: &Options<'_>,
     project_root: &Path,
     name: &str,
+    dispatches: &[Dispatch],
     report: &mut Report,
 ) -> Result<()> {
     let dir = worktree::worktrees_dir(options.mana_home, name);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Ok(());
     };
-    let dispatches = status::dispatches_in(options.mana_home, name)?;
 
     let mut leftovers: Vec<(PathBuf, String, bool)> = Vec::new();
     for entry in entries {
@@ -777,33 +808,106 @@ fn worktree_section(
 
     report.say("");
     report.say(format!("worktrees -- {}", dir.display()));
+    // The listing is a sample, not an inventory: 200 leftovers used to print
+    // 200 near-identical lines (#194). Every one is still acted on -- only the
+    // *naming* is capped, and a failed prune is never elided, because that one
+    // is a finding.
+    let (mut named, mut elided, mut left_over) = (0usize, 0usize, 0usize);
     for (path, dir_name, in_use) in leftovers {
         let age = status::render_age(dir_age(&path, options.now));
-        if in_use {
-            report.say(format!(
+        let line = if in_use {
+            format!(
                 "  {dir_name}  age {age}  in use by a running dispatch{}",
                 if options.prune { " -- kept" } else { "" }
-            ));
-            continue;
-        }
-        if !options.prune {
-            report.say(format!(
-                "  {dir_name}  age {age}  no running dispatch -- remove with `mana doctor --prune`"
-            ));
-            continue;
-        }
-        match worktree::remove_at(project_root, &path) {
-            Ok(()) => report.say(format!("  {dir_name}  age {age}  pruned")),
-            // A leftover worktree is disk, not correctness, so listing one is
-            // not broken -- but a *failed* prune is: the cleanup the user
-            // asked for did not happen, and a script that read exit 0 here
-            // would move on believing the directory is gone.
-            Err(error) => report.broken(format!(
-                "  BROKEN: {dir_name}  age {age}  prune failed: {error:#}"
-            )),
+            )
+        } else if !options.prune {
+            left_over += 1;
+            format!("  {dir_name}  age {age}  no running dispatch")
+        } else {
+            match worktree::remove_at(project_root, &path) {
+                Ok(()) => format!("  {dir_name}  age {age}  pruned"),
+                // A leftover worktree is disk, not correctness, so listing one
+                // is not broken -- but a *failed* prune is: the cleanup the
+                // user asked for did not happen, and a script that read exit 0
+                // here would move on believing the directory is gone.
+                Err(error) => {
+                    report.broken(format!(
+                        "  BROKEN: {dir_name}  age {age}  prune failed: {error:#}"
+                    ));
+                    continue;
+                }
+            }
+        };
+        if named < WORKTREES_SHOWN {
+            named += 1;
+            report.say(line);
+        } else {
+            elided += 1;
         }
     }
+    if elided > 0 {
+        report.say(format!("  and {elided} more"));
+    }
+    if left_over > 0 {
+        // Said once, and qualified with the project: `--prune` resolves
+        // against the *working* directory, and since #33 the project name
+        // fingerprints the absolute path, so run from anywhere else it finds
+        // no state, removes nothing and exits 0 -- which reads as "cleaned"
+        // (#166).
+        report.say(format!(
+            "  {left_over} with no running dispatch -- remove with `mana doctor --prune` (in {})",
+            project_root.display()
+        ));
+    }
     Ok(())
+}
+
+// -- branches ----------------------------------------------------------------
+
+/// The `mana/*` branches the project repo carries.
+///
+/// Reported and never removed, `--prune` included. A worktree is disk and
+/// rebuildable from its branch, which is why `--prune` may delete one; a
+/// branch is the only copy of what its executor wrote, and "the task was
+/// validated" is not "the work was landed" (#194). So this says what is there,
+/// separates the branches HEAD already contains -- the ones a user can delete
+/// losing nothing, which is git's own `-d` rule -- from the ones still holding
+/// work, and hands over the command rather than running it.
+fn branch_section(project_root: &Path, dispatches: &[Dispatch], report: &mut Report) {
+    let branches = worktree::mana_branches(project_root);
+    if branches.is_empty() {
+        return;
+    }
+    let (mut in_use, mut merged, mut unlanded) = (0usize, 0usize, 0usize);
+    for (branch, is_merged) in &branches {
+        let live = dispatches.iter().any(|dispatch| {
+            dispatch.status == DispatchStatus::Running
+                && &worktree::branch_name(&dispatch.record.task_id) == branch
+        });
+        match (live, is_merged) {
+            (true, _) => in_use += 1,
+            (false, true) => merged += 1,
+            (false, false) => unlanded += 1,
+        }
+    }
+
+    report.say("");
+    report.say(format!(
+        "branches -- {} mana/* branch(es) in {}",
+        branches.len(),
+        project_root.display()
+    ));
+    report.say(format!(
+        "  {in_use} in use by a running dispatch, {merged} merged into HEAD, \
+         {unlanded} still holding unlanded work"
+    ));
+    if merged > 0 {
+        report.say(format!(
+            "  mana never deletes a branch -- delete the merged ones with \
+             `git branch -d $(git branch --list 'mana/*' --merged HEAD)` (in {})",
+            project_root.display()
+        ));
+    }
 }
 
 /// A worktree's age from its own mtime, not from a registry record: the
@@ -1181,6 +1285,45 @@ cooldown_minutes = 30
         assert_eq!(report.exit_code(), 1, "a failed prune exited clean: {text}");
     }
 
+    /// Issue #194: 200 leftover worktrees made a 265-line report, 200 of them
+    /// the same line carrying the same hint. The listing is a sample and a
+    /// count now, and the hint is said once.
+    #[test]
+    fn the_worktree_listing_is_capped_and_hints_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mana_home = tmp.path().join("mana-home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let dir = worktree::worktrees_dir(&mana_home, &project_name_from_dir(&project));
+        for i in 0..25 {
+            std::fs::create_dir_all(dir.join(format!("leftover{i:02}"))).unwrap();
+        }
+
+        let entries = entries();
+        let report = diagnose(&Options {
+            project_root: Some(&project),
+            ..options(&mana_home, &entries)
+        })
+        .unwrap();
+        let text = joined(&report);
+
+        let listed = report
+            .lines
+            .iter()
+            .filter(|line| line.contains("  age ") && line.contains("no running dispatch"))
+            .count();
+        assert_eq!(listed, WORKTREES_SHOWN, "{text}");
+        assert!(
+            text.contains(&format!("and {} more", 25 - WORKTREES_SHOWN)),
+            "{text}"
+        );
+        assert_eq!(
+            text.matches("mana doctor --prune").count(),
+            1,
+            "the hint is repeated per line: {text}"
+        );
+    }
+
     #[test]
     fn truncate_list_says_how_many_it_left_out() {
         let many: Vec<String> = (0..10).map(|i| format!("m{i}")).collect();
@@ -1210,6 +1353,54 @@ mod process_tests {
             pid,
             started_at: now_iso8601(),
         }
+    }
+
+    /// Issue #166: `mana kill` and `mana doctor --prune` both default to the
+    /// working directory, and since #33 the project name fingerprints the
+    /// absolute path -- so run from anywhere but the project these prescribed
+    /// commands hit a different project's state and do nothing. Every remedy
+    /// has to carry the project it was prescribed for, the way `mana dev`
+    /// already does since #128.
+    #[test]
+    fn the_prescribed_remedies_name_the_project_they_are_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("my-api");
+        std::fs::create_dir_all(&project).unwrap();
+        let name = project_name_from_dir(&project);
+        let paths = resolve_project_paths(tmp.path(), &name);
+        crate::project::ensure_project_structure(&paths).unwrap();
+        append_record(
+            &paths.subagents_file,
+            &record("3f2a1b6c-dead", Some(reaped_pid())),
+        )
+        .unwrap();
+        // A leftover worktree directory for a task nothing is running, which
+        // is what the second remedy is printed for.
+        std::fs::create_dir_all(worktree::worktrees_dir(tmp.path(), &name).join("9d4e4a7b"))
+            .unwrap();
+
+        let entries = vec![parse_entry(super::tests::FIXTURE).unwrap()];
+        let report = diagnose(&Options {
+            mana_home: tmp.path(),
+            entries: &entries,
+            override_note: None,
+            override_error: None,
+            project_root: Some(&project),
+            prune: false,
+            now: Utc::now(),
+        })
+        .unwrap();
+        let text = report.lines.join("\n");
+
+        let here = project.display().to_string();
+        assert!(
+            text.contains(&format!("`mana kill <agent-id>` (in {here})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("`mana doctor --prune` (in {here})")),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1413,6 +1604,54 @@ mod process_tests {
             "routable: mini (cheap, pool main); discovered: fast, slow"
         );
         assert_eq!(sequential[1].binary, None);
+    }
+
+    /// Issue #194: a task branch outlives its worktree by design (it carries
+    /// the executor's commits), and nothing removed *or reported* it, so a few
+    /// hundred tasks made the user's own `git branch` unusable. Doctor now
+    /// says the branches are there -- and still does not delete them, `--prune`
+    /// included: a worktree is disk and rebuildable from its branch, a branch
+    /// is the only copy of what the executor wrote.
+    #[test]
+    fn leftover_task_branches_are_reported_and_never_pruned() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fixture = GitFixture::new(tmp.path());
+        let mana_home = tmp.path().join("mana-home");
+
+        let task = "3f2a1b6c-dead-0000-0000-000000000000";
+        let info = worktree::create(&fixture.project, &mana_home, task).unwrap();
+        worktree::remove_at(&fixture.project, &info.path).unwrap();
+
+        let entries = vec![parse_entry(super::tests::FIXTURE).unwrap()];
+        let report = diagnose(&Options {
+            mana_home: &mana_home,
+            entries: &entries,
+            override_note: None,
+            override_error: None,
+            project_root: Some(&fixture.project),
+            prune: true,
+            now: Utc::now(),
+        })
+        .unwrap();
+        let text = report.lines.join("\n");
+
+        assert!(text.contains("branches --"), "{text}");
+        assert!(text.contains("1 merged into HEAD"), "{text}");
+        assert!(text.contains("git branch -d"), "{text}");
+        // Reported is not broken: an unlanded branch is work, not damage.
+        assert_eq!(report.exit_code(), 0, "{text}");
+
+        let still_there = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&fixture.project)
+            .args(["rev-parse", "--verify", &info.branch])
+            .output()
+            .unwrap();
+        assert!(
+            still_there.status.success(),
+            "--prune deleted a task branch: {}",
+            String::from_utf8_lossy(&still_there.stderr)
+        );
     }
 
     #[test]
