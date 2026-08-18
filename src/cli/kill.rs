@@ -168,6 +168,7 @@ pub fn kill_dispatch(
     // record still has to be written, or `mana ps` keeps calling it stale.
     if dispatch.status == DispatchStatus::Stale {
         lines.push(format!("{agent}: pid {pid} is already gone"));
+        mark_killed(paths, dispatch)?;
         record_completion(
             paths,
             dispatch,
@@ -206,6 +207,9 @@ pub fn kill_dispatch(
         ));
     }
 
+    // Before the signal, not after: see `mark_killed`. The supervising
+    // dispatch reads this the moment the child dies.
+    mark_killed(paths, dispatch)?;
     signal(pid).with_context(|| format!("killing {agent} (pid {pid})"))?;
     lines.push(match wait_for_death(pid) {
         true => format!("{agent}: killed (pid {pid} and its process group are gone)"),
@@ -290,6 +294,27 @@ fn where_it_looked(scope: &Scope) -> String {
 /// extra line changes nothing for any reader — and it is what the supervising
 /// dispatch reads to tell an operator's kill apart from a vendor cutting the
 /// process off (`dispatch::killed_by_operator`).
+/// Says "an operator asked for this" in the agent's own log, and must run
+/// *before* the signal.
+///
+/// `dispatch::run_dispatch` reads this marker the moment the child dies, to
+/// tell a deliberate kill apart from a vendor cutting the process off. Written
+/// afterwards it is always too late: the supervisor has already classified the
+/// run on its captured output alone, and a CLI that merely printed the words
+/// "rate limit" gets its whole pool rested for an hour (#199, #38).
+fn mark_killed(paths: &ProjectPaths, dispatch: &Dispatch) -> Result<()> {
+    append_log(
+        &paths
+            .logs
+            .join(format!("{}.jsonl", dispatch.record.agent_id)),
+        &LogEntry {
+            status: Status::Running,
+            action: "killed".to_string(),
+            timestamp: now_iso8601(),
+        },
+    )
+}
+
 fn record_completion(
     paths: &ProjectPaths,
     dispatch: &Dispatch,
@@ -300,14 +325,6 @@ fn record_completion(
     let log_path = paths.logs.join(format!("{}.jsonl", record.agent_id));
     let timestamp = now_iso8601();
 
-    append_log(
-        &log_path,
-        &LogEntry {
-            status: Status::Running,
-            action: "killed".to_string(),
-            timestamp: timestamp.clone(),
-        },
-    )?;
     append_log(
         &log_path,
         &ExitEntry {
