@@ -233,8 +233,44 @@ fn decoration(source: Source) -> Decoration {
     }
 }
 
+/// How wide `text` renders, in terminal cells.
+///
+/// Code points are the wrong unit and were the bug (#159): a terminal lays out
+/// in cells, and the two disagree for every CJK character, most emoji and
+/// every combining sequence. `Span::width` is ratatui's own measurement -- the
+/// same unicode-width the renderer lays the buffer out with -- so measuring
+/// with it measures what will actually be drawn, and costs no dependency.
+fn cells(text: &str) -> usize {
+    Span::raw(text).width()
+}
+
+/// The longest prefix of `word` that fits in `width` cells.
+///
+/// Never empty and never split mid-character: a pane one cell wide still has
+/// to make progress through a two-cell character, and a head of nothing would
+/// spin the hard-break loop below forever (#159). Such a character overflows
+/// its row by one cell rather than stalling the frame.
+fn head_within(word: &str, width: usize) -> String {
+    let mut head = String::new();
+    let mut used = 0;
+    let mut buffer = [0u8; 4];
+    for character in word.chars() {
+        let cell = cells(character.encode_utf8(&mut buffer));
+        if !head.is_empty() && used + cell > width {
+            break;
+        }
+        head.push(character);
+        used += cell;
+    }
+    head
+}
+
 /// Greedy word wrap, falling back to a hard break for a word longer than the
 /// pane (a path, a URL, a base64 blob -- all things an agent prints).
+///
+/// Measured in display cells, not code points: a row built to a width the pane
+/// does not have is cut by `Paragraph` rather than re-wrapped, so the overflow
+/// never reaches any frame at all (#159).
 fn wrap(text: &str, width: usize) -> Vec<String> {
     if text.is_empty() {
         return vec![String::new()];
@@ -244,8 +280,8 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     for word in text.split(' ') {
         let mut word = word;
         loop {
-            let free = width.saturating_sub(row.chars().count());
-            let needed = word.chars().count() + usize::from(!row.is_empty());
+            let free = width.saturating_sub(cells(&row));
+            let needed = cells(word) + usize::from(!row.is_empty());
             if needed <= free {
                 if !row.is_empty() {
                     row.push(' ');
@@ -258,13 +294,20 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
                 continue;
             }
             // An empty row that still cannot hold the word: split it.
-            let head: String = word.chars().take(width).collect();
+            let head = head_within(word, width);
             let consumed = head.len();
             rows.push(head);
             word = &word[consumed..];
         }
     }
-    rows.push(row);
+    // A hard break that consumed the whole word leaves nothing in hand, and a
+    // character wider than the pane always ends that way (#159). Pushing it
+    // would spend a row of the pane on a blank continuation line. The
+    // `rows.is_empty()` arm keeps whitespace-only text one empty row, as
+    // `wrap("", _)` already returns.
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(row);
+    }
     rows
 }
 
@@ -983,6 +1026,25 @@ mod tests {
     #[test]
     fn wrap_hard_breaks_on_character_boundaries() {
         assert_eq!(wrap("ééééé", 2), ["éé", "éé", "é"]);
+    }
+
+    /// Code points are not display cells (#159). A row built to 36 CJK
+    /// characters is 72 cells wide in a 36-cell pane, and `Paragraph` (no
+    /// `Wrap`) cuts the overflow instead of re-wrapping it -- the text leaves
+    /// the frame entirely rather than scrolling off it.
+    #[test]
+    fn wrap_measures_display_cells_so_wide_text_is_never_cut() {
+        let mut app = App::new("Claude Code");
+        app.push(Source::Pm, &"日".repeat(60));
+        // Width 40 -> inner 38 -> 36 cells of text: 18 characters a row.
+        let rendered = dump(&screen(&app, &[], 40, 12));
+        assert_eq!(rendered.matches('日').count(), 60, "{rendered}");
+
+        // Two cells each: three characters do not fit in four cells.
+        assert_eq!(wrap("日本語", 4), ["日本", "語"]);
+        // The hard break counts cells too, and a pane narrower than one
+        // character still has to make progress through it.
+        assert_eq!(wrap("日本語", 1), ["日", "本", "語"]);
     }
 
     #[test]
