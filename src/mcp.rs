@@ -413,22 +413,31 @@ impl ManaTools {
         let role = Role::from(params.role);
         let path = task_path(&paths, task_id);
         let task = read_task(&path).map_err(|error| {
-            // Two states, two remedies. A file that is *there* and unreadable
-            // is not a task to create: `create_task` would mint a second id,
-            // leave the broken file where it is, and leave every `depends_on`
-            // naming the old id pointing at something no dispatch can read.
-            // `{error:#}` rather than `{error}` because the parser's own
-            // "line 3 column 8" is the only thing that says where to look.
+            // Two remedies, ordered by who can act on them. The PM's role
+            // forbids editing or deleting task files, so it gets create_task
+            // first -- but a replacement task gets a *new* id, so any task
+            // whose depends_on names the broken one has to be recreated
+            // against the new id, or it waits forever on a dependency gate
+            // that can never open. Repairing the file in place is a human
+            // operator's job, not the PM's; the PM can only pass along the
+            // path and the parser's own complaint. `{error:#}` rather than
+            // `{error}` because the parser's own "line 3 column 8" is the
+            // only thing that says where to look.
             if crate::task::read_failure_is_missing(&error) {
                 invalid(format!(
                     "unknown task {task_id:?} -- create it with create_task first"
                 ))
             } else {
+                let path = path.display();
                 invalid(format!(
-                    "task {task_id} exists at {} but mana cannot read it ({error:#}) -- \
-                     repair that file (a '+++'-fenced TOML block with id, title and role, \
-                     then the brief), or delete it and create a replacement with create_task",
-                    path.display()
+                    "task {task_id} exists at {path} but mana cannot read it -- create a \
+                     replacement task with create_task and dispatch that instead; the \
+                     replacement gets a new id, so any task whose depends_on names {task_id} \
+                     must be recreated against the new id, or it will wait forever on a \
+                     dependency gate that can never open. Repairing the file at {path} in place \
+                     is a job for the human operator, not the PM: it needs a '+++'-fenced TOML \
+                     block with id, title and role, then the brief; mana's parser says: \
+                     {error:#}"
                 ))
             }
         })?;
@@ -2251,11 +2260,13 @@ mod tests {
         assert!(error.message.contains("create_task"), "{}", error.message);
     }
 
-    /// A task file mana cannot read is not a task that does not exist: sending
-    /// the PM to `create_task` there mints a second id and leaves the corrupt
-    /// file (and everything depending on its id) exactly as broken.
+    /// A task file mana cannot read is not a task that does not exist, and the
+    /// PM cannot edit or delete task files itself -- so the message leads with
+    /// the remedy the PM can actually perform (create a replacement and
+    /// dispatch that) before the file-repair instructions, which it addresses
+    /// to the human operator, not the PM.
     #[test]
-    fn launching_on_a_corrupt_task_file_says_to_repair_it_not_to_create_it() {
+    fn launching_on_a_corrupt_task_file_leads_with_the_pm_remedy_before_the_human_repair() {
         let fixture = Fixture::new();
         let task_id = fixture.create("Real task", "# Brief\n", None);
         let path = task_path(&fixture.paths, &task_id);
@@ -2272,6 +2283,20 @@ mod tests {
             })
             .unwrap_err();
         assert!(!error.message.contains("unknown task"), "{}", error.message);
+
+        let create_task_at = error
+            .message
+            .find("create_task")
+            .unwrap_or_else(|| panic!("no create_task remedy in {}", error.message));
+        let repair_at = error.message.find("human operator").unwrap_or_else(|| {
+            panic!("no human-operator repair instructions in {}", error.message)
+        });
+        assert!(
+            create_task_at < repair_at,
+            "create_task remedy should come before the repair instructions: {}",
+            error.message
+        );
+
         // The file to open, and the parser's complaint about it -- the context
         // chain `{error}` used to drop.
         assert!(
@@ -2279,7 +2304,11 @@ mod tests {
             "{}",
             error.message
         );
-        assert!(error.message.contains("repair"), "{}", error.message);
+        assert!(
+            error.message.contains("missing closing"),
+            "parser's own error text should still be included: {}",
+            error.message
+        );
     }
 
     #[test]
