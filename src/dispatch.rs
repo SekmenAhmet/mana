@@ -1598,10 +1598,14 @@ mod dispatch_tests {
         let mana_home = fixture.mana_home.clone();
         let project_root = fixture.project.clone();
         let wanted = agent.clone();
+        // How long to wait for the dispatch to register a pid: load-tolerant
+        // rather than a fixed count of 20ms polls, since registering a pid
+        // is exactly the kind of scheduling a busy machine slows down first.
+        let deadline = std::time::Instant::now() + crate::subprocess::load_tolerant_deadline();
         let killer = std::thread::spawn(move || {
             let project = crate::project::project_name_from_dir(&project_root);
             let paths = crate::project::resolve_project_paths(&mana_home, &project);
-            for _ in 0..600 {
+            while std::time::Instant::now() < deadline {
                 if let Ok(found) = crate::status::dispatches_in(&mana_home, &project)
                     && let Some(dispatch) = found
                         .iter()

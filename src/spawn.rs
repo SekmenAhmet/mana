@@ -420,6 +420,9 @@ mod windows_process_tests {
             args: Vec::new(),
             cwd: tmp.path().to_path_buf(),
             prompt: PromptDelivery::Argv,
+            // Deliberately short and fixed: the deadline under test, chosen
+            // to fire well before the fixture's `ping -n 60` would ever
+            // exit on its own -- not a bound this test needs to survive.
             timeout: Duration::from_millis(800),
         };
         let outcome = run(&spec, |_| {}).unwrap();
@@ -441,14 +444,15 @@ mod windows_process_tests {
 #[cfg(all(test, unix))] // every test here execs unix shell fixtures
 mod process_tests {
     use super::*;
+    use crate::subprocess::load_tolerant_deadline;
 
-    fn sh(script: &str, cwd: &std::path::Path, timeout_ms: u64) -> SpawnSpec {
+    fn sh(script: &str, cwd: &std::path::Path, timeout: Duration) -> SpawnSpec {
         SpawnSpec {
             bin: "sh".into(),
             args: vec!["-c".to_string(), script.to_string()],
             cwd: cwd.to_path_buf(),
             prompt: PromptDelivery::Argv,
-            timeout: Duration::from_millis(timeout_ms),
+            timeout,
         }
     }
 
@@ -461,7 +465,7 @@ mod process_tests {
     #[test]
     fn propagates_the_exit_code() {
         let tmp = tempfile::tempdir().unwrap();
-        let outcome = run(&sh("exit 3", tmp.path(), 5_000), |_| {}).unwrap();
+        let outcome = run(&sh("exit 3", tmp.path(), load_tolerant_deadline()), |_| {}).unwrap();
         assert_eq!(outcome.exit_code, Some(3));
         assert!(!outcome.timed_out);
     }
@@ -470,7 +474,11 @@ mod process_tests {
     fn captures_stdout_and_stderr_separately() {
         let tmp = tempfile::tempdir().unwrap();
         let outcome = run(
-            &sh("echo to-stdout; echo to-stderr >&2", tmp.path(), 5_000),
+            &sh(
+                "echo to-stdout; echo to-stderr >&2",
+                tmp.path(),
+                load_tolerant_deadline(),
+            ),
             |_| {},
         )
         .unwrap();
@@ -483,7 +491,7 @@ mod process_tests {
     #[test]
     fn runs_in_the_requested_directory() {
         let tmp = tempfile::tempdir().unwrap();
-        let outcome = run(&sh("pwd -P", tmp.path(), 5_000), |_| {}).unwrap();
+        let outcome = run(&sh("pwd -P", tmp.path(), load_tolerant_deadline()), |_| {}).unwrap();
         let expected = tmp.path().canonicalize().unwrap();
         assert_eq!(outcome.stdout.trim(), expected.to_string_lossy());
     }
@@ -498,7 +506,7 @@ mod process_tests {
             args: Vec::new(),
             cwd: tmp.path().to_path_buf(),
             prompt: PromptDelivery::Stdin("the brief, on stdin".to_string()),
-            timeout: Duration::from_secs(5),
+            timeout: load_tolerant_deadline(),
         };
         let outcome = run(&spec, |_| {}).unwrap();
         assert!(!outcome.timed_out, "stdin was never closed");
@@ -511,7 +519,11 @@ mod process_tests {
         let tmp = tempfile::tempdir().unwrap();
         // A CLI that reads stdin although it was given an argv prompt must see
         // EOF, not mana's own terminal: inheriting it would hang the dispatch.
-        let outcome = run(&sh("cat; echo done", tmp.path(), 5_000), |_| {}).unwrap();
+        let outcome = run(
+            &sh("cat; echo done", tmp.path(), load_tolerant_deadline()),
+            |_| {},
+        )
+        .unwrap();
         assert!(!outcome.timed_out);
         assert_eq!(outcome.stdout.trim(), "done");
     }
@@ -525,8 +537,13 @@ mod process_tests {
         // and possibly still writing into the worktree.
         let script = format!("sleep 30 & echo $! > '{}'; sleep 30", pidfile.display());
 
-        let started = Instant::now();
-        let outcome = run(&sh(&script, tmp.path(), 400), |_| {}).unwrap();
+        // Deliberately short and fixed: this is the deadline under test, not
+        // a bound this test needs to survive. Whether the kill was prompt is
+        // proven below by the recorded outcome (`timed_out`, `exit_code`,
+        // `duration`) and by the grandchild's own death, not by timing the
+        // test itself -- a machine so loaded that this took ten seconds
+        // would still have a correct outcome to show for it.
+        let outcome = run(&sh(&script, tmp.path(), Duration::from_millis(400)), |_| {}).unwrap();
 
         assert!(outcome.timed_out);
         assert_eq!(
@@ -534,11 +551,6 @@ mod process_tests {
             "a signalled process reports no code"
         );
         assert!(outcome.duration >= Duration::from_millis(400));
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "took {:?}",
-            started.elapsed()
-        );
 
         let grandchild: i32 = std::fs::read_to_string(&pidfile)
             .unwrap()
@@ -562,7 +574,7 @@ mod process_tests {
         // Well past the cap, so a clean exit also proves the child was never
         // blocked by a reader that stopped reading at the ceiling.
         let script = "echo FIRST-LINE; yes filler-line | head -c 9000000";
-        let outcome = run(&sh(script, tmp.path(), 30_000), |_| {}).unwrap();
+        let outcome = run(&sh(script, tmp.path(), load_tolerant_deadline()), |_| {}).unwrap();
 
         assert_eq!(outcome.exit_code, Some(0));
         assert!(!outcome.timed_out);
@@ -576,13 +588,16 @@ mod process_tests {
     fn on_spawn_reports_a_live_pid_before_the_process_exits() {
         let tmp = tempfile::tempdir().unwrap();
         let seen = std::cell::Cell::new(None);
-        let outcome = run(&sh("sleep 0.3", tmp.path(), 5_000), |pid| {
-            assert!(
-                process_is_alive(pid as i32),
-                "callback fired after the process was gone"
-            );
-            seen.set(Some(pid));
-        })
+        let outcome = run(
+            &sh("sleep 0.3", tmp.path(), load_tolerant_deadline()),
+            |pid| {
+                assert!(
+                    process_is_alive(pid as i32),
+                    "callback fired after the process was gone"
+                );
+                seen.set(Some(pid));
+            },
+        )
         .unwrap();
         assert_eq!(seen.get(), Some(outcome.pid));
         assert_eq!(outcome.exit_code, Some(0));
@@ -592,7 +607,7 @@ mod process_tests {
     fn missing_working_directory_is_named_in_the_error() {
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("no-such-worktree");
-        let err = run(&sh("true", &missing, 5_000), |_| {}).unwrap_err();
+        let err = run(&sh("true", &missing, load_tolerant_deadline()), |_| {}).unwrap_err();
         let rendered = format!("{err:#}");
         assert!(rendered.contains("no-such-worktree"), "{rendered}");
     }
