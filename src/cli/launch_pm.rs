@@ -4206,4 +4206,34 @@ mod teardown_tests {
             "PM skill does not describe worktree rebuild from current HEAD at relaunch time"
         );
     }
+
+    /// Issue #172: the skill must explain that relaunching preserves depends_on
+    /// while creating a replacement task orphans dependents.
+    #[test]
+    fn pm_skill_describes_the_dependency_implications_of_relaunch_vs_replacement() {
+        // Extract the Verdicts section from "## Verdicts" to "## Landing the work".
+        let verdicts_start = PM_SKILL
+            .find("## Verdicts")
+            .expect("PM skill has no Verdicts section");
+        let landing_start = PM_SKILL[verdicts_start..]
+            .find("## Landing the work")
+            .map(|pos| verdicts_start + pos)
+            .unwrap_or_else(|| PM_SKILL.len());
+        let verdicts_section = &PM_SKILL[verdicts_start..landing_start];
+
+        // The skill must explain that relaunching preserves depends_on.
+        assert!(
+            verdicts_section.contains("depends_on"),
+            "PM skill verdicts section does not mention depends_on"
+        );
+        // Relaunching vs replacement are the two routes.
+        assert!(
+            verdicts_section.contains("Relaunching"),
+            "PM skill verdicts section does not explain relaunching"
+        );
+        assert!(
+            verdicts_section.contains("replacement"),
+            "PM skill verdicts section does not explain replacement"
+        );
+    }
 }

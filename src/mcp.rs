@@ -636,19 +636,33 @@ impl ManaTools {
             // in: `create_task` wrote it, but a task file is plain text on
             // disk and this id is about to become a path.
             let dependency = validated_task_id(dependency)?;
-            let state = match review::read_verdict(&review_path(paths, dependency)) {
+            let state_and_move = match review::read_verdict(&review_path(paths, dependency)) {
                 Ok(verdict) if verdict.verdict == Decision::Validated => continue,
-                // A rejection and a malformed verdict need the same next move
-                // (get that task finished), so they get the same sentence with
-                // the state that distinguishes them.
-                Ok(verdict) => format!("its verdict is {}", verdict.verdict.word()),
-                Err(_) => "it has no usable verdict yet".to_string(),
+                Ok(verdict) if verdict.verdict == Decision::Rejected => (
+                    format!("its verdict is {}", verdict.verdict.word()),
+                    " Relaunching the same task_id preserves this dependency, because this \
+                         task still names that id and it can still reach validated. Creating a \
+                         replacement task mints a new id, which orphans this task."
+                        .to_string(),
+                ),
+                // A malformed verdict needs the task finished, no special guidance.
+                Ok(verdict) => (
+                    format!("its verdict is {}", verdict.verdict.word()),
+                    String::new(),
+                ),
+                Err(_) => ("it has no usable verdict yet".to_string(), String::new()),
             };
             return Err(invalid(format!(
-                "task {} depends on task {dependency}, and {state}. Finish that one first -- \
+                "task {} depends on task {dependency}, and {}. Finish that one first -- \
                  executor, then reviewer, then get_review -- and launch this one when it comes \
-                 back validated. Nothing is queued in the meantime: send this call again then.",
-                task.frontmatter.id
+                 back validated.{} Nothing is queued in the meantime: send this call again then.",
+                task.frontmatter.id,
+                state_and_move.0,
+                if state_and_move.1.is_empty() {
+                    String::new()
+                } else {
+                    format!(" {}", state_and_move.1)
+                }
             )));
         }
         Ok(())
@@ -2205,6 +2219,74 @@ mod tests {
         std::fs::write(&verdict, r#"{"verdict":"validated","issues":[]}"#).unwrap();
         let error = launch(&second, RoleParam::Executor).unwrap_err();
         assert!(error.message.contains("unknown CLI"), "{}", error.message);
+    }
+
+    /// When a dependency is rejected, the refusal must tell the PM that
+    /// relaunching the same task_id preserves the dependency.
+    #[test]
+    fn a_rejected_dependency_refusal_explains_relaunching_preserves_depends_on() {
+        let fixture = Fixture::new();
+        let first = fixture.create("First", "brief", None);
+        let second = fixture.create("Second", "brief", Some(vec![first.clone()]));
+
+        let launch = |task_id: &str| {
+            fixture.tools.launch_subagent_impl(LaunchSubagentParams {
+                task_id: task_id.to_string(),
+                role: RoleParam::Executor,
+                cli: Some("not-a-cli".to_string()),
+                model: None,
+                cost_class: None,
+            })
+        };
+
+        let verdict = review_path(&fixture.paths, &first);
+        std::fs::write(
+            &verdict,
+            r#"{"verdict":"rejected","attribution":"code","issues":[]}"#,
+        )
+        .unwrap();
+
+        let error = launch(&second).unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("Relaunching the same task_id preserves this dependency"),
+            "{}",
+            error.message
+        );
+    }
+
+    /// When a dependency has no verdict yet, the refusal must not suggest
+    /// relaunching, because there is no rejection to relaunch.
+    #[test]
+    fn a_dependency_with_no_verdict_refusal_does_not_mention_relaunching() {
+        let fixture = Fixture::new();
+        let first = fixture.create("First", "brief", None);
+        let second = fixture.create("Second", "brief", Some(vec![first.clone()]));
+
+        let launch = |task_id: &str| {
+            fixture.tools.launch_subagent_impl(LaunchSubagentParams {
+                task_id: task_id.to_string(),
+                role: RoleParam::Executor,
+                cli: Some("not-a-cli".to_string()),
+                model: None,
+                cost_class: None,
+            })
+        };
+
+        // No verdict file written, so the error is about "no usable verdict yet".
+        let error = launch(&second).unwrap_err();
+        assert!(
+            error.message.contains("no usable verdict yet"),
+            "{}",
+            error.message
+        );
+        // This case does not suggest relaunching.
+        assert!(
+            !error.message.contains("Relaunching the same task_id"),
+            "{}",
+            error.message
+        );
     }
 
     /// The drop guard exists so a panicking dispatch cannot permanently eat a
