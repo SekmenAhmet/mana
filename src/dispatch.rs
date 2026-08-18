@@ -1302,6 +1302,64 @@ mod dispatch_tests {
         assert!(!log.contains("rate_limited"), "{log}");
     }
 
+    /// #199: `kill_dispatch` used to signal first and write the `killed`
+    /// marker afterwards, so the supervising dispatch had already read the log
+    /// and found nothing. The operator's kill was then classified on the
+    /// sub-agent's output alone, and a CLI that had merely printed the words
+    /// "rate limit" got its whole pool rested for an hour.
+    ///
+    /// Unlike `an_operators_kill_is_not_read_as_the_vendors_quota_failure`,
+    /// which has the doomed process append its own marker, this drives the
+    /// real `mana kill` against a real dispatch — the ordering under test only
+    /// exists in `kill_dispatch`.
+    #[test]
+    fn a_real_mana_kill_beats_the_signature_match_to_the_log() {
+        let fixture = Fixture::new();
+        let agent = agent_id();
+        let bin = fixture.script("slow-cli", "echo 'rate limit reached'\nsleep 30\n");
+        let entry = fixture_entry(
+            &bin,
+            PLAIN_SUBAGENT,
+            "[[failure]]\nmeans = \"rate_limited\"\nstdout_regex = \"rate.?limit\"\ncooldown_minutes = 60\n",
+        );
+
+        // The killer runs `mana kill`'s real path as soon as the dispatch has
+        // registered a pid, exactly as an operator at another terminal would.
+        let mana_home = fixture.mana_home.clone();
+        let project_root = fixture.project.clone();
+        let wanted = agent.clone();
+        let killer = std::thread::spawn(move || {
+            let project = crate::project::project_name_from_dir(&project_root);
+            let paths = crate::project::resolve_project_paths(&mana_home, &project);
+            for _ in 0..600 {
+                if let Ok(found) = crate::status::dispatches_in(&mana_home, &project)
+                    && let Some(dispatch) = found
+                        .iter()
+                        .find(|d| d.record.agent_id == wanted && d.record.pid.is_some())
+                {
+                    return crate::cli::kill::kill_dispatch(&paths, dispatch, chrono::Utc::now())
+                        .map(|_| ());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            Err(anyhow::anyhow!("the dispatch never registered a pid"))
+        });
+
+        let run = dispatch_executor(&assign(&agent, &entry, &task(), &fixture)).unwrap();
+        killer.join().unwrap().expect("mana kill failed");
+
+        assert!(
+            run.outcome.killed,
+            "the kill marker was not on disk in time"
+        );
+        assert_eq!(
+            run.outcome.failure_means, None,
+            "an operator's kill was blamed on the vendor's quota"
+        );
+        let log = std::fs::read_to_string(&run.outcome.log_path).unwrap();
+        assert!(!log.contains("rate_limited"), "{log}");
+    }
+
     /// A signalled run with no kill marker is still classified: the fix must
     /// not blind mana to a CLI the vendor really did cut off mid-run.
     #[test]
