@@ -103,26 +103,53 @@ impl Observations {
         let mut verdicts: BTreeMap<String, Option<Verdict>> = BTreeMap::new();
         let mut cooldowns: BTreeMap<(String, String), DateTime<Utc>> = BTreeMap::new();
 
+        // (#154) A task that was retried has multiple executor records in the
+        // registry, but exactly one verdict file -- written (and cleared) by
+        // the most recent attempt. Credit only the LAST executor record for
+        // each task_id: the registry is append-only and in dispatch order, so
+        // the last entry for a task_id is provably the one whose attempt the
+        // verdict describes. Every earlier record was superseded.
+        let last_executor: BTreeMap<&str, &str> = registry
+            .records
+            .iter()
+            .filter(|r| r.role == Role::Executor)
+            .fold(BTreeMap::new(), |mut map, r| {
+                map.insert(r.task_id.as_str(), r.agent_id.as_str());
+                map
+            });
+
         for record in &registry.records {
             let key = (record.cli.clone(), record.model.clone());
 
             // Credited to the executor only: the reviewer's own (CLI × model)
             // did not write the code the verdict is about.
             if record.role == Role::Executor {
-                let verdict = verdicts.entry(record.task_id.clone()).or_insert_with(|| {
-                    review::read_verdict(&paths.reviews.join(format!("{}.json", record.task_id)))
+                // (#154) Only the last executor for this task_id earns the
+                // credit. Earlier attempts were superseded; their verdicts were
+                // cleared on relaunch (#153) and no longer describe their work.
+                // Keyed by agent_id (record identity) so same-(cli,model) retries
+                // are also correctly deduplicated.
+                let is_last = last_executor
+                    .get(record.task_id.as_str())
+                    .is_some_and(|&agent_id| agent_id == record.agent_id);
+                if is_last {
+                    let verdict = verdicts.entry(record.task_id.clone()).or_insert_with(|| {
+                        review::read_verdict(
+                            &paths.reviews.join(format!("{}.json", record.task_id)),
+                        )
                         .ok()
-                });
-                if let Some(verdict) = verdict {
-                    let stats = stats.entry(key.clone()).or_default();
-                    match (verdict.verdict, verdict.attribution) {
-                        (Decision::Validated, _) => stats.validated += 1,
-                        (Decision::Rejected, Some(Attribution::Code)) => {
-                            stats.rejected_for_code += 1
+                    });
+                    if let Some(verdict) = verdict {
+                        let stats = stats.entry(key.clone()).or_default();
+                        match (verdict.verdict, verdict.attribution) {
+                            (Decision::Validated, _) => stats.validated += 1,
+                            (Decision::Rejected, Some(Attribution::Code)) => {
+                                stats.rejected_for_code += 1
+                            }
+                            // A rejection blamed on the brief is recorded nowhere:
+                            // it is the PM's failure, not the model's.
+                            (Decision::Rejected, _) => {}
                         }
-                        // A rejection blamed on the brief is recorded nowhere:
-                        // it is the PM's failure, not the model's.
-                        (Decision::Rejected, _) => {}
                     }
                 }
             }
@@ -1247,6 +1274,78 @@ pool_scope = "per-model""#,
         assert_eq!(observations.stats("alpha", "midi").dispatched, 1);
         // Never dispatched reads as zeros, not as absent.
         assert_eq!(observations.stats("alpha", "ghost"), Stats::default());
+    }
+
+    /// #154: when a task is retried on a different (cli, model), only the LAST
+    /// executor record should be credited with the outcome. Before the fix,
+    /// `verdicts` memoised the file read but not the credit -- so every
+    /// executor record for the same task_id incremented validated, handing the
+    /// model that *failed* the task the same score as the one that fixed it.
+    #[test]
+    fn a_retried_task_credits_only_the_last_executor_not_every_attempt() {
+        let fixture = Fixture::new();
+        let entries = vec![shared_pool_entry("alpha")];
+        let now = Utc::now();
+
+        // First attempt: mini tried and (implicitly) was superseded by a retry.
+        fixture.dispatch("a1", "alpha", "mini", "task-retry", Role::Executor);
+        fixture.exit("a1", now, None);
+
+        // Second attempt: nano retried the same task_id and earned the verdict.
+        // The registry is append-only and in dispatch order, so nano's record
+        // is the last executor record for "task-retry" -- this is the one that
+        // should be credited (#154).
+        fixture.dispatch("a2", "alpha", "nano", "task-retry", Role::Executor);
+        fixture.exit("a2", now, None);
+
+        // One verdict file for the task; it describes nano's attempt because
+        // the executor path clears the verdict on every relaunch (#153).
+        fixture.verdict("task-retry", r#"{"verdict":"validated","issues":[]}"#);
+
+        let observations = Observations::gather(&fixture.paths, &entries, now).unwrap();
+
+        // The fix: nano (last executor) gets the credit; mini (first) gets none.
+        assert_eq!(
+            observations.stats("alpha", "nano").validated,
+            1,
+            "nano was the last executor and must be credited"
+        );
+        assert_eq!(
+            observations.stats("alpha", "mini").validated,
+            0,
+            "mini was superseded and must not be credited (#154)"
+        );
+        // dispatched must not change: every attempt is still a dispatch.
+        assert_eq!(observations.stats("alpha", "mini").dispatched, 1);
+        assert_eq!(observations.stats("alpha", "nano").dispatched, 1);
+    }
+
+    /// #154, the half a different-model retry does not exercise: retrying on
+    /// the *same* pair is the ordinary case, and it must still credit the task
+    /// once. Keying the credit on (cli, model) rather than on the record makes
+    /// both attempts match, which is the original bug with a smaller blast
+    /// radius.
+    #[test]
+    fn a_task_retried_on_the_same_pair_is_still_credited_once() {
+        let fixture = Fixture::new();
+        let entries = vec![shared_pool_entry("alpha")];
+        let now = Utc::now();
+
+        fixture.dispatch("a1", "alpha", "mini", "task-same", Role::Executor);
+        fixture.exit("a1", now, None);
+        fixture.dispatch("a2", "alpha", "mini", "task-same", Role::Executor);
+        fixture.exit("a2", now, None);
+
+        fixture.verdict("task-same", r#"{"verdict":"validated","issues":[]}"#);
+
+        let observations = Observations::gather(&fixture.paths, &entries, now).unwrap();
+
+        assert_eq!(
+            observations.stats("alpha", "mini").validated,
+            1,
+            "one task and one verdict is one validation, however many attempts it took"
+        );
+        assert_eq!(observations.stats("alpha", "mini").dispatched, 2);
     }
 
     #[test]
