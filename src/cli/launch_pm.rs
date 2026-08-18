@@ -35,7 +35,7 @@
 //! without paying a real CLI.
 
 use crate::catalog::{Catalog, CliEntry, ToolChannel, substitute};
-use crate::cli::kill::{Verdict, kill_dispatch};
+use crate::cli::kill::kill_dispatch;
 use crate::mcp::runs::{Notification, notifications_path};
 use crate::pm::{self, PmEvent, PmTransport, Resume};
 use crate::project::{
@@ -1371,10 +1371,13 @@ fn sweep_in_flight(home: &Path, project: &str, now: DateTime<Utc>) -> Sweep {
     {
         let agent = short(&dispatch.record.agent_id);
         match kill_dispatch(&paths, dispatch, now) {
-            Ok(report) => match report.verdict {
-                Verdict::Refused(reason) => spared.push(format!("{agent} -- {reason}")),
-                _ => killed.push(agent.to_string()),
-            },
+            Ok(report) => {
+                if let Some(reason) = report.refusal_reason {
+                    spared.push(format!("{agent} -- {reason}"));
+                } else {
+                    killed.push(agent.to_string());
+                }
+            }
             Err(error) => failed.push(format!("{agent} -- {error:#}")),
         }
     }
@@ -4289,6 +4292,47 @@ mod teardown_tests {
         let sweep = sweep_in_flight(tmp.path(), "demo", Utc::now());
         assert!(sweep.lines.is_empty());
         assert!(sweep.clean);
+    }
+
+    /// The sweep processes every dispatch, including continuing past a refused
+    /// one to kill the next: a recycled pid does not stop the teardown.
+    #[test]
+    fn the_sweep_continues_past_a_refused_dispatch_to_process_the_next() {
+        let tmp = tempfile::tempdir().unwrap();
+        // A live process that mana never spawned: pid guard will refuse it.
+        let mut bystander = Sleeper::new(false);
+        // A live process that mana did spawn: should be killed.
+        let mut actual_agent = Sleeper::new(true);
+        seed(tmp.path(), "demo", "agent-refused", bystander.pid());
+        seed(tmp.path(), "demo", "agent-killed", actual_agent.pid());
+
+        let sweep = sweep_in_flight(tmp.path(), "demo", Utc::now());
+
+        // The bystander was not touched.
+        assert!(
+            bystander.still_running(),
+            "bystander was incorrectly signalled"
+        );
+        // But the real agent was killed even though a previous dispatch was refused.
+        assert!(
+            actual_agent.died(),
+            "real agent survived despite sweep continuing"
+        );
+        // The sweep reports both: one refused, one killed.
+        assert!(!sweep.clean);
+        let lines_str = sweep.lines.join("\n");
+        assert!(lines_str.contains("killed 1"), "{lines_str}");
+        assert!(lines_str.contains("left 1 in-flight"), "{lines_str}");
+        // The refused dispatch is still running, the killed one is done.
+        assert_eq!(
+            status_of(tmp.path(), "demo", "agent-refused"),
+            DispatchStatus::Running,
+            "refused dispatch should not be marked finished"
+        );
+        assert_eq!(
+            status_of(tmp.path(), "demo", "agent-killed"),
+            DispatchStatus::Done
+        );
     }
 
     /// The PM skill must describe what a worktree is branched from at relaunch

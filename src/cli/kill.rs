@@ -89,32 +89,18 @@ fn kill_at(
     // function reports a refusal as an outcome because its other caller (the
     // teardown sweep in `cli::launch_pm`) has several dispatches to get
     // through and must not stop at the first pid it may not touch.
-    if let Verdict::Refused(reason) = report.verdict {
+    if let Some(reason) = report.refusal_reason {
         bail!("{reason}");
     }
     Ok(report.lines)
 }
 
-/// What one kill attempt did.
-#[derive(Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// The process group was signalled and the completion recorded.
-    Signalled,
-    /// The pid was already gone. Not an error -- the requested end state is
-    /// the actual one -- and the completion is recorded all the same.
-    AlreadyGone,
-    /// The dispatch had already finished. Nothing signalled, nothing written.
-    AlreadyFinished,
-    /// `status::guard` says this pid is not the dispatch's process, so nothing
-    /// was signalled and nothing was recorded. Carries the whole sentence,
-    /// because both callers say the same thing about it.
-    Refused(String),
-}
-
 /// One kill attempt, told.
 #[derive(Debug)]
 pub struct KillReport {
-    pub verdict: Verdict,
+    /// If the guard refused this kill, the reason. If `Some`, nothing was
+    /// signalled and nothing was recorded.
+    pub refusal_reason: Option<String>,
     /// What happened, in mana's voice, ready to print.
     pub lines: Vec<String>,
 }
@@ -130,7 +116,7 @@ pub struct KillReport {
 ///
 /// `Err` only for a dispatch mana cannot act on at all (no pid was ever
 /// recorded) or a failure to write the completion records. A pid the guard
-/// refuses is a `Verdict`, not an error: see `Verdict::Refused`.
+/// refuses is reported as `refusal_reason` in the report, not an error.
 pub fn kill_dispatch(
     paths: &ProjectPaths,
     dispatch: &Dispatch,
@@ -144,7 +130,7 @@ pub fn kill_dispatch(
         DispatchStatus::Done => {
             let when = dispatch.finished_at.as_deref().unwrap_or("an unknown time");
             return Ok(KillReport {
-                verdict: Verdict::AlreadyFinished,
+                refusal_reason: None,
                 lines: vec![format!("{agent} finished at {when}; nothing to kill")],
             });
         }
@@ -177,7 +163,7 @@ pub fn kill_dispatch(
         )?;
         lines.push(format!("{agent}: recorded as finished"));
         return Ok(KillReport {
-            verdict: Verdict::AlreadyGone,
+            refusal_reason: None,
             lines,
         });
     }
@@ -190,7 +176,7 @@ pub fn kill_dispatch(
         // the same evidence and may still be running.
         Guard::NotOurs(reason) => {
             return Ok(KillReport {
-                verdict: Verdict::Refused(format!(
+                refusal_reason: Some(format!(
                     "refusing to kill {agent}: {reason}. Nothing was signalled and nothing was \
                      recorded. If you are certain, signal it yourself (`kill -9 {pid}`)."
                 )),
@@ -227,7 +213,7 @@ pub fn kill_dispatch(
     )?;
     lines.push(format!("{agent}: recorded as finished"));
     Ok(KillReport {
-        verdict: Verdict::Signalled,
+        refusal_reason: None,
         lines,
     })
 }
