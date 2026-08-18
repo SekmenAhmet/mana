@@ -31,6 +31,12 @@ dist = true
 clap = { version = "4", features = ["derive"] }
 ratatui = "0.30"
 crossterm = "0.29"
+# Backspace deletes one *glyph*, and only Unicode's grapheme rules know where
+# one ends: `String::pop` takes a code point, which turns a ZWJ emoji into a
+# different valid emoji instead of deleting it (#182). The rules are tables,
+# not a heuristic worth hand-rolling. ratatui-core already depends on this
+# crate, so promoting it adds nothing to the graph or to audit.
+unicode-segmentation = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # The `[pm.events]` map is JSONPath, because that is the one query language a
