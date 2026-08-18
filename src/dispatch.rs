@@ -170,8 +170,31 @@ pub fn dispatch_executor(assignment: &Assignment<'_>) -> Result<ExecutorRun> {
 
     let paths = project_paths(project_root, mana_home)?;
     let task_id = &task.frontmatter.id;
+
+    // `worktree::create` builds its path from the task id with this exact
+    // function, so computing it here ahead of `create` costs nothing and
+    // names the real directory -- not a placeholder -- for the checks and the
+    // prompt below.
+    let worktree_path = worktree::worktree_path(mana_home, project_root, task_id);
+    let worktree_path_str = worktree_path.to_string_lossy().into_owned();
+
+    let prompt = fill(
+        template_body(EXECUTOR_TEMPLATE, "executor.md")?,
+        &[
+            ("{worktree}", worktree_path_str.as_str()),
+            ("{task_id}", task_id),
+            ("{task_title}", &task.frontmatter.title),
+            ("{task_body}", &task.body),
+        ],
+    );
+
+    // #170: a sub-agent that cannot be spawned must fail before a worktree
+    // and a branch exist for it. Every catalogue/environment check that can
+    // fail this dispatch therefore runs here, against the worktree's future
+    // path, before `worktree::create` puts anything on disk or in the repo.
+    let prepared = prepare_spawn(entry, model, &prompt, &worktree_path, EXECUTOR_TIMEOUT)?;
+
     let worktree = worktree::create(project_root, mana_home, task_id)?;
-    let worktree_path = worktree.path.to_string_lossy().into_owned();
 
     // A verdict's lifetime is its branch's. `create` above force-resets
     // `mana/<task id>` onto a fresh base, so a verdict written about the
@@ -183,27 +206,17 @@ pub fn dispatch_executor(assignment: &Assignment<'_>) -> Result<ExecutorRun> {
     // the verdict it would have invalidated is still the truth.
     clear_verdict(&paths.reviews.join(format!("{task_id}.json")))?;
 
-    let prompt = fill(
-        template_body(EXECUTOR_TEMPLATE, "executor.md")?,
-        &[
-            ("{worktree}", worktree_path.as_str()),
-            ("{task_id}", task_id),
-            ("{task_title}", &task.frontmatter.title),
-            ("{task_body}", &task.body),
-        ],
-    );
-
-    let outcome = run_dispatch(Plan {
-        agent_id,
-        entry,
-        model,
-        task_id,
-        role: Role::Executor,
-        prompt,
-        cwd: &worktree.path,
-        timeout: EXECUTOR_TIMEOUT,
-        paths: &paths,
-    })?;
+    let outcome = run_dispatch(
+        Plan {
+            agent_id,
+            entry,
+            model,
+            task_id,
+            role: Role::Executor,
+            paths: &paths,
+        },
+        prepared,
+    )?;
 
     Ok(ExecutorRun { outcome, worktree })
 }
@@ -266,17 +279,18 @@ pub fn dispatch_reviewer(
         prompt.push('\n');
     }
 
-    let outcome = run_dispatch(Plan {
-        agent_id,
-        entry,
-        model,
-        task_id,
-        role: Role::Reviewer,
-        prompt,
-        cwd: &worktree.path,
-        timeout: REVIEWER_TIMEOUT,
-        paths: &paths,
-    })?;
+    let prepared = prepare_spawn(entry, model, &prompt, &worktree.path, REVIEWER_TIMEOUT)?;
+    let outcome = run_dispatch(
+        Plan {
+            agent_id,
+            entry,
+            model,
+            task_id,
+            role: Role::Reviewer,
+            paths: &paths,
+        },
+        prepared,
+    )?;
 
     Ok(ReviewerRun {
         outcome,
@@ -285,52 +299,75 @@ pub fn dispatch_reviewer(
 }
 
 /// Everything one dispatch needs that the two roles disagree about. A struct
-/// rather than eight positional parameters, since half of them are strings
-/// and swapping two would compile.
+/// rather than six positional parameters, since half of them are strings and
+/// swapping two would compile.
 struct Plan<'a> {
     agent_id: &'a str,
     entry: &'a CliEntry,
     model: &'a str,
     task_id: &'a str,
     role: Role,
-    prompt: String,
-    /// Where the process runs: the task worktree for both roles.
-    cwd: &'a Path,
-    timeout: Duration,
     paths: &'a ProjectPaths,
 }
 
-/// Spawn, observe, record. The one place a sub-agent process is created.
-fn run_dispatch(plan: Plan<'_>) -> Result<DispatchOutcome> {
+/// Everything about a dispatch that can fail before a process is spawned:
+/// catalogue data (a failure signature, an argv template) and the local
+/// environment (is the CLI even on PATH). Built once, ahead of the spawn, so
+/// `dispatch_executor` can run it before `worktree::create` and satisfy #170
+/// -- a sub-agent that cannot be spawned must fail before a worktree and a
+/// branch exist for it. `dispatch_reviewer` creates no worktree and gets no
+/// benefit from the reordering, but shares this preparation step anyway: one
+/// path for "can this dispatch even run" is cheaper to keep correct than two.
+struct PreparedSpawn {
+    spec: SpawnSpec,
+    signatures: Vec<Signature>,
+}
+
+fn prepare_spawn(
+    entry: &CliEntry,
+    model: &str,
+    prompt: &str,
+    cwd: &Path,
+    timeout: Duration,
+) -> Result<PreparedSpawn> {
     // Compiled before the spawn, not after: a typo in a catalogue regex is a
     // data bug, and finding it only once a real agent has already burned a
     // quota slot would be the most expensive possible moment to learn about it.
-    let signatures = compile_signatures(&plan.entry.failure)
-        .with_context(|| format!("{}: invalid failure signature", plan.entry.cli.id))?;
+    let signatures = compile_signatures(&entry.failure)
+        .with_context(|| format!("{}: invalid failure signature", entry.cli.id))?;
 
-    let args = build_argv(plan.entry, plan.model, &plan.prompt, plan.cwd)?;
-    let prompt_delivery = PromptDelivery::from_mode(plan.entry.subagent.prompt, &plan.prompt)?;
-
-    let agent_id = plan.agent_id;
-    let log_path = plan.paths.logs.join(format!("{agent_id}.jsonl"));
+    let args = build_argv(entry, model, prompt, cwd)?;
+    let prompt_delivery = PromptDelivery::from_mode(entry.subagent.prompt, prompt)?;
 
     // Resolved here rather than inside the spawner: `which` answers the same
     // question `mana doctor` and the PM's routing table ask, and a sub-agent
     // that cannot be spawned must fail before a worktree and a log record
     // exist for it. See `CliMeta::resolve`.
-    let bin = plan
-        .entry
+    let bin = entry
         .cli
         .resolve()
-        .with_context(|| format!("cannot dispatch to {}", plan.entry.cli.name))?;
+        .with_context(|| format!("cannot dispatch to {}", entry.cli.name))?;
 
-    let spec = SpawnSpec {
-        bin,
-        args,
-        cwd: plan.cwd.to_path_buf(),
-        prompt: prompt_delivery,
-        timeout: plan.timeout,
-    };
+    Ok(PreparedSpawn {
+        spec: SpawnSpec {
+            bin,
+            args,
+            cwd: cwd.to_path_buf(),
+            prompt: prompt_delivery,
+            timeout,
+        },
+        signatures,
+    })
+}
+
+/// Spawn, observe, record. The one place a sub-agent process is created.
+/// Every check that could still fail the dispatch has already run, in
+/// `prepare_spawn`.
+fn run_dispatch(plan: Plan<'_>, prepared: PreparedSpawn) -> Result<DispatchOutcome> {
+    let PreparedSpawn { spec, signatures } = prepared;
+
+    let agent_id = plan.agent_id;
+    let log_path = plan.paths.logs.join(format!("{agent_id}.jsonl"));
 
     // The registry record carries the pid, which exists only once the process
     // does -- hence writing it from `on_spawn` rather than before or after the
@@ -1559,6 +1596,74 @@ mod dispatch_tests {
         assert!(run.outcome.stderr.contains("something else broke"));
         let log = std::fs::read_to_string(&run.outcome.log_path).unwrap();
         assert!(!log.contains("failure_means"), "{log}");
+
+        // #170's opposite direction: a run that *did* spawn keeps its worktree
+        // and branch even though it exited non-zero -- that quota slot was
+        // spent and the executor's (however useless) work lives there.
+        assert!(
+            run.worktree.path.exists(),
+            "a spawned run's worktree was removed"
+        );
+        // `+` rather than `*` marks a branch checked out in another worktree
+        // (ours), not the current one.
+        assert_eq!(
+            fixture.git(&["branch", "--list", &run.worktree.branch]),
+            format!("+ {}", run.worktree.branch)
+        );
+    }
+
+    /// #170: the CLI resolution check in `prepare_spawn` is one of the
+    /// pre-spawn steps that must fail before `worktree::create` runs.
+    #[test]
+    fn a_dispatch_whose_cli_does_not_resolve_leaves_no_worktree_or_branch() {
+        let fixture = Fixture::new();
+        let entry = fixture_entry("mana-fixture-cli-does-not-exist", PLAIN_SUBAGENT, "");
+
+        let error = dispatch_executor(&assign(&agent_id(), &entry, &task(), &fixture)).unwrap_err();
+
+        assert!(error.to_string().contains("cannot dispatch to"), "{error}");
+        let worktree_path = worktree::worktree_path(&fixture.mana_home, &fixture.project, TASK_ID);
+        assert!(
+            !worktree_path.exists(),
+            "a dispatch that could not resolve its CLI left a worktree behind"
+        );
+        assert!(
+            fixture
+                .git(&["branch", "--list", &format!("mana/{TASK_ID}")])
+                .is_empty(),
+            "a dispatch that could not resolve its CLI left a branch behind"
+        );
+    }
+
+    /// #170: an unusable catalogue regex is caught by `prepare_spawn`'s call to
+    /// `compile_signatures`, also before `worktree::create` runs.
+    #[test]
+    fn a_dispatch_with_an_unusable_failure_regex_leaves_no_worktree_or_branch() {
+        let fixture = Fixture::new();
+        let bin = fixture.script("exec-cli", COMMITTING_EXECUTOR);
+        let entry = fixture_entry(
+            &bin,
+            PLAIN_SUBAGENT,
+            "[[failure]]\nmeans = \"rate_limited\"\nstdout_regex = \"rate(limit\"\n",
+        );
+
+        let error = dispatch_executor(&assign(&agent_id(), &entry, &task(), &fixture)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("invalid failure signature"),
+            "{error}"
+        );
+        let worktree_path = worktree::worktree_path(&fixture.mana_home, &fixture.project, TASK_ID);
+        assert!(
+            !worktree_path.exists(),
+            "a dispatch with an unusable failure regex left a worktree behind"
+        );
+        assert!(
+            fixture
+                .git(&["branch", "--list", &format!("mana/{TASK_ID}")])
+                .is_empty(),
+            "a dispatch with an unusable failure regex left a branch behind"
+        );
     }
 
     #[test]
