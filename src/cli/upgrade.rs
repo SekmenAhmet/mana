@@ -568,6 +568,69 @@ mod tests {
         );
     }
 
+    /// `release.yml` holds `contents: write` and is triggered by pushing a
+    /// tag, so the tag name is attacker-controlled input right up until the
+    /// `guard` job's own name check runs. Interpolating it straight into a
+    /// `run:` block (`${{ github.ref_name }}` or a `needs.plan.outputs.tag*`
+    /// that carries it) turns that name into shell source text instead of
+    /// data — mana issue #176. `outputs:`/`if:`/`with:`/`env:` contexts are
+    /// not shell, so those may keep the expression; only `run:` bodies may
+    /// not.
+    #[test]
+    fn release_workflow_does_not_interpolate_tag_derived_expressions_in_run_blocks() {
+        let workflow = include_str!("../../.github/workflows/release.yml");
+        let banned = [
+            "github.ref_name",
+            "needs.plan.outputs.tag",
+            "needs.plan.outputs.tag-flag",
+        ];
+
+        let mut in_block_run = false;
+        let mut body_indent: Option<usize> = None;
+
+        for line in workflow.lines() {
+            let trimmed = line.trim_start();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let indent = line.len() - trimmed.len();
+
+            if in_block_run {
+                match body_indent {
+                    None => body_indent = Some(indent),
+                    Some(bi) if indent < bi => {
+                        in_block_run = false;
+                        body_indent = None;
+                    }
+                    _ => {}
+                }
+            }
+
+            if in_block_run {
+                for expr in banned {
+                    assert!(
+                        !line.contains(expr),
+                        "run: block interpolates `{expr}` directly: {line}"
+                    );
+                }
+            } else {
+                let key = trimmed.strip_prefix("- ").unwrap_or(trimmed);
+                if let Some(rest) = key.strip_prefix("run:") {
+                    for expr in banned {
+                        assert!(
+                            !rest.contains(expr),
+                            "run: block interpolates `{expr}` directly: {line}"
+                        );
+                    }
+                    if rest.trim() == "|" {
+                        in_block_run = true;
+                        body_indent = None;
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn archive_name_matches_the_recorded_dist_plan_for_every_target() {
         let mut produced: Vec<String> = configured_targets()

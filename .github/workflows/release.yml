@@ -56,6 +56,12 @@ jobs:
     name: tagged commit is on main
     runs-on: "ubuntu-22.04"
     steps:
+      - name: Refuse a tag whose name is not well-formed
+        run: |
+          if ! echo "$GITHUB_REF_NAME" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.]+)?$'; then
+            echo "::error::tag $GITHUB_REF_NAME is not a well-formed version (expected v<major>.<minor>.<patch> with an optional pre-release suffix) — refusing to release"
+            exit 1
+          fi
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
           # merge-base needs the real history of both the tag and main; the
@@ -100,8 +106,15 @@ jobs:
       # (PRs run on the *source* but secrets are usually on the *target* -- that's *good*
       # but also really annoying to build CI around when it needs secrets to work right.)
       - id: plan
+        env:
+          TAG: ${{ github.ref_name }}
+          IS_NOT_PR: ${{ !github.event.pull_request }}
         run: |
-          dist ${{ (!github.event.pull_request && format('host --steps=create --tag={0}', github.ref_name)) || 'plan' }} --output-format=json > plan-dist-manifest.json
+          if [ "$IS_NOT_PR" = "true" ]; then
+            dist host --steps=create --tag="$TAG" --output-format=json > plan-dist-manifest.json
+          else
+            dist plan --output-format=json > plan-dist-manifest.json
+          fi
           echo "dist ran successfully"
           cat plan-dist-manifest.json
           echo "manifest=$(jq -c "." plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -164,9 +177,16 @@ jobs:
         run: |
           ${{ matrix.packages_install }}
       - name: Build artifacts
+        shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
           # Actually do builds and make zips and whatnot
-          dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          if [ -n "$TAG_FLAG" ]; then
+            dist build "$TAG_FLAG" --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          else
+            dist build --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
+          fi
           echo "dist ran successfully"
       - id: cargo-dist
         name: Post-build
@@ -218,8 +238,14 @@ jobs:
           merge-multiple: true
       - id: cargo-dist
         shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist build ${{ needs.plan.outputs.tag-flag }} --output-format=json "--artifacts=global" > dist-manifest.json
+          if [ -n "$TAG_FLAG" ]; then
+            dist build "$TAG_FLAG" --output-format=json "--artifacts=global" > dist-manifest.json
+          else
+            dist build --output-format=json "--artifacts=global" > dist-manifest.json
+          fi
           echo "dist ran successfully"
 
           # Parse out what we just built and upload it to scratch storage
@@ -268,8 +294,14 @@ jobs:
           merge-multiple: true
       - id: host
         shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
         run: |
-          dist host ${{ needs.plan.outputs.tag-flag }} --steps=upload --steps=release --output-format=json > dist-manifest.json
+          if [ -n "$TAG_FLAG" ]; then
+            dist host "$TAG_FLAG" --steps=upload --steps=release --output-format=json > dist-manifest.json
+          else
+            dist host --steps=upload --steps=release --output-format=json > dist-manifest.json
+          fi
           echo "artifacts uploaded and released successfully"
           cat dist-manifest.json
           echo "manifest=$(jq -c "." dist-manifest.json)" >> "$GITHUB_OUTPUT"
@@ -296,11 +328,12 @@ jobs:
           ANNOUNCEMENT_TITLE: "${{ fromJson(steps.host.outputs.manifest).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(steps.host.outputs.manifest).announcement_github_body }}"
           RELEASE_COMMIT: "${{ github.sha }}"
+          TAG: "${{ needs.plan.outputs.tag }}"
         run: |
           # Write and read notes from a file to avoid quoting breaking things
           echo "$ANNOUNCEMENT_BODY" > $RUNNER_TEMP/notes.txt
 
-          gh release create "${{ needs.plan.outputs.tag }}" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
+          gh release create "$TAG" --target "$RELEASE_COMMIT" $PRERELEASE_FLAG --title "$ANNOUNCEMENT_TITLE" --notes-file "$RUNNER_TEMP/notes.txt" artifacts/*
 
   announce:
     needs:
