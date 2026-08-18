@@ -163,7 +163,7 @@ meant to be rare, the way adding a new database driver is rare.
 
 | CLI | PM driver | Tool channel | Sub-agent support | Notes |
 |---|---|---|---|---|
-| **Claude Code** (`claude`) | `stream` | `mcp` | yes, unlimited concurrency | PM is mechanically read-only: `--allowedTools mcp__mana__*,Read,Grep,Glob` is verified to block Edit/Write at the tool layer, not just by instruction. |
+| **Claude Code** (`claude`) | `stream` | `mcp` | yes, unlimited concurrency | The PM runs under `--dangerously-skip-permissions`, so the no-code rule rests on the skill text here as it does everywhere else. This entry once carried `--allowedTools mcp__mana__*,Read,Grep,Glob`, the only mechanical enforcement any catalogued CLI offered; it was dropped on 2026-08-18 because it also cost the PM the reads the loop needs at either end (an issue to plan from, a branch to land). |
 | **Antigravity** (`agy`) | `oneshot-continue` | `sentinel` | yes, max 1 concurrent — two parallel dispatches crashed within 8s in testing. The cap counts sub-agent dispatches only, so while agy is the PM its own turn plus one agy sub-agent are already two agy processes; mana permits that and builds nothing to avoid it, so route sub-agents to another CLI. | No MCP or ACP surface exists on this CLI, and no permission-allowlist flag either, so the no-code rule rests on the skill text alone — though print mode happens to auto-deny every tool permission request, which blocks writes as a side effect of blocking reads too: an agy PM cannot inspect the repository and plans from what you paste into the chat. The PM can't read its own skill file here, so the role text is inlined straight into the activation message instead. No quota failure has ever been observed from it, so no cooldown signature is catalogued yet. |
 | **GitHub Copilot CLI** (`copilot`) | `acp` | `mcp` (attached over argv, not the native ACP path) | yes, max 1 concurrent (unmeasured; conservative default) | ACP's `session/new` rejects mana's stdio MCP server outright (`Rejecting non-http/sse MCP server`); `--additional-mcp-config @<file>` is the path that actually works. Its model list could not be measured — the only account available had already exhausted its monthly quota — so only `auto` is catalogued. |
 | **opencode** | `acp` | `mcp` (native, via `session/new`'s `mcpServers`) | yes, unlimited — two in parallel measured clean | Degraded: the PM is **not** mechanically read-only here. In testing it ran opencode's own `bash` and `read` tools directly, with no permission prompt, even though mana advertised no filesystem or terminal capability at the ACP handshake. The no-code rule rests on the skill text alone. |
@@ -489,10 +489,16 @@ Pre-approving permissions for an unattended agent is a bet on the CLI and the
 model; the worktree does not cover it.
 
 The PM is a different story, and deliberately not as clean: it needs to read
-the project to plan, but should never write code, and how well that is
-actually enforced varies by CLI. Claude gives mana a real mechanism —
-`--allowedTools mcp__mana__*,Read,Grep,Glob` — verified to block Edit/Write at
-the tool layer, not just by instruction. agy has no allowlist flag at all, but
+the project to plan, but should never write code, and today nothing enforces
+that on any CLI. Claude is the only one that ever offered a mechanism —
+`--allowedTools mcp__mana__*,Read,Grep,Glob`, verified to block Edit/Write at
+the tool layer — and mana no longer uses it: the same allowlist blocked
+everything else a planner does that is not writing code, so the PM could
+neither read a GitHub issue nor land a validated branch, and both ends of the
+loop fell back on the user. The trade is deliberate and it is a real loss:
+until enforcement returns as a list of what the PM *may* do, an expensive PM
+that starts implementing is caught by nothing but its own skill text.
+agy has no allowlist flag at all, but
 its print mode happens to auto-deny every tool permission request, which
 blocks writes as a side effect of blocking everything — `view_file`,
 `grep_search` and `run_command` were each denied in testing, so an agy PM

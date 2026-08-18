@@ -325,18 +325,14 @@ url = "https://example.invalid/alpha"
         let claude = catalog.get("claude").unwrap();
         assert_eq!(claude.pm.driver, PmDriver::Stream);
         assert_eq!(claude.tools.channel, ToolChannel::Mcp);
-        // The PM's no-code rule is data, not code (design §6). Assert the
-        // shape rather than the exact string: what matters is that the
-        // allowlist reaches mana's own tools and grants nothing that writes.
-        assert_eq!(claude.pm.permission_args[0], "--allowedTools");
-        let allowed = &claude.pm.permission_args[1];
-        assert!(allowed.contains("mcp__mana__*"), "{allowed}");
-        for writing in ["Edit", "Write", "Bash"] {
-            assert!(
-                !allowed.contains(writing),
-                "the PM may {writing}: {allowed}"
-            );
-        }
+        // No catalogued CLI restricts its PM any more: claude's allowlist was
+        // dropped on 2026-08-18 so the PM could reach the issues and the
+        // branches the loop needs at either end. The rule this pins is not
+        // "the PM is restricted" but the one `mana doctor` reads -- an
+        // auto-approve flag must never be filed under `permission_args`,
+        // because an entry with a non-empty one is reported as enforcing
+        // something.
+        assert!(claude.pm.permission_args.is_empty());
         assert_eq!(claude.subagent.max_concurrent, 0);
         // `mana launch claude --continue`, measured on this machine twice
         // (see the entry's notes). One flag, appended to the argv above.
