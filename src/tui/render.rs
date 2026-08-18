@@ -311,9 +311,23 @@ fn wrap(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+/// The graph pane: one row per dispatch, windowed to the newest that fit.
+///
+/// The window is the fix for #161 and not a design: `Paragraph` renders from
+/// the top and drops whatever runs past the pane, silently. There is one node
+/// per dispatch mana ever made for this project -- `subagents.jsonl` is
+/// append-only across sessions -- and `build_nodes` sorts them oldest-first,
+/// so an unwindowed pane showed finished history and hid the running node the
+/// operator opened Ctrl+G for. Keeping the tail is the same policy the chat
+/// pane already has (`visible_lines`), which is the point: two panes in one
+/// frame should not disagree about which end of a list matters.
+///
+/// Deliberately still a list. #152 wants this pane rebuilt around the real
+/// dependency DAG; that rework inherits the overflow unless the windowing
+/// lands first, and it is free to choose its own window then.
 fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
     let running = running_frame(app.started_at.elapsed(), SPINNER_INTERVAL);
-    let rows: Vec<Line> = if nodes.is_empty() {
+    let mut rows: Vec<Line> = if nodes.is_empty() {
         vec![Line::styled("no dispatches yet", theme::GRAPH_EMPTY)]
     } else {
         nodes
@@ -335,6 +349,8 @@ fn draw_graph(frame: &mut Frame, app: &App, nodes: &[GraphNode], area: Rect) {
             })
             .collect()
     };
+    let height = inner_size(area).1;
+    rows.drain(..rows.len().saturating_sub(height));
     frame.render_widget(
         Paragraph::new(rows).block(
             Block::default()
@@ -979,6 +995,34 @@ mod tests {
         app.toggle_graph();
         let rendered = dump(&screen(&app, &[], 80, 10));
         assert!(rendered.contains("no dispatches yet"), "{rendered}");
+    }
+
+    /// `subagents.jsonl` is append-only across every session and `build_nodes`
+    /// sorts it oldest-first, so an unwindowed `Paragraph` shows the oldest
+    /// finished work and hides the running node the operator pressed Ctrl+G
+    /// to watch (#161). The chat pane in the same frame already windows to the
+    /// newest; the graph pane has to agree.
+    #[test]
+    fn the_graph_pane_keeps_the_newest_nodes_when_it_runs_out_of_rows() {
+        let mut app = App::new("Claude Code");
+        app.toggle_graph();
+        let nodes: Vec<GraphNode> = (0..10)
+            .map(|index| {
+                node(
+                    Role::Executor,
+                    &format!("node-{index:02}"),
+                    Some(Status::Done),
+                    None,
+                )
+            })
+            .collect();
+
+        // Height 12 -> 8 rows of pane -> 6 rows inside the border, for 10 nodes.
+        let rendered = dump(&screen(&app, &nodes, 100, 12));
+        assert!(rendered.contains("node-09"), "{rendered}");
+        assert!(rendered.contains("node-04"), "{rendered}");
+        assert!(!rendered.contains("node-03"), "{rendered}");
+        assert!(!rendered.contains("node-00"), "{rendered}");
     }
 
     /// The newest line is the one that must always be on screen -- the reason
