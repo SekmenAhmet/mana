@@ -41,7 +41,7 @@ use crate::pm::{self, PmEvent, PmTransport, Resume};
 use crate::project::{
     ProjectPaths, ensure_project_structure, mana_home, project_name_from_dir, resolve_project_paths,
 };
-use crate::sentinel::{Sentinel, ToolLine};
+use crate::sentinel::{MAX_TOOL_CYCLES, Sentinel, ToolLine};
 use crate::session_lock;
 use crate::status::{self, DispatchStatus, short};
 use crate::tui::app::{App, Source};
@@ -632,6 +632,16 @@ struct Session {
     /// so `finish_session` can say them again where they survive, and count
     /// them into the exit status.
     lost: Vec<String>,
+    /// How many sentinel tool cycles have turned in a row with nothing from
+    /// outside the loop. Bounded by `MAX_TOOL_CYCLES` -- the rule is stated
+    /// where the constant is defined (`sentinel::MAX_TOOL_CYCLES`, #191).
+    ///
+    /// It lives on the session because the loop it bounds is the session's:
+    /// this is the one piece of state that says whether the PM is talking to
+    /// mana or to itself. Reset by `send_typed` (the operator said something),
+    /// by `poll_notifications` (a dispatch reported back) and by any PM
+    /// message that carried no block.
+    tool_cycles: u32,
 }
 
 /// One turn waiting its place.
@@ -672,6 +682,10 @@ impl Session {
     /// echo itself is `apply_app_event`'s, because that is the only place that
     /// knows somebody pressed Enter.
     fn send_typed(&mut self, text: &str) -> Result<Delivery> {
+        // The operator is the outside of the loop: whatever the PM was doing
+        // to itself, it is now answering a human, and the cycle count starts
+        // over (#191).
+        self.tool_cycles = 0;
         self.deliver(text, true)
     }
 
@@ -788,6 +802,10 @@ impl Session {
                 TailEvent::Finished(notification) => notification_message(&notification),
                 TailEvent::Gap(message) => message,
             };
+            // A dispatch reporting back is news from outside the loop too:
+            // the PM has a real reason to call tools again, so the cycle
+            // count starts over (#191).
+            self.tool_cycles = 0;
             self.send_internal(&message)?;
             sent.push(message);
         }
@@ -804,10 +822,30 @@ impl Session {
         // The borrow of `sentinel` ends with this match, which is what leaves
         // `self.pm` free to take the reply turn below.
         let outcome = match &self.sentinel {
-            Some(sentinel) => sentinel.handle(text),
             None => return ToolPass::default(),
+            // Past the bound the message is still scanned -- the operator gets
+            // the PM's words with the machinery taken out, as always -- but
+            // nothing in it runs (#191).
+            Some(sentinel) if self.tool_cycles >= MAX_TOOL_CYCLES => sentinel.decline(text),
+            Some(sentinel) => sentinel.handle(text),
         };
         let mut log = outcome.log;
+        let mut reply = outcome.reply;
+        if reply.is_none() {
+            // The PM answered without asking for anything: the loop stopped
+            // turning by itself, so the count starts over.
+            self.tool_cycles = 0;
+        } else {
+            self.tool_cycles += 1;
+            // Told once, not once per turn. `MAX_TOOL_CYCLES + 1` is the cycle
+            // the bound fired on and the one that carries the explanation;
+            // past it mana says nothing and injects nothing, and a cycle with
+            // no injected turn has nothing left to turn it.
+            if self.tool_cycles > MAX_TOOL_CYCLES + 1 {
+                reply = None;
+                log.clear();
+            }
+        }
         // The results themselves never render: they are a tool's answer to the
         // PM, often a page of JSON, and the operator gets `outcome.log`'s one
         // compact line per call instead.
@@ -816,7 +854,7 @@ impl Session {
         // one while it is still answering is exactly the race the queue exists
         // to remove. It leaves on `TurnEnded`, which on the one CLI that uses
         // this channel is the very next event.
-        if let Some(reply) = outcome.reply
+        if let Some(reply) = reply
             && let Err(error) = self.send_internal(&reply)
         {
             // Almost always a PM that just died. Reported where the operator
@@ -967,6 +1005,7 @@ fn prepare_session(
         turn_open: false,
         tracks_turns,
         lost: Vec::new(),
+        tool_cycles: 0,
     };
     // Through `send_internal` rather than straight down the transport, so the
     // rule holds where it matters most: this message is a briefing mana wrote,
@@ -3318,6 +3357,131 @@ mod smoke {
         );
         assert!(!shown.contains("\"agents\""), "{shown}");
         assert!(!shown.contains("tool results"), "{shown}");
+        session.shutdown().unwrap();
+    }
+
+    /// A PM that never closes a turn and never answers, so the whole cycle
+    /// under test is the one mana drives: `apply_tools` in, injected turn out.
+    /// The 449-turn runaway ran exactly here, and a stub that only ever reads
+    /// reproduces it without paying for 449 sub-agents.
+    fn mute_sentinel_session(fixture: &Fixture) -> Session {
+        let pm = fixture.home.join("mute-pm");
+        std::fs::write(&pm, "#!/bin/sh\nwhile IFS= read -r line; do :; done\n").unwrap();
+        std::fs::set_permissions(&pm, std::fs::Permissions::from_mode(0o755)).unwrap();
+        fixture.write_override_on(&pm.to_string_lossy(), "sentinel");
+        prepare_session(&fixture.home, &fixture.project, "fixture", false).unwrap()
+    }
+
+    /// How many blocks that pass actually executed.
+    fn executed(pass: &ToolPass) -> usize {
+        pass.log
+            .iter()
+            .filter(|line| line.text.starts_with("⚙"))
+            .count()
+    }
+
+    /// The test that would have caught 449 (#191).
+    ///
+    /// A PM stub that re-emits the same executable block on every turn, driven
+    /// for far more cycles than the bound allows. What is asserted is the
+    /// number of *executions*, not that some message was printed: the cost of
+    /// this failure was paid in tool calls.
+    #[test]
+    fn a_pm_that_re_emits_the_same_block_for_ever_is_stopped_after_a_bounded_number_of_cycles() {
+        let fixture = Fixture::new();
+        let mut session = mute_sentinel_session(&fixture);
+        let nonce = session.sentinel.as_ref().unwrap().nonce().to_string();
+        let message =
+            format!("Dispatching again.\n```mana:{nonce}\n{{\"tool\": \"list_agents\"}}\n```");
+
+        let mut runs = 0;
+        let mut injected = 0;
+        for _ in 0..200 {
+            let before = session.queued();
+            runs += executed(&session.apply_tools(&message));
+            injected += session.queued() - before;
+        }
+        assert_eq!(
+            runs, MAX_TOOL_CYCLES as usize,
+            "200 identical turns executed {runs} blocks"
+        );
+        // ...and the injected turns stopped too, which is what actually ends
+        // the cycle: the bound's own message is the last thing mana writes.
+        assert_eq!(injected, MAX_TOOL_CYCLES as usize + 1);
+
+        // Recoverable: the operator says one word and the channel is live
+        // again. A bound that gagged it for the rest of the session would
+        // leave a PM that looks like it works and does nothing.
+        session
+            .send_typed("stop dispatching, what is going on?")
+            .unwrap();
+        assert_eq!(executed(&session.apply_tools(&message)), 1);
+        session.shutdown().unwrap();
+    }
+
+    /// The bound is on the runaway shape, not on how much work a PM does: a
+    /// message with three blocks runs three, and the next message runs its own.
+    #[test]
+    fn several_blocks_in_one_message_and_the_message_after_it_all_execute() {
+        let fixture = Fixture::new();
+        let mut session = mute_sentinel_session(&fixture);
+        let nonce = session.sentinel.as_ref().unwrap().nonce().to_string();
+        let block = format!("```mana:{nonce}\n{{\"tool\": \"list_agents\"}}\n```");
+        let message = format!("Three at once.\n{block}\n{block}\n{block}");
+
+        assert_eq!(executed(&session.apply_tools(&message)), 3);
+        // The results came back, the PM read them and dispatched three more:
+        // one cycle each, six executions, nothing declined.
+        let second = session.apply_tools(&message);
+        assert_eq!(executed(&second), 3);
+        assert!(
+            !second.log.iter().any(|line| line.failed),
+            "{:?}",
+            second.log
+        );
+        session.shutdown().unwrap();
+    }
+
+    /// When it fires the PM is told once, in its own turn, and the operator
+    /// sees a line about it -- the whole point being a failure mode that looks
+    /// busy on screen.
+    #[test]
+    fn the_bound_tells_the_pm_once_and_says_so_in_the_pane() {
+        let fixture = Fixture::new();
+        let mut session = mute_sentinel_session(&fixture);
+        let nonce = session.sentinel.as_ref().unwrap().nonce().to_string();
+        let message = format!("Again.\n```mana:{nonce}\n{{\"tool\": \"list_agents\"}}\n```");
+
+        let mut pane = Vec::new();
+        for _ in 0..(MAX_TOOL_CYCLES + 5) {
+            let pass = session.apply_tools(&message);
+            // The PM's words are still rendered, bound or no bound.
+            assert_eq!(pass.prose.as_deref(), Some("Again."));
+            pane.extend(pass.log.into_iter().filter(|line| line.failed));
+        }
+
+        // One line in the pane, in mana's voice, naming the bound.
+        assert_eq!(pane.len(), 1, "{pane:?}");
+        assert!(
+            pane[0].text.starts_with("[mana] tool cycle bound reached"),
+            "{}",
+            pane[0].text
+        );
+
+        // ...and one turn to the PM, saying its blocks were not executed and
+        // what starts the count over.
+        let told: Vec<&Queued> = session
+            .queue
+            .iter()
+            .filter(|queued| queued.text.contains("did not execute"))
+            .collect();
+        assert_eq!(told.len(), 1, "{told:?}");
+        assert!(
+            !told[0].typed,
+            "the bound is mana talking, not the operator"
+        );
+        assert!(told[0].text.starts_with("[mana]"), "{}", told[0].text);
+        assert!(told[0].text.contains("count resets"), "{}", told[0].text);
         session.shutdown().unwrap();
     }
 
