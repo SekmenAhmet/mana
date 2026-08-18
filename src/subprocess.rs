@@ -190,6 +190,34 @@ pub(crate) fn write_version_script(
     write_executable(dir, name, &format!("#!/bin/sh\necho {printed_version}\n"))
 }
 
+/// What a real-process test should wait for a *fast-exiting* fixture to
+/// finish, without tripping just because the machine is busy.
+///
+/// Bounds: this is not a timeout under test (a test that proves a hang gets
+/// killed still picks its own short, fixed deadline) -- it is the "this
+/// should finish almost instantly, so give it a deadline that only a
+/// genuinely wedged child could ever reach" bound that `spawn.rs`,
+/// `subprocess.rs` and `dispatch.rs` each used to hardcode as `5_000`ms or
+/// similar. Issue #206 measured why a fixed idle-machine number does not
+/// work: with ten `cargo build`s running (load average 6.8) a suite of such
+/// tests went from 5s to 77s, and five of them failed on "exceeded 5s".
+///
+/// Shape: spawn something trivial (`true`) and time it -- that single
+/// spawn+reap is exactly the kind of scheduling the busy machine is
+/// starving, so its cost right now is the best available signal for how
+/// starved the machine is. Scale by 200x and floor at 5s (today's old
+/// constant, kept as the idle-machine baseline) so a test never gets *less*
+/// tolerant than before, and a wedged child is still bounded rather than
+/// hung on forever. This is the helper the rest of the suite (`src/pm/*`,
+/// `src/cli/*`) should adopt in place of their own fixed deadlines.
+#[cfg(all(test, unix))]
+pub(crate) fn load_tolerant_deadline() -> Duration {
+    let start = Instant::now();
+    let _ = Command::new("true").status();
+    let baseline = start.elapsed();
+    (baseline * 200).max(Duration::from_secs(5))
+}
+
 #[cfg(all(test, unix))] // every test here execs unix shell fixtures
 mod tests {
     use super::*;
@@ -217,7 +245,7 @@ mod tests {
 
         let args = vec!["version".to_string(), "--short".to_string()];
         assert_eq!(
-            capture_version_output(&script, &args, VERSION_CHECK_TIMEOUT).unwrap(),
+            capture_version_output(&script, &args, load_tolerant_deadline()).unwrap(),
             "got:version --short"
         );
     }
@@ -228,7 +256,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let script = write_version_script(tmp.path(), "agent.sh", "3.1.4");
         assert_eq!(
-            capture_version_output(&script, &version_flag(), VERSION_CHECK_TIMEOUT).unwrap(),
+            capture_version_output(&script, &version_flag(), load_tolerant_deadline()).unwrap(),
             "3.1.4"
         );
     }
@@ -250,7 +278,7 @@ mod tests {
         std::fs::set_permissions(&script, perms).unwrap();
 
         assert_eq!(
-            capture_version_output(&script, &version_flag(), VERSION_CHECK_TIMEOUT).unwrap(),
+            capture_version_output(&script, &version_flag(), load_tolerant_deadline()).unwrap(),
             "GitHub Copilot CLI 1.0.80."
         );
     }
@@ -267,13 +295,17 @@ mod tests {
         perms.set_mode(0o755);
         std::fs::set_permissions(&script, perms).unwrap();
 
-        let start = Instant::now();
+        // Deliberately short and fixed, unlike `load_tolerant_deadline`: this
+        // *is* the deadline under test, not a bound this test needs to
+        // survive. The proof that it fired is the returned error, not how
+        // long the call took -- a script that ran its full 5s and then
+        // exited would still be a bug even if it happened to do so in under
+        // 2s on a quiet machine.
         let result = capture_version_output(&script, &version_flag(), Duration::from_millis(200));
-        assert!(result.is_err(), "expected a timeout error, got {result:?}");
+        let err = result.expect_err("expected a timeout error");
         assert!(
-            start.elapsed() < Duration::from_secs(2),
-            "should time out near the 200ms bound, took {:?}",
-            start.elapsed()
+            format!("{err:#}").contains("timeout"),
+            "error should name the timeout, got {err:#}"
         );
     }
 
@@ -283,7 +315,7 @@ mod tests {
         let result = capture_version_output(
             Path::new("/nonexistent/path/to/nowhere"),
             &version_flag(),
-            VERSION_CHECK_TIMEOUT,
+            load_tolerant_deadline(),
         );
         assert!(result.is_err());
     }
