@@ -244,6 +244,7 @@ pub fn diagnose(options: &Options<'_>) -> Result<Report> {
     if let Some((root, paths, name)) = &project {
         project_section(
             options,
+            root,
             paths,
             name,
             &dispatches,
@@ -618,6 +619,7 @@ fn args_line(args: &[String]) -> String {
 
 fn project_section(
     options: &Options<'_>,
+    project_root: &Path,
     paths: &ProjectPaths,
     name: &str,
     dispatches: &[Dispatch],
@@ -656,10 +658,15 @@ fn project_section(
         }
     }
     if stale > 0 {
+        // Qualified with the project, because `mana kill` resolves against the
+        // *working* directory and since #33 the project name fingerprints the
+        // absolute path: unqualified, this remedy is a dead end everywhere but
+        // here (#166). Same shape `mana dev` prints since #128.
         report.broken(format!(
             "  BROKEN: {stale} stale dispatch(es) -- their process is gone and no exit record \
              was ever written, so the PM is still waiting on them. Clear each with \
-             `mana kill <agent-id>`."
+             `mana kill <agent-id>` (in {}).",
+            project_root.display()
         ));
     }
 
@@ -805,8 +812,13 @@ fn worktree_section(
             continue;
         }
         if !options.prune {
+            // Same reason as the stale-dispatch remedy above: `--prune` run
+            // from anywhere else finds no state, removes nothing and exits 0,
+            // which reads as "cleaned" (#166).
             report.say(format!(
-                "  {dir_name}  age {age}  no running dispatch -- remove with `mana doctor --prune`"
+                "  {dir_name}  age {age}  no running dispatch -- remove with \
+                 `mana doctor --prune` (in {})",
+                project_root.display()
             ));
             continue;
         }
@@ -1228,6 +1240,54 @@ mod process_tests {
             pid,
             started_at: now_iso8601(),
         }
+    }
+
+    /// Issue #166: `mana kill` and `mana doctor --prune` both default to the
+    /// working directory, and since #33 the project name fingerprints the
+    /// absolute path -- so run from anywhere but the project these prescribed
+    /// commands hit a different project's state and do nothing. Every remedy
+    /// has to carry the project it was prescribed for, the way `mana dev`
+    /// already does since #128.
+    #[test]
+    fn the_prescribed_remedies_name_the_project_they_are_for() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("my-api");
+        std::fs::create_dir_all(&project).unwrap();
+        let name = project_name_from_dir(&project);
+        let paths = resolve_project_paths(tmp.path(), &name);
+        crate::project::ensure_project_structure(&paths).unwrap();
+        append_record(
+            &paths.subagents_file,
+            &record("3f2a1b6c-dead", Some(reaped_pid())),
+        )
+        .unwrap();
+        // A leftover worktree directory for a task nothing is running, which
+        // is what the second remedy is printed for.
+        std::fs::create_dir_all(worktree::worktrees_dir(tmp.path(), &name).join("9d4e4a7b"))
+            .unwrap();
+
+        let entries = vec![parse_entry(super::tests::FIXTURE).unwrap()];
+        let report = diagnose(&Options {
+            mana_home: tmp.path(),
+            entries: &entries,
+            override_note: None,
+            override_error: None,
+            project_root: Some(&project),
+            prune: false,
+            now: Utc::now(),
+        })
+        .unwrap();
+        let text = report.lines.join("\n");
+
+        let here = project.display().to_string();
+        assert!(
+            text.contains(&format!("`mana kill <agent-id>` (in {here})")),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("`mana doctor --prune` (in {here})")),
+            "{text}"
+        );
     }
 
     #[test]
