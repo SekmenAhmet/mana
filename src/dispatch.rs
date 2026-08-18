@@ -135,6 +135,23 @@ pub struct Assignment<'a> {
 
 /// Dispatches the task to an executor: a fresh worktree, the executor role
 /// prompt, and one process observed to completion.
+/// Removes a task's verdict, treating "there was none" as success.
+///
+/// Two callers, two different transitions, one rule: a verdict describes one
+/// attempt, and whatever invalidates that attempt invalidates the verdict with
+/// it. The executor path clears it because the branch was just reset under it;
+/// the reviewer path clears it because a corrective re-dispatch must not read
+/// the answer it was sent to replace.
+fn clear_verdict(review_path: &Path) -> Result<()> {
+    if let Err(error) = std::fs::remove_file(review_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        return Err(error)
+            .with_context(|| format!("clearing the previous verdict {}", review_path.display()));
+    }
+    Ok(())
+}
+
 pub fn dispatch_executor(assignment: &Assignment<'_>) -> Result<ExecutorRun> {
     let Assignment {
         agent_id,
@@ -155,6 +172,16 @@ pub fn dispatch_executor(assignment: &Assignment<'_>) -> Result<ExecutorRun> {
     let task_id = &task.frontmatter.id;
     let worktree = worktree::create(project_root, mana_home, task_id)?;
     let worktree_path = worktree.path.to_string_lossy().into_owned();
+
+    // A verdict's lifetime is its branch's. `create` above force-resets
+    // `mana/<task id>` onto a fresh base, so a verdict written about the
+    // previous attempt now describes code that is nowhere -- and `branch` and
+    // `worktree` are deterministic from the task id, so `get_review` would
+    // hand the PM that stale rejection paired with the *new* branch, and the
+    // retry it prescribes is the dispatch that just ran (#153). Cleared after
+    // `create` rather than before: a `create` that failed reset nothing, and
+    // the verdict it would have invalidated is still the truth.
+    clear_verdict(&paths.reviews.join(format!("{task_id}.json")))?;
 
     let prompt = fill(
         template_body(EXECUTOR_TEMPLATE, "executor.md")?,
@@ -216,15 +243,10 @@ pub fn dispatch_reviewer(
     worktree::validate_task_id(task_id)?;
     let review_path = paths.reviews.join(format!("{task_id}.json"));
 
-    // A verdict left by an earlier run -- a retry, an abandoned attempt at the
-    // same task -- would otherwise be read back as this reviewer's answer, and
-    // the corrective re-dispatch would keep "succeeding" on stale bytes.
-    if let Err(error) = std::fs::remove_file(&review_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        return Err(error)
-            .with_context(|| format!("clearing the previous verdict {}", review_path.display()));
-    }
+    // A verdict left by an earlier *reviewer* -- the corrective re-dispatch
+    // after an unusable one -- would otherwise be read back as this reviewer's
+    // answer, and that re-dispatch would keep "succeeding" on stale bytes.
+    clear_verdict(&review_path)?;
 
     let worktree_path = worktree.path.to_string_lossy().into_owned();
     let mut prompt = fill(
@@ -1702,6 +1724,28 @@ mod dispatch_tests {
         .unwrap();
 
         assert!(!run.review_path.exists());
+    }
+
+    /// The verdict's lifetime is the branch's: `worktree::create` force-resets
+    /// `mana/<task id>` on every attempt (#153), so a verdict written about
+    /// the previous attempt describes code that is no longer there.
+    #[test]
+    fn relaunching_the_executor_clears_the_verdict_that_judged_the_old_branch() {
+        let fixture = Fixture::new();
+        executor_with(&fixture, COMMITTING_EXECUTOR);
+        std::fs::write(
+            fixture.review_path(),
+            r#"{"verdict":"rejected","attribution":"code","issues":["missing error handling"]}"#,
+        )
+        .unwrap();
+
+        // The retry `get_review`'s own message prescribes.
+        executor_with(&fixture, COMMITTING_EXECUTOR);
+
+        assert!(
+            !fixture.review_path().exists(),
+            "the previous attempt's verdict survived the branch reset"
+        );
     }
 
     /// The verdict path is built from the id in the *task file*, and a task
