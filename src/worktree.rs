@@ -172,7 +172,12 @@ pub fn worktree_path(mana_home: &Path, project_root: &Path, task_id: &str) -> Pa
 /// landed, straight from the PM over MCP — untrusted enough that a `..` or a
 /// separator would otherwise build a path outside the worktree root and a
 /// branch name outside the `mana/` namespace.
-fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
+///
+/// Visible to the crate because `dispatch_reviewer` needs the same rule for
+/// the same reason and creates no worktree to get it from `create` (#187),
+/// and a second copy of the character set would be a second answer to "what
+/// is a task id".
+pub(crate) fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
     let acceptable = !task_id.is_empty()
         && task_id
             .chars()
