@@ -23,8 +23,10 @@ imply them. Clean code that solves the wrong problem is rejected; ugly code
 that meets every criterion is validated.
 
 Also reject scope violations: changes clearly beyond the brief, or criteria
-the executor weakened or rewrote. An empty diff is a rejection as well — an
-executor that committed nothing delivered nothing, whatever its summary said.
+the executor weakened or rewrote. (A test the executor added that covers this
+task's changes is not a scope violation.) An empty diff is a rejection as well
+— an executor that committed nothing delivered nothing, whatever its summary
+said.
 
 Write your verdict as JSON to `{review_path}` — exactly this shape, nothing
 else in the file and no key beyond the three below, since a `summary` or a
