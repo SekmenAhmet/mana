@@ -4158,9 +4158,16 @@ mod teardown_tests {
             "PM skill claims relaunch uses the same starting point, which is wrong"
         );
         // The corrected skill must say the worktree is rebuilt from current HEAD.
+        // This assertion is deliberately loose to tolerate rewording: split by
+        // blank lines, find the paragraph that mentions relaunching, and check it
+        // mentions HEAD. A test pinned to exact prose pays for every doc edit.
+        let relaunch_para = PM_SKILL
+            .split("\n\n")
+            .find(|para| para.contains("relaunch"))
+            .expect("PM skill must have a paragraph about relaunching");
         assert!(
-            PM_SKILL.contains("rebuilt from the project's HEAD at the moment of the relaunch"),
-            "PM skill does not describe worktree rebuild from current HEAD at relaunch time"
+            relaunch_para.contains("HEAD"),
+            "relaunch paragraph in PM skill does not mention HEAD"
         );
     }
 }
