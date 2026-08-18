@@ -138,9 +138,29 @@ kind       = "tokens"              # requests | tokens | credits | unknown
 period     = "5h-window"
 pool_scope = "global"              # global | per-model
 
+# The pattern is anchored inside the frame, not on the words, and #164 is why:
+# this CLI prints a `rate_limit_event` frame on every *healthy* turn -- both
+# recorded goldens carry one -- so the previous `rate.?limit` matched the key
+# names in claude's own routine telemetry. Any claude dispatch that failed for
+# an unrelated reason (a timeout, a crash, a malformed tool call) was then
+# filed as a vendor quota failure, and `pool_scope = "global"` above rested
+# haiku, sonnet and opus together for an hour.
+#
+# Measured: the frame's shape, from catalog/goldens/claude/single-turn.jsonl --
+# {"type":"rate_limit_event","rate_limit_info":{"status":"allowed",...,
+# "overageStatus":"rejected",...}}. Note the sibling `overageStatus`, which is
+# "rejected" on a perfectly healthy turn: the leading quote and the lower-case
+# `s` in `"status"` are what keep the pattern off it, and a test pins that
+# against the golden itself.
+#
+# Assumed, and not yet measured: that a refused turn is this same frame with
+# `rate_limit_info.status` set to "rejected". No claude refusal has ever been
+# captured here. If claude words it otherwise the signature is dead weight --
+# the same blindness as agy's and opencode's deliberate silence, and never a
+# false cooldown. Replace this line the day a real refusal is recorded.
 [[failure]]                        # ordered; first match wins
 means            = "rate_limited"  # quota_exhausted | rate_limited | auth_expired
-stdout_regex     = "rate.?limit"
+stdout_regex     = '"rate_limit_info":\{[^}]*"status":"rejected"'
 cooldown_minutes = 60
 
 [skills]

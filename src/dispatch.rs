@@ -629,11 +629,37 @@ pub fn failure_wire_name(means: FailureMeans) -> &'static str {
 
 #[cfg(test)]
 pub(crate) mod test_support {
-    use crate::catalog::{CliEntry, parse_entry};
+    use crate::catalog::{Catalog, CliEntry, Failure, parse_entry};
 
     /// The `[subagent]` keys a test supplies when the invocation shape is not
     /// what it is testing: no flags, prompt as the trailing positional.
     pub const PLAIN_SUBAGENT: &str = "args = []\nprompt = \"argv\"";
+
+    /// The healthy `rate_limit_event` frame as claude really prints it: one
+    /// whole JSONL line, straight out of the recorded golden rather than
+    /// hand-written, so a test cannot assert against a claude that never was.
+    pub fn golden_rate_limit_frame() -> String {
+        let golden = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/catalog/goldens/claude/single-turn.jsonl"
+        ))
+        .expect("the claude golden is in the repo");
+        golden
+            .lines()
+            .find(|line| line.contains(r#""type":"rate_limit_event""#))
+            .expect("the golden carries a rate_limit_event frame")
+            .to_string()
+    }
+
+    /// claude's failure signatures as shipped, never a copy of them.
+    pub fn shipped_claude_signatures() -> Vec<Failure> {
+        Catalog::embedded()
+            .expect("the embedded catalogue parses")
+            .get("claude")
+            .expect("claude is in the embedded catalogue")
+            .failure
+            .clone()
+    }
 
     /// A complete catalogue entry for a CLI that does not exist, so a test can
     /// dispatch a shell script and still go through the real parse/validate
@@ -796,7 +822,9 @@ echo "executor finished"
 
 #[cfg(test)]
 mod tests {
-    use super::test_support::{PLAIN_SUBAGENT, fixture_entry};
+    use super::test_support::{
+        PLAIN_SUBAGENT, fixture_entry, golden_rate_limit_frame, shipped_claude_signatures,
+    };
     use super::*;
 
     fn outcome(exit_code: Option<i32>, stdout: &str, stderr: &str) -> SpawnOutcome {
@@ -1009,9 +1037,10 @@ stdout_regex = "4"
 
     #[test]
     fn a_successful_run_never_matches_a_signature() {
-        // The claude entry's real signature: a bare `rate.?limit` on stdout. An
-        // executor that succeeded at a task *about* rate limiting would put the
-        // whole pool on cooldown if success were matched.
+        // A bare `rate.?limit` on stdout -- the shape claude's entry carried
+        // until #164. An executor that succeeded at a task *about* rate
+        // limiting would put the whole pool on cooldown if success were
+        // matched.
         let entry = fixture_entry(
             "fixture",
             PLAIN_SUBAGENT,
@@ -1025,6 +1054,38 @@ stdout_regex = "4"
         assert_eq!(
             match_signatures(&signatures, &outcome(Some(1), "rate limit reached", "")),
             Some(FailureMeans::RateLimited)
+        );
+    }
+
+    /// The other half of #164: narrowing claude's signature must not blind
+    /// mana to a refusal the vendor really issued.
+    ///
+    /// What this can and cannot claim. The repo holds no recorded claude
+    /// refusal -- `catalog/goldens/` has a captured quota failure for copilot
+    /// only, and both claude goldens are healthy runs. So the second assertion
+    /// pins the *assumption the fix rests on*, spelled out where it can be
+    /// read: a refused frame is the golden's frame with a different
+    /// `rate_limit_info.status`. If claude words its refusal some other way,
+    /// the signature is dead weight -- the same blindness as declaring none,
+    /// which is what agy and opencode already do, and never a false cooldown.
+    /// The first assertion is the part that is measured: the healthy frame,
+    /// at a failing exit code, must match nothing.
+    #[test]
+    fn claudes_signature_separates_a_refused_frame_from_the_healthy_one() {
+        let signatures = compile_signatures(&shipped_claude_signatures()).unwrap();
+        let healthy = golden_rate_limit_frame();
+        let refused = healthy.replace(r#""status":"allowed""#, r#""status":"rejected""#);
+        assert_ne!(refused, healthy, "the golden frame is no longer 'allowed'");
+
+        assert_eq!(
+            match_signatures(&signatures, &outcome(Some(1), &healthy, "")),
+            None,
+            "a healthy frame was read as the vendor's quota failure"
+        );
+        assert_eq!(
+            match_signatures(&signatures, &outcome(Some(1), &refused, "")),
+            Some(FailureMeans::RateLimited),
+            "a refused frame no longer matches: mana is blind to a real limit"
         );
     }
 
@@ -1117,7 +1178,9 @@ stdout_regex = "4"
 #[cfg(all(test, unix))] // every test here dispatches a shell-script CLI
 mod dispatch_tests {
     use super::test_fixture::{COMMITTING_EXECUTOR, Fixture, TASK_ID, task};
-    use super::test_support::{PLAIN_SUBAGENT, fixture_entry};
+    use super::test_support::{
+        PLAIN_SUBAGENT, fixture_entry, golden_rate_limit_frame, shipped_claude_signatures,
+    };
     use super::*;
     use crate::lock::load_registry;
     use std::process::Command;
@@ -1262,6 +1325,46 @@ mod dispatch_tests {
             "{log}"
         );
         assert!(log.contains("\"exit_code\":1"), "{log}");
+    }
+
+    /// #164: claude's only signature was a bare `rate.?limit` on stdout, and
+    /// claude prints a `rate_limit_event` frame on every *healthy* turn -- both
+    /// recorded goldens carry one, with `"status":"allowed"`. So any claude
+    /// dispatch that failed for an unrelated reason was filed as a vendor quota
+    /// failure, and `pool_scope = "global"` on pool `plan` put haiku, sonnet
+    /// and opus on the same 60-minute cooldown.
+    ///
+    /// Deliberately not a hand-written string: the stub prints the frame
+    /// exactly as it sits in `catalog/goldens/claude/single-turn.jsonl`, and
+    /// the signatures are the shipped ones, read out of the embedded
+    /// catalogue. Neither half can drift away from what claude really emits.
+    #[test]
+    fn claudes_healthy_telemetry_is_not_read_as_the_vendors_quota_failure() {
+        let fixture = Fixture::new();
+        let bin = fixture.script(
+            "claude-ish",
+            &format!(
+                "printf '%s\\n' '{}'\necho 'fatal: the model returned a malformed tool call' >&2\nexit 1\n",
+                golden_rate_limit_frame()
+            ),
+        );
+        let mut entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
+        entry.failure = shipped_claude_signatures();
+
+        let run = dispatch_executor(&assign(&agent_id(), &entry, &task(), &fixture)).unwrap();
+
+        assert_eq!(run.outcome.exit_code, Some(1));
+        assert!(
+            run.outcome.stdout.contains("rate_limit_event"),
+            "the stub never printed the golden frame: {}",
+            run.outcome.stdout
+        );
+        assert_eq!(
+            run.outcome.failure_means, None,
+            "a healthy rate_limit_event frame was blamed on the vendor's quota"
+        );
+        let log = std::fs::read_to_string(&run.outcome.log_path).unwrap();
+        assert!(!log.contains("rate_limited"), "{log}");
     }
 
     /// The incident this guards: killing a reviewer produced "killed by a

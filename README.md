@@ -425,8 +425,9 @@ catalogue's `[[failure]]` signatures for that CLI — a run that exited 0 is
 never matched, and neither is one mana can see an operator killed, since a
 CLI that merely printed the words "rate limit" would otherwise rest a pool
 for an hour on a kill somebody meant — copilot's is `exit 1`
-plus `"exceeded your monthly quota"` on stderr, claude's is `rate.?limit` on
-stdout. A match records a failure meaning (`quota_exhausted`, `rate_limited`,
+plus `"exceeded your monthly quota"` on stderr, claude's is a `rate_limit_info`
+frame whose `status` is `"rejected"` on stdout — anchored that tightly because
+the same frame, reading `"allowed"`, is printed on every healthy claude turn. A match records a failure meaning (`quota_exhausted`, `rate_limited`,
 or `auth_expired` — which never triggers a cooldown, since waiting does not
 log anyone back in) and rests the affected pool for a catalogue-declared
 number of minutes, 60 by default. `pool_scope` decides the blast radius:
