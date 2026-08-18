@@ -13,6 +13,12 @@ pub enum AppEvent {
     /// Answers the permission the PM is waiting on: `true` allows, `false`
     /// rejects. Does nothing when there is none.
     AnswerPermission(bool),
+    /// A bracketed-paste block, appended to the input buffer whole. Without
+    /// bracketed paste a multi-line paste arrives as one key event per
+    /// character, including its newlines, so a five-line brief became five
+    /// separate submitted turns (#160). The paste's own newlines must not
+    /// submit anything -- only a typed Enter does that.
+    Paste(String),
     Quit,
 }
 
@@ -54,9 +60,24 @@ pub fn map_key_event(
     }
 }
 
-/// Source of raw key events for the PM's render loop. The loop depends on
-/// this instead of calling `crossterm::event::poll`/`read` directly, so its
-/// per-tick logic is testable against a scripted key sequence.
+/// One raw terminal event, undecoded. Keys still go through `map_key_event`;
+/// a pasted block is not a key at all and is handed to the app whole, since
+/// bracketed paste exists precisely so it is not replayed as keystrokes.
+#[derive(Debug, Clone, PartialEq)]
+pub enum RawEvent {
+    Key(crossterm::event::KeyEvent),
+    Paste(String),
+}
+
+impl From<crossterm::event::KeyEvent> for RawEvent {
+    fn from(key: crossterm::event::KeyEvent) -> Self {
+        RawEvent::Key(key)
+    }
+}
+
+/// Source of raw terminal events for the PM's render loop. The loop depends
+/// on this instead of calling `crossterm::event::poll`/`read` directly, so
+/// its per-tick logic is testable against a scripted event sequence.
 ///
 /// A trait rather than a `&mut dyn FnMut(Duration) -> …` parameter (#69):
 /// every implementation carries behaviour that wants a name and a comment --
@@ -65,26 +86,25 @@ pub fn map_key_event(
 /// Closures would relocate all three into anonymous lambdas at their call
 /// sites, not delete them.
 pub trait EventSource {
-    fn poll_key(
-        &mut self,
-        timeout: std::time::Duration,
-    ) -> anyhow::Result<Option<crossterm::event::KeyEvent>>;
+    fn poll_event(&mut self, timeout: std::time::Duration) -> anyhow::Result<Option<RawEvent>>;
 }
 
 pub struct CrosstermEventSource;
 
 impl EventSource for CrosstermEventSource {
-    fn poll_key(
-        &mut self,
-        timeout: std::time::Duration,
-    ) -> anyhow::Result<Option<crossterm::event::KeyEvent>> {
-        if crossterm::event::poll(timeout)?
-            && let crossterm::event::Event::Key(key) = crossterm::event::read()?
-            // Windows reports press *and* release for every key; without this
-            // filter each character would be typed twice there.
-            && key.kind == crossterm::event::KeyEventKind::Press
-        {
-            return Ok(Some(key));
+    fn poll_event(&mut self, timeout: std::time::Duration) -> anyhow::Result<Option<RawEvent>> {
+        if crossterm::event::poll(timeout)? {
+            match crossterm::event::read()? {
+                // Windows reports press *and* release for every key; without
+                // this filter each character would be typed twice there.
+                crossterm::event::Event::Key(key)
+                    if key.kind == crossterm::event::KeyEventKind::Press =>
+                {
+                    return Ok(Some(RawEvent::Key(key)));
+                }
+                crossterm::event::Event::Paste(text) => return Ok(Some(RawEvent::Paste(text))),
+                _ => {}
+            }
         }
         Ok(None)
     }
@@ -95,30 +115,33 @@ impl EventSource for CrosstermEventSource {
 // -D warnings. Widen back to plain cfg(test) with the first Windows user.
 #[cfg(all(test, unix))]
 pub(crate) mod test_support {
-    use super::EventSource;
-    use crossterm::event::KeyEvent;
+    use super::{EventSource, RawEvent};
     use std::collections::VecDeque;
 
-    /// Replays a fixed sequence of key events, one per `poll_key` call,
+    /// Replays a fixed sequence of raw events, one per `poll_event` call,
     /// ignoring the timeout entirely (tests don't want to actually wait).
-    /// The sequence MUST end with a key that `map_key_event` maps to
-    /// `AppEvent::Quit` (Ctrl+C) -- once exhausted, `poll_key` returns an
-    /// error instead of blocking forever, so a test that forgot the trailing
-    /// quit key fails fast instead of hanging.
+    /// Takes anything `Into<RawEvent>` so existing callers can keep passing
+    /// bare `KeyEvent`s. The sequence MUST end with a key that
+    /// `map_key_event` maps to `AppEvent::Quit` (Ctrl+C) -- once exhausted,
+    /// `poll_event` returns an error instead of blocking forever, so a test
+    /// that forgot the trailing quit key fails fast instead of hanging.
     pub(crate) struct FakeEventSource {
-        queue: VecDeque<KeyEvent>,
+        queue: VecDeque<RawEvent>,
     }
 
     impl FakeEventSource {
-        pub(crate) fn new(events: impl IntoIterator<Item = KeyEvent>) -> Self {
+        pub(crate) fn new<T: Into<RawEvent>>(events: impl IntoIterator<Item = T>) -> Self {
             FakeEventSource {
-                queue: events.into_iter().collect(),
+                queue: events.into_iter().map(Into::into).collect(),
             }
         }
     }
 
     impl EventSource for FakeEventSource {
-        fn poll_key(&mut self, _timeout: std::time::Duration) -> anyhow::Result<Option<KeyEvent>> {
+        fn poll_event(
+            &mut self,
+            _timeout: std::time::Duration,
+        ) -> anyhow::Result<Option<RawEvent>> {
             self.queue.pop_front().map(Some).ok_or_else(|| {
                 anyhow::anyhow!(
                     "FakeEventSource exhausted without a Quit-mapped key -- the test likely \
