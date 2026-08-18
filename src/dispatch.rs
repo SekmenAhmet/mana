@@ -223,11 +223,12 @@ pub fn dispatch_executor(assignment: &Assignment<'_>) -> Result<ExecutorRun> {
 
 /// Dispatches the review of a finished task.
 ///
-/// No worktree is created: the reviewer is read-only, and the thing it has to
-/// read is the executor's checkout, so it runs there with `{base_ref}` from
-/// that same worktree. "Read-only" is a prompt contract, not a sandbox --
-/// making it mechanical needs per-CLI permission flags, which is task 2.3's
-/// problem.
+/// No worktree is created: the reviewer runs in the executor's worktree,
+/// reads the diff, and writes its verdict JSON to a file. "Read-only" is a
+/// prompt contract, not a sandbox — the reviewer receives the same
+/// `[subagent].auto_approve_args` as the executor. Mechanically enforcing
+/// read-only-ness (via per-CLI permission flags) requires changing the
+/// verdict channel from file-based to stdout, which is deferred beyond v2.
 ///
 /// `correction` is appended to the prompt, and exists for exactly one caller:
 /// the single corrective re-dispatch after an unusable verdict (plan 1.4).
@@ -1056,6 +1057,27 @@ prompt = "argv""#,
         );
         let argv = build_argv(&entry, "haiku", "brief", Path::new("/tmp/wt")).unwrap();
         assert_eq!(argv, ["--cwd", "/tmp/wt", "brief"]);
+    }
+
+    #[test]
+    fn build_argv_is_role_agnostic_so_all_dispatches_receive_auto_approve_args() {
+        // This documents the current state: build_argv has no role parameter,
+        // so every dispatch -- executor or reviewer -- receives the same
+        // auto_approve_args from the catalogue. The reviewer is "read-only"
+        // only via a prompt contract, not by mechanical enforcement. See design §9.
+        let entry = fixture_entry(
+            "fixture",
+            r#"args = ["-p"]
+auto_approve_args = ["--dangerously-skip-permissions"]
+model_args = ["--model", "{model}"]
+prompt = "argv""#,
+            "",
+        );
+        let argv = build_argv(&entry, "haiku", "the brief", Path::new("/tmp/wt")).unwrap();
+        assert!(
+            argv.contains(&"--dangerously-skip-permissions".to_string()),
+            "auto_approve_args missing from argv: {argv:?}"
+        );
     }
 
     #[test]

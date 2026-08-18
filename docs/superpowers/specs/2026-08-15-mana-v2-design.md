@@ -307,7 +307,16 @@ and `role` already carries the write/read distinction.
 | Role | Writes? | Isolation | Permissions |
 |---|---|---|---|
 | `executor` | yes | **git worktree** (one per task) | auto-approve flags from catalogue |
-| `reviewer` | no | none needed | read-only where the CLI supports it (e.g. `gemini --approval-mode plan`) |
+| `reviewer` | no* | none needed | auto-approve flags from catalogue (read-only via prompt contract only) |
+
+**\*Reviewer "no writes":** The reviewer must write its verdict JSON to a file
+(mana reads it to assess the task), so a CLI read-only mode that forbids all
+writes would break the review. Instead, read-only-ness is a prompt contract: the
+role template instructs the agent not to edit the executor's work, and the
+reviewer runs in the executor's worktree with the same `[subagent].auto_approve_args`
+as the executor. Mechanically enforcing this separation (e.g. via per-CLI
+permission flags) requires changing the verdict channel from file-based to
+stdout, which is deferred beyond v2.
 
 Worktrees: the 2026 standard for parallel agents (native in Claude Code, Codex,
 Cursor; ~8–10 concurrent is the practical ceiling; no symlinks needed on
