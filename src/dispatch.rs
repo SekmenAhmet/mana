@@ -207,6 +207,13 @@ pub fn dispatch_reviewer(
 
     let paths = project_paths(project_root, mana_home)?;
     let task_id = &task.frontmatter.id;
+    // Validated on the way back out of the file as well as on the way in, for
+    // the reason `mcp::unmet_dependency` gives about a `depends_on` id: the
+    // MCP entry point checked the id the PM named, but this one was read from
+    // plain text on disk and is about to become a path that gets deleted.
+    // `dispatch_executor` gets the same check from `worktree::create`; the
+    // reviewer creates no worktree, so it asks for it here (#187).
+    worktree::validate_task_id(task_id)?;
     let review_path = paths.reviews.join(format!("{task_id}.json"));
 
     // A verdict left by an earlier run -- a retry, an abandoned attempt at the
@@ -1592,5 +1599,40 @@ mod dispatch_tests {
         .unwrap();
 
         assert!(!run.review_path.exists());
+    }
+
+    /// The verdict path is built from the id in the *task file*, and a task
+    /// file is plain text on disk -- the same reason `unmet_dependency`
+    /// re-validates a `depends_on` id it has just read back out of one.
+    /// Unvalidated, a `..` in that id resolved outside `reviews/` and the
+    /// stale-verdict cleanup deleted whatever was there (#187).
+    #[test]
+    fn a_task_id_that_would_escape_the_reviews_directory_is_refused() {
+        let fixture = Fixture::new();
+        let executor = executor_with(&fixture, COMMITTING_EXECUTOR);
+
+        let outside = fixture.paths().reviews.join("../canary.json");
+        std::fs::write(&outside, "not the reviewer's to delete").unwrap();
+
+        let mut hostile = task();
+        hostile.frontmatter.id = "../canary".to_string();
+        let bin = fixture.script("review-cli", "echo reviewed\n");
+        let entry = fixture_entry(&bin, PLAIN_SUBAGENT, "");
+
+        let error = dispatch_reviewer(
+            &assign(&agent_id(), &entry, &hostile, &fixture),
+            &executor.worktree,
+            None,
+        )
+        .unwrap_err();
+
+        // Specifically rejected as an id -- not incidentally failing later on
+        // some call that happened to choke on it.
+        assert!(error.to_string().contains("invalid task id"), "{error}");
+        assert!(
+            outside.exists(),
+            "the reviewer deleted a file outside {}",
+            fixture.paths().reviews.display()
+        );
     }
 }
