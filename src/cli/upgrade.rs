@@ -91,15 +91,6 @@ fn archive_name(target: &str) -> String {
     format!("{BIN_NAME}-{target}{ARCHIVE_EXT}")
 }
 
-pub(crate) fn describe_update_result(status: &self_update::Status) -> String {
-    match status {
-        self_update::Status::UpToDate(version) => format!("mana is already up to date ({version})"),
-        self_update::Status::Updated(version) => {
-            format!("mana updated to version {version}")
-        }
-    }
-}
-
 /// Where the binary sits inside the archive, with `self_update`'s two
 /// placeholders resolved.
 ///
@@ -192,10 +183,7 @@ pub fn run() -> anyhow::Result<()> {
     // Same "is it strictly newer" rule the launch-time notice uses, so the two
     // halves of this file can never disagree about whether an upgrade exists.
     if notice(CURRENT_VERSION, &release.version).is_none() {
-        println!(
-            "{}",
-            describe_update_result(&self_update::Status::UpToDate(CURRENT_VERSION.to_string()))
-        );
+        println!("mana is already up to date ({CURRENT_VERSION})");
         return Ok(());
     }
 
@@ -238,10 +226,7 @@ pub fn run() -> anyhow::Result<()> {
     self_update::Extract::from_source(&archive_path).extract_file(tmp.path(), &bin_in_archive)?;
     self_update::self_replace::self_replace(tmp.path().join(&bin_in_archive))?;
 
-    println!(
-        "{}",
-        describe_update_result(&self_update::Status::Updated(release.version))
-    );
+    println!("mana updated to version {}", release.version);
     Ok(())
 }
 
@@ -481,24 +466,29 @@ pub(crate) fn poll_check(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use self_update::Status;
     use std::net::TcpListener;
 
+    /// Pins the two lines `run` prints, by reading `run`'s own source rather
+    /// than rebuilding the text from a copy of the template -- a test that
+    /// reconstructs the message independently still passes when the real
+    /// `println!` in `run` is edited, which is exactly what made the
+    /// previous version of this pin worthless. Splitting off `mod tests`
+    /// before searching keeps this assertion's own copy of the same words
+    /// from making it trivially match itself.
     #[test]
-    fn describe_update_result_reports_already_up_to_date() {
-        let status = Status::UpToDate("0.1.0".to_string());
-        assert_eq!(
-            describe_update_result(&status),
-            "mana is already up to date (0.1.0)"
+    fn upgrade_messages_are_the_real_run_literals() {
+        let source = include_str!("upgrade.rs");
+        let production = source
+            .split("#[cfg(test)]")
+            .next()
+            .expect("this file has a #[cfg(test)] marker");
+        assert!(
+            production.contains("mana is already up to date ({CURRENT_VERSION})"),
+            "the up-to-date message in `run` changed; update this pin"
         );
-    }
-
-    #[test]
-    fn describe_update_result_reports_new_version_installed() {
-        let status = Status::Updated("0.2.0".to_string());
-        assert_eq!(
-            describe_update_result(&status),
-            "mana updated to version 0.2.0"
+        assert!(
+            production.contains("mana updated to version {}"),
+            "the updated message in `run` changed; update this pin"
         );
     }
 
@@ -510,20 +500,39 @@ mod tests {
     const DIST_PLAN_VERSION: &str = "0.32.0";
 
     /// The names `dist plan` printed for this exact `dist-workspace.toml`
-    /// (dist 0.32.0, 2026-08-15), copied verbatim by hand.
+    /// (dist 0.32.0, 2026-08-15), copied verbatim by hand -- the five
+    /// archives. The five `.sha256` sidecars beside them were not printed by
+    /// that run and are not copied from one: they are *derived* by
+    /// appending `CHECKSUM_EXT` to each archive name, on the strength of
+    /// this file's own header comment (cargo-dist uploads exactly one
+    /// sidecar per archive, named after it). That derivation stops being
+    /// true the moment cargo-dist's sidecar naming does -- e.g. a future
+    /// dist version hashing with something other than sha256, dropping the
+    /// per-archive sidecar in favor of only the aggregate `sha256.sum`, or
+    /// naming it anything but `<archive-name><CHECKSUM_EXT>`. Any of those
+    /// would also break `mana upgrade`'s own `asset(&format!("{archive}{CHECKSUM_EXT}"))`
+    /// lookup, so the derivation and the code it stands in for go stale
+    /// together.
     ///
     /// Nothing here executes `dist`: both sides of the comparison below are
     /// files in this repo, so what the comparison proves is that `BIN_NAME`,
-    /// `ARCHIVE_EXT` and `[dist].targets` still agree with what was observed
-    /// once — not that dist would print the same today. `DIST_PLAN_VERSION` is
-    /// what carries the second half; re-run `dist plan` and re-copy this list
-    /// when it fails.
+    /// `ARCHIVE_EXT`, `CHECKSUM_EXT` and `[dist].targets` still agree with
+    /// what was observed once (the archives) or asserted (the sidecars) —
+    /// not that dist would print the same today. `DIST_PLAN_VERSION` is
+    /// what carries the second half; re-run `dist plan`, re-copy the archive
+    /// half of this list when it fails, and re-derive the sidecar half from
+    /// it the same way.
     const DIST_PLAN_ARTIFACTS: &[&str] = &[
         "mana-aarch64-apple-darwin.tar.gz",
+        "mana-aarch64-apple-darwin.tar.gz.sha256",
         "mana-aarch64-unknown-linux-gnu.tar.gz",
+        "mana-aarch64-unknown-linux-gnu.tar.gz.sha256",
         "mana-x86_64-apple-darwin.tar.gz",
+        "mana-x86_64-apple-darwin.tar.gz.sha256",
         "mana-x86_64-pc-windows-msvc.tar.gz",
+        "mana-x86_64-pc-windows-msvc.tar.gz.sha256",
         "mana-x86_64-unknown-linux-gnu.tar.gz",
+        "mana-x86_64-unknown-linux-gnu.tar.gz.sha256",
     ];
 
     /// The targets cargo-dist is configured to build, read from the config
@@ -759,11 +768,19 @@ jobs:
         );
     }
 
+    /// Covers both halves of what `mana upgrade` looks up by exact name
+    /// (`run`'s `asset(&archive)` and `asset(&format!("{archive}{CHECKSUM_EXT}"))`):
+    /// the archive and the sidecar the release must publish for the
+    /// checksum guard to find anything to check against.
     #[test]
     fn archive_name_matches_the_recorded_dist_plan_for_every_target() {
         let mut produced: Vec<String> = configured_targets()
             .iter()
-            .map(|target| archive_name(target))
+            .flat_map(|target| {
+                let archive = archive_name(target);
+                let checksum = format!("{archive}{CHECKSUM_EXT}");
+                [archive, checksum]
+            })
             .collect();
         produced.sort();
         let mut expected: Vec<String> = DIST_PLAN_ARTIFACTS.iter().map(|s| s.to_string()).collect();
