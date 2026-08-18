@@ -94,7 +94,10 @@ pub struct SpawnOutcome {
     #[allow(dead_code)]
     pub pid: u32,
     /// `None` when the process was killed by a signal, which on unix is what a
-    /// timeout looks like -- read it together with `timed_out`.
+    /// timeout or an operator's `mana kill` looks like -- read it together
+    /// with `timed_out`. On Windows both leave an exit *code* instead
+    /// (`taskkill /T /F`), so `exit_code` alone never tells a kill from an
+    /// ordinary exit there; `dispatch::classify_killed` is what does.
     pub exit_code: Option<i32>,
     pub stdout: String,
     pub stderr: String,

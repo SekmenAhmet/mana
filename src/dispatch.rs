@@ -405,12 +405,16 @@ fn run_dispatch(plan: Plan<'_>, prepared: PreparedSpawn) -> Result<DispatchOutco
     // `mana kill` appends a `killed` line to this agent's log *before* it
     // signals the process group, so the marker is already on disk by the time
     // the spawner returns. It has to be read before the signatures get a look
-    // in: a signalled run carries no exit code, so it is classified on its
-    // captured output alone, and a CLI that merely printed the words "rate
-    // limit" would have an operator's deliberate kill recorded as the vendor's
+    // in: an operator-killed run is otherwise classified on its captured
+    // output alone, and a CLI that merely printed the words "rate limit"
+    // would have an operator's deliberate kill recorded as the vendor's
     // quota failure -- resting the busiest pool for an hour and sending the PM
-    // to a pricier model for no reason.
-    let killed = outcome.exit_code.is_none() && !outcome.timed_out && killed_by_operator(&log_path);
+    // to a pricier model for no reason. See `classify_killed` for the rule.
+    let killed = classify_killed(
+        outcome.exit_code,
+        outcome.timed_out,
+        killed_by_operator(&log_path),
+    );
     let failure_means = if killed {
         None
     } else {
@@ -470,6 +474,22 @@ fn killed_by_operator(log_path: &Path) -> bool {
         .lines()
         .filter_map(|line| serde_json::from_str::<LogEntry>(line).ok())
         .any(|entry| entry.action == "killed")
+}
+
+/// Whether a finished run counts as an operator kill rather than a vendor
+/// failure to run the signatures against.
+///
+/// The marker is the fact; the exit code is only a platform detail of how a
+/// kill ends a process -- unix leaves no exit code (a signal), Windows's
+/// `taskkill /T /F` leaves one, same as a timeout does there too. So this
+/// asks the marker, not the exit code, and only excludes two cases: a
+/// timeout, which is classified as a timeout everywhere and never a kill;
+/// and a clean exit (code 0), because the marker can land on disk just as a
+/// process is already finishing on its own, and a run that succeeded by
+/// itself must not be reported as killed just because the marker exists.
+/// One rule for both platforms -- no `cfg(windows)` needed.
+fn classify_killed(exit_code: Option<i32>, timed_out: bool, operator_marker: bool) -> bool {
+    !timed_out && operator_marker && exit_code != Some(0)
 }
 
 /// One line of fact about a finished run: what happened, how long it took, the
@@ -880,6 +900,10 @@ echo "executor finished"
     }
 }
 
+// Ungated (no `unix` gate) on purpose: `dispatch_tests` below spawns
+// shell-script fixtures and compiles out on Windows, so the pure-function
+// tests in here -- including `classify_killed`'s -- are the only coverage
+// this module's Windows-relevant logic gets on a Windows build.
 #[cfg(test)]
 mod tests {
     use super::test_support::{
@@ -896,6 +920,32 @@ mod tests {
             duration: Duration::from_millis(10),
             timed_out: false,
         }
+    }
+
+    #[test]
+    fn classify_killed_an_exit_code_with_the_marker_is_killed() {
+        // Windows shape: `taskkill /T /F` ends the process with a real exit
+        // code, not a signal, so a non-zero code must not by itself defeat
+        // the marker.
+        assert!(classify_killed(Some(1), false, true));
+    }
+
+    #[test]
+    fn classify_killed_the_same_exit_code_without_the_marker_is_not_killed() {
+        assert!(!classify_killed(Some(1), false, false));
+    }
+
+    #[test]
+    fn classify_killed_a_clean_exit_with_the_marker_is_not_killed() {
+        // The marker can land on disk just as the process is already
+        // exiting on its own; a successful run must not be reported as
+        // killed just because it exists.
+        assert!(!classify_killed(Some(0), false, true));
+    }
+
+    #[test]
+    fn classify_killed_a_timeout_is_never_a_kill() {
+        assert!(!classify_killed(Some(1), true, false));
     }
 
     #[test]
