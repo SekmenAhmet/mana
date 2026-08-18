@@ -832,7 +832,7 @@ mod process_tests {
         driver.send_user("one").unwrap();
         assert_eq!(
             next(&driver),
-            PmEvent::Raw("boom: no credentials found".to_string())
+            PmEvent::Stderr("boom: no credentials found".to_string())
         );
         assert_eq!(next(&driver), PmEvent::Exited { code: Some(7) });
 
@@ -921,7 +921,7 @@ mod process_tests {
         driver.send_user("hi").unwrap();
         assert_eq!(
             next(&driver),
-            PmEvent::Raw("argv: --print hi --mcp-config /tmp/mana-mcp.json".to_string())
+            PmEvent::Stderr("argv: --print hi --mcp-config /tmp/mana-mcp.json".to_string())
         );
         driver.shutdown().unwrap();
     }

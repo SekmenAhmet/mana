@@ -92,11 +92,15 @@ pub(super) fn pump(
 /// swallowing it is how v1 left users with a silently dead session. It is also
 /// why an unread pipe is not an option -- a full stderr buffer blocks the
 /// child mid-write.
+///
+/// `Stderr` rather than `Raw`, which renders the same: this is the one place
+/// that knows which pipe a line came off, and a report that has to quote the
+/// PM's own explanation cannot work that out afterwards (#189).
 pub(super) fn pump_stderr(
     source: impl Read + Send + 'static,
     sender: Sender<PmEvent>,
 ) -> JoinHandle<()> {
-    pump(source, sender, |line| vec![PmEvent::Raw(line)])
+    pump(source, sender, |line| vec![PmEvent::Stderr(line)])
 }
 
 /// Waits for the child to be gone and reports its exit code.

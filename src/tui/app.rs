@@ -65,10 +65,16 @@ pub struct App {
     /// The latest `PmEvent::Usage`, already summarised. `None` until the PM
     /// finishes a turn -- most CLIs report totals only at the end of one.
     pub usage: Option<String>,
-    /// The last `Raw` line seen. When a PM dies, the reason is on its stderr,
-    /// which arrives here -- and the chat pane is gone by the time mana can
-    /// print anything, so the launch flow reads it back from here.
+    /// The last `Raw` line seen -- the fallback explanation for a PM that died
+    /// without saying anything on its stderr. The chat pane is gone by the
+    /// time mana can print anything, so the launch flow reads it back here.
     pub last_raw: Option<String>,
+    /// The last line the PM wrote to its stderr, which is where a dying CLI
+    /// says why. Kept apart from `last_raw` because both pipes produce noise
+    /// and the loudest one is usually stdout: an agent opens every turn with a
+    /// routine frame no path matches, so the report quoted the cwd and the
+    /// tool list instead of the error it promised (#189).
+    pub last_stderr: Option<String>,
     /// Whether the chat pane shows its `Raw` lines (Ctrl+O). Off by default.
     ///
     /// A PM session is mostly machinery -- reasoning chunks, tool activity, the
@@ -131,6 +137,7 @@ impl App {
             cli_name: cli_name.to_string(),
             usage: None,
             last_raw: None,
+            last_stderr: None,
             show_raw: false,
             raw_lines: 0,
             pending_permission: None,
@@ -147,6 +154,12 @@ impl App {
             PmEvent::Text(text) => self.push(Source::Pm, text),
             PmEvent::Raw(line) => {
                 self.last_raw = Some(line.clone());
+                self.push(Source::Raw, line);
+            }
+            // The same line in the pane, a different one to quote when the PM
+            // is gone (#189).
+            PmEvent::Stderr(line) => {
+                self.last_stderr = Some(line.clone());
                 self.push(Source::Raw, line);
             }
             // Kept when a snapshot has nothing countable in it rather than

@@ -79,6 +79,12 @@ pub enum PmEvent {
     /// half of "degraded, never silent": a CLI that changes shape shows up as
     /// ugly lines in the chat pane, not as a PM that went quiet.
     Raw(String),
+    /// One line the PM wrote to its stderr. Rendered exactly like `Raw` -- it
+    /// is the same kind of noise -- but kept apart because when a PM dies this
+    /// is where it says why, and the one line mana prints after the alternate
+    /// screen is gone has to be that one rather than whichever pipe happened
+    /// to speak last (#189).
+    Stderr(String),
     /// The PM is waiting on a human decision before it can act (ACP's
     /// `session/request_permission`). Answer it with
     /// `PmTransport::answer_permission`; leaving it unanswered stalls the PM's

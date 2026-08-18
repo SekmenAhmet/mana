@@ -2178,7 +2178,7 @@ done
         let events = drain_to_exit(&driver);
         assert_eq!(events.last(), Some(&PmEvent::Exited { code: Some(9) }));
         assert!(
-            events.contains(&PmEvent::Raw("boom: the agent fell over".to_string())),
+            events.contains(&PmEvent::Stderr("boom: the agent fell over".to_string())),
             "{events:#?}"
         );
         // A turn sent to a corpse fails where the person who typed it can see.
@@ -2230,7 +2230,7 @@ done
         driver.shutdown().unwrap();
 
         let events = drain_to_exit(&driver);
-        let noise = PmEvent::Raw("warning: a single line on stderr".to_string());
+        let noise = PmEvent::Stderr("warning: a single line on stderr".to_string());
         assert_eq!(
             events.iter().filter(|event| **event == noise).count(),
             1,
