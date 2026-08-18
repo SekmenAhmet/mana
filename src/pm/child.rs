@@ -71,21 +71,6 @@ pub(super) fn read_lines(source: impl Read, mut sink: impl FnMut(String) -> bool
     }
 }
 
-/// Spawns a thread that turns each line of `source` into events.
-pub(super) fn pump(
-    source: impl Read + Send + 'static,
-    sender: Sender<PmEvent>,
-    to_events: impl Fn(String) -> Vec<PmEvent> + Send + 'static,
-) -> JoinHandle<()> {
-    std::thread::spawn(move || {
-        read_lines(source, |line| {
-            to_events(line)
-                .into_iter()
-                .all(|event| sender.send(event).is_ok())
-        });
-    })
-}
-
 /// Drains a PM's stderr into visible chat lines.
 ///
 /// Not discarded, because a PM that dies on startup says why there and
@@ -100,7 +85,9 @@ pub(super) fn pump_stderr(
     source: impl Read + Send + 'static,
     sender: Sender<PmEvent>,
 ) -> JoinHandle<()> {
-    pump(source, sender, |line| vec![PmEvent::Stderr(line)])
+    std::thread::spawn(move || {
+        read_lines(source, |line| sender.send(PmEvent::Stderr(line)).is_ok());
+    })
 }
 
 /// Waits for the child to be gone and reports its exit code.
