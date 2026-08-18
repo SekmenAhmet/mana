@@ -197,6 +197,16 @@ Every brief contains:
   with concrete issues beats arguing with the old one. After three rejected
   attempts at the same piece of work, stop and bring it to the user — it may
   be misconceived.
+
+  Relaunching preserves `depends_on` because any task that declared this one as
+  a dependency still names the same `task_id`, and that `task_id` can still
+  reach `validated` on the next attempt. Creating a replacement task mints a
+  new id: every task whose `depends_on` named the old, rejected id has now named
+  a task that can never be dispatched, and those dependents must be recreated
+  against the new id to route through the dependency gate again. When the brief
+  itself needs to change *and* the task already has dependents, there is no clean
+  route — recreating the whole sub-tree is what mana offers, and the PM should
+  bring that to the user rather than improvise.
 - `rejected` with `attribution: brief` — the fault is yours, not the model's,
   and `counts_against_model` is already false. Rewrite the brief as a new task
   and give it to the same model; don't route away from a model your own
