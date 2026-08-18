@@ -210,8 +210,10 @@ routing_weight        = 10
 # choose on its own. It needs one because discovery reports ids and nothing
 # reports a cost class, so with no statics at all every cost_class route
 # silently resolved to claude and this CLI's quota was never spent (#31). An id
-# outside the seed is still dispatchable when the PM names it together with
-# "cli" -- see `routing::validate_model`.
+# outside the seed is *not* dispatchable, not even when the PM names it with
+# "cli": `routing::validate_model` takes a non-static id only while the seed is
+# empty, which #31 stopped being true here. To dispatch one more, seed it --
+# `mana doctor` prints seed and discovery side by side so the gap shows (#193).
 discovery_args = ["models"]        # refresh the seed from its output
 line_regex     = '^(\S+)\t'        # capture group = model id (output is TSV)
 
