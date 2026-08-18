@@ -72,6 +72,28 @@ pub fn ensure_git_repo(project_root: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Gate for session startup (#192, the second half of #86): a repo with zero
+/// commits cannot host a dispatch, and the session should say so before the
+/// PM has planned and paid for one -- not first learn it through `create`'s
+/// own check, once per executor.
+///
+/// Deliberately a second `rev-parse`, separate from `create`'s: sharing the
+/// call would mean sharing `create`'s bail message and its one-invocation
+/// shape, and changing either is the one thing this check may not do. A
+/// second git process at startup costs nothing next to that.
+pub fn ensure_has_commits(project_root: &Path) -> anyhow::Result<()> {
+    let head = git_output(project_root, &["rev-parse", "--verify", "HEAD"])?;
+    if !head.status.success() {
+        anyhow::bail!(
+            "{} has no commits yet. mana branches task worktrees off HEAD, \
+             so there is nothing to dispatch against: make an initial \
+             commit, then launch again. Nothing has been started.",
+            project_root.display()
+        );
+    }
+    Ok(())
+}
+
 /// Creates (or recreates) the isolated worktree for `task_id`.
 ///
 /// Recreation is deliberate: a retried task must start from `base_ref`, not
@@ -605,7 +627,37 @@ mod tests {
         let error = create(&fixture.project, &fixture.mana_home, TASK_ID)
             .unwrap_err()
             .to_string();
+        // Pins the full message, `(git: ...)` suffix included -- a previous
+        // attempt at #192 silently dropped that suffix and a substring-only
+        // assertion here did not notice.
+        let stderr = fixture.run(&fixture.project, &["rev-parse", "--verify", "HEAD"]);
+        assert_eq!(
+            error,
+            format!(
+                "{} has no commits yet, so there is nothing to branch a task \
+                 worktree from. Make an initial commit, then dispatch again. \
+                 (git: {})",
+                fixture.project.display(),
+                String::from_utf8_lossy(&stderr.stderr).trim()
+            )
+        );
+    }
+
+    #[test]
+    fn ensure_has_commits_refuses_a_repo_with_no_commits_yet() {
+        let fixture = Fixture::new();
+        let error = ensure_has_commits(&fixture.project)
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("no commits yet"), "got: {error}");
+        assert!(error.contains("Nothing has been started"), "got: {error}");
+    }
+
+    #[test]
+    fn ensure_has_commits_accepts_a_repo_with_one_commit() {
+        let fixture = Fixture::new();
+        fixture.seed_commit("README.md", "hello\n");
+        ensure_has_commits(&fixture.project).unwrap();
     }
 
     #[test]

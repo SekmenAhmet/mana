@@ -250,7 +250,9 @@ pub fn run(agent_cli: Option<&str>, resume: bool) -> Result<u8> {
 ///   text billed to the user (#85);
 /// - the repo, by the first dispatch's `worktree::ensure_git_repo` -- on a
 ///   background thread, after the PM had planned and dispatched every task, with
-///   one paid PM turn coming back per executor to say the same thing (#86).
+///   one paid PM turn coming back per executor to say the same thing (#86);
+/// - a repo with no commits to branch a worktree from, by `create`'s own
+///   check -- same story, same one paid PM turn per executor (#192).
 ///
 /// Refusing the launch outright on a non-git project is stronger than the
 /// dispatch gate it hoists: a read-only role would have run. That is the point.
@@ -270,7 +272,8 @@ fn check_preconditions(project_root: &Path, interactive: bool) -> Result<()> {
              nothing has been started."
         );
     }
-    crate::worktree::ensure_git_repo(project_root)
+    crate::worktree::ensure_git_repo(project_root)?;
+    crate::worktree::ensure_has_commits(project_root)
 }
 
 /// Everything a session owes the machine once the loop is over, whichever way
@@ -2253,6 +2256,64 @@ url = "https://example.invalid/fixture"
             "",
             "mana's own output turned up in the user's git status"
         );
+    }
+
+    /// #192: a freshly `git init`-ed project has no commits, so there is
+    /// nothing to branch a task worktree from -- refused at startup, not
+    /// after the PM has planned and dispatched.
+    #[test]
+    fn check_preconditions_refuses_a_repo_with_no_commits() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        std::process::Command::new("git")
+            .args(["-c", "init.defaultBranch=main", "init", "-q"])
+            .current_dir(&project)
+            .output()
+            .expect("git is installed");
+
+        let error = check_preconditions(&project, true).unwrap_err().to_string();
+        assert!(error.contains("make an initial"), "got: {error}");
+        assert!(error.contains("Nothing has been started"), "got: {error}");
+    }
+
+    /// A repo with one commit is exactly what a dispatch needs -- accepted.
+    #[test]
+    fn check_preconditions_accepts_a_repo_with_one_commit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("repo");
+        std::fs::create_dir_all(&project).unwrap();
+        let git = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&project)
+                .env("GIT_AUTHOR_NAME", "test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
+                .env("GIT_COMMITTER_NAME", "test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
+                .output()
+                .expect("git is installed")
+        };
+        git(&["-c", "init.defaultBranch=main", "init", "-q"]);
+        std::fs::write(project.join("README.md"), "hello\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "init"]);
+
+        check_preconditions(&project, true).unwrap();
+    }
+
+    /// A non-git directory still gets `ensure_git_repo`'s own refusal, not
+    /// the no-commits one -- the two checks run in that order and must not
+    /// blur together.
+    #[test]
+    fn check_preconditions_reports_a_non_git_directory_as_not_a_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("plain");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let error = check_preconditions(&project, true).unwrap_err().to_string();
+        assert!(error.contains("not a git repository"), "got: {error}");
+        assert!(!error.contains("no commits"), "got: {error}");
     }
 
     /// Nothing to clean is the normal case, and it says nothing at all.
