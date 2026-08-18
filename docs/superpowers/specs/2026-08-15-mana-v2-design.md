@@ -49,10 +49,23 @@ April 2026 and that per-CLI burden now falls on volunteers.
 │        │                                                                   │
 │        ▼ dispatch                                                          │
 │  sub-agents: bare spawn + prompt (no protocol) ── in git worktrees ──►     │
-│  observer: exit code, duration, files, failure signatures ──► logs.jsonl   │
+│  observer: exit code, duration, failure signatures ──► logs.jsonl         │
 └────────────────────────────────────────────────────────────────────────────┘
          ▲ embedded catalogue (TOML, build-validated)   ▲ local override
 ```
+
+> **Amendment (2026-08-18, #184):** `files` was dropped from the line above —
+> it described an ambition, not what ships. `ExitEntry` (`src/log.rs`) carries
+> no file record and no token field. #58 removed reserved token fields
+> promising "add them back in the commit that populates them," and that
+> commit never came. Capturing files needs a filesystem watcher (a new
+> dependency, and the one plan 1.3 pointed at was v1 code the 4.5 kill sweep
+> later removed) with noise-filtering on top, a judgment call of its own;
+> capturing tokens needs each CLI's structured output parsed per sub-agent
+> dispatch, and the catalogue declares that shape only for the PM driver
+> today (`[pm.events]`, §4). Both are real features with a measurement
+> campaign behind them, not a doc fix, and both stay open for v3 — see §8's
+> amendment for the token half.
 
 Two code paths total, neither CLI-specific:
 
@@ -279,6 +292,19 @@ intentionally as-shipped (kebab-case drivers/scopes, snake_case failure means).
 rankings, $ prices, task categories, observed counters. The first three rot on
 someone else's release schedule; the last lives in `~/.mana/` state.
 
+> **Amendment (2026-08-18, #145):** `routing_weight` (`[subagent].routing_weight`,
+> already in the reference entry above) turned out to be the one ranking that
+> belongs here after all. It is a per-CLI editorial preference the router
+> falls back on only when the two measured counters ahead of it are tied —
+> which every pair is on a fresh project. The alternative tried first,
+> resolving that tie alphabetically, silently sent every new project's
+> default cheap dispatch to the least suitable of the four CLIs, because a
+> CLI's name is an accident and a maintainer's belief about relative fit is
+> not. That belief has to live somewhere; the catalogue is where it can be
+> edited without a Rust change, which is the rule in §2 the rest of this list
+> still serves. The other four items above — prose, $ prices, task
+> categories, observed counters — are still absent.
+
 Catalogue CI: schema validation + golden recorded transcripts per CLI replayed
 against the `[pm.events]` maps.
 
@@ -287,6 +313,13 @@ against the `[pm.events]` maps.
 **Rule: cheapest quota first; escalate on failure.** No quality judgment is
 required or stored — the PM decides *how hard the task is* (cost-class floor),
 mana resolves the concrete pair.
+
+> **Amendment (2026-08-18, #185):** "escalate on failure" never shipped.
+> `mcp::routing::resolve` refuses to bump a cheap dispatch to a pricier class
+> on its own — that would spend expensive quota on a decision the PM never
+> made. It reports every candidate resting on a cooldown and until when; the
+> PM asks for a higher `cost_class` itself if it wants to escalate. The half
+> of the rule that stands is "cheapest quota first."
 
 **Quota state cannot be queried** — measured across all installed CLIs
 (copilot's `/billing`/`/limits` are in-session slash commands; claude only
@@ -297,6 +330,18 @@ nothing). So the router **observes and remembers**:
   avg duration. **Raw counters, never a synthesized score** — with dozens of
   cells and few tasks, "4 of 6" lets the PM discount small samples; a "7/10"
   from different sessions cannot stay calibrated.
+
+  > **Amendment (2026-08-18, #145, #185):** the router does rank candidate
+  > pairs with the raw counters above — `(validated desc, quota_failures asc,
+  > routing_weight desc, cli, model)` — before ever handing anything to the
+  > PM, because resolving a tie alphabetically was the bug #145 found: it
+  > silently sent every fresh project's default cheap dispatch to the least
+  > suitable of the four CLIs. That ordering is mana's own preference over
+  > pairs within one already-chosen cost class, not a stored score — nothing
+  > is written back, it is recomputed from these same counters on every
+  > call, and the PM still sees the raw counters via `list_agents` to discount
+  > a small sample itself. "Never a synthesized score" overstated what the
+  > counters are for; "never stored" is what stands.
 - The reviewer's verdict *is* the outcome signal, and it carries an
   **attribution field: code vs brief**. Only code-rejections count against the
   model (a bad brief must not condemn a good model — the agy-cwd incident).
@@ -307,10 +352,20 @@ nothing). So the router **observes and remembers**:
   mana knows its own dispatch count for free. Cost/token enrichment is
   harvested only where the catalogue declares structured output.
 
-Log field names follow **OTEL GenAI semantic conventions** (`gen_ai.usage.*`,
-`gen_ai.client.operation.duration`) so a future OTEL backend is a pipe change.
-OTEL itself is rejected for now (experimental, 2/5 CLIs, would force an OTLP
-collector into a CLI binary).
+Log field names follow **OTEL GenAI semantic conventions**
+(`gen_ai.client.operation.duration`) so a future OTEL backend is a pipe
+change. OTEL itself is rejected for now (experimental, 2/5 CLIs, would force
+an OTLP collector into a CLI binary).
+
+> **Amendment (2026-08-18, #184):** only `gen_ai.client.operation.duration`
+> shipped (`ExitEntry`, `src/log.rs`). `gen_ai.usage.*` never did: #58 removed
+> the reserved token fields, promising to "add them back in the commit that
+> populates them," and that commit never came. Populating them means parsing
+> each CLI's structured output per sub-agent dispatch, and the catalogue
+> declares that shape only for the PM driver today (`[pm.events]`, §4) —
+> extending it to sub-agents is a feature with a measurement campaign behind
+> it, not a doc fix. Left open for v3; see §3's amendment for the matching
+> gap on the files side.
 
 ## 9. Roles, permissions, isolation
 
@@ -341,6 +396,16 @@ isolation (ports, DBs) is out of scope for v2; containers can layer on later.
 **Non-git projects:** write roles require a git repo — without one, mana
 refuses the dispatch with a clear message ("init a repo first"). Read-only
 roles work anywhere. No degraded write mode to maintain.
+
+> **Amendment (2026-08-18, #188):** "read-only roles work anywhere" never
+> shipped. `mana launch`'s `check_preconditions` calls `ensure_git_repo` for
+> the whole session before any role is even chosen (`src/cli/launch_pm.rs`),
+> refusing the launch outright on a non-git project — stronger than gating
+> only the write dispatch, because the alternative would let a read-only
+> role run for a session whose whole purpose is to dispatch work (#86). A
+> reviewer needs the `WorktreeInfo` an executor dispatch produced anyway, so
+> it was never reachable git-free either. The non-git refusal message
+> stands; "read-only roles work anywhere" does not.
 
 ## 10. What this kills in the current code
 

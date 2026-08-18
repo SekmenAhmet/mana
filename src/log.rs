@@ -548,4 +548,62 @@ mod tests {
         let result = counters(&tmp.path().join("logs"), &Registry::default()).unwrap();
         assert!(result.is_empty());
     }
+
+    /// §3 and §8 of the design document describe what the observer records
+    /// today; `ExitEntry` above is the struct that actually ships. This pins
+    /// the two together so a future edit to either cannot silently reopen
+    /// #184 (the doc promising `gen_ai.usage.*`/file capture that `ExitEntry`
+    /// never carried).
+    ///
+    /// Amendment blockquotes (lines starting `> `) are excluded before
+    /// checking, since the whole point of that convention is to record a
+    /// promise as *no longer standing* right next to it -- scanning them too
+    /// would make this test fail on the very sentence that fixed #184.
+    /// Matching is on field names, not full sentences, so a prose rewrite
+    /// that keeps the same facts does not break this test.
+    #[test]
+    fn design_doc_observer_claim_matches_exit_entry() {
+        const DESIGN: &str = include_str!("../docs/superpowers/specs/2026-08-15-mana-v2-design.md");
+
+        fn standing_text(design: &str, heading: &str, next_heading: &str) -> String {
+            let section = design
+                .split_once(heading)
+                .unwrap_or_else(|| panic!("design doc has no {heading:?} section"))
+                .1
+                .split_once(next_heading)
+                .unwrap_or_else(|| panic!("{heading:?} section has no {next_heading:?} after it"))
+                .0;
+            section
+                .lines()
+                .filter(|line| !line.trim_start().starts_with('>'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        let arch = standing_text(DESIGN, "## 3. Architecture overview", "\n## 4.");
+        let routing = standing_text(DESIGN, "## 8. Routing and reputation", "\n## 9.");
+
+        // What ExitEntry actually carries, named the way the doc names it.
+        for field in ["exit code", "duration", "failure signatures"] {
+            assert!(arch.contains(field), "§3 no longer names {field}: {arch}");
+        }
+        assert!(
+            routing.contains("gen_ai.client.operation.duration"),
+            "§8 no longer names the one field ExitEntry does carry: {routing}"
+        );
+
+        // What ExitEntry does not carry: the standing (non-amendment) text
+        // must not promise it as delivered.
+        assert!(!arch.contains("files"), "§3 still promises files: {arch}");
+        assert!(
+            !routing.contains("gen_ai.usage"),
+            "§8 still promises gen_ai.usage.*: {routing}"
+        );
+
+        // The struct itself: neither field exists to serialize.
+        let entry = sample_exit(Some(1500), Some("quota_exhausted"));
+        let json = serde_json::to_string(&entry).unwrap();
+        assert!(!json.contains("file"), "{json}");
+        assert!(!json.contains("gen_ai.usage"), "{json}");
+    }
 }

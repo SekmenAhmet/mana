@@ -1,11 +1,13 @@
 //! Which (CLI × model) a dispatch actually runs on.
 //!
 //! The PM says how hard a task is (a cost class); this module says which
-//! concrete pair pays for it. Design §8 is the whole specification: cheapest
-//! quota first, no synthesized quality score, and the choice derived from what
-//! mana already wrote down -- `subagents.jsonl`, `logs/*.jsonl`, `reviews/*.json`.
-//! There is no router state file, because a second store of the same facts is
-//! a second thing that can be wrong.
+//! concrete pair pays for it. Design §8 and §7's amendments (2026-08-18,
+//! #145, #185) are the specification: cheapest quota first among installed,
+//! not-cooling candidates, ranked by the counters and the catalogue's
+//! `routing_weight` -- never escalated automatically, never stored back --
+//! and derived from what mana already wrote down -- `subagents.jsonl`,
+//! `logs/*.jsonl`, `reviews/*.json`. There is no router state file, because a
+//! second store of the same facts is a second thing that can be wrong.
 //!
 //! Determinism is a requirement, not a nicety: the PM cannot debug a dispatch
 //! it cannot predict, and a test cannot assert on a tie broken by hash order.
