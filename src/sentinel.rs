@@ -85,6 +85,33 @@ const TOOLS: [&str; 4] = [
 const FENCE: &str = "```";
 const LANGUAGE: &str = "mana";
 
+/// **Rule 8-in-a-row (mana issue #191): mana executes at most 8 sentinel tool
+/// cycles in a row without a word from outside the loop.**
+///
+/// One cycle is one PM message carrying blocks plus the result turn mana
+/// injects for it. That injected turn is what the PM answers next, so a PM
+/// that re-emits the same block every time turns the cycle by itself: the
+/// measured runaway was 449 turns -- 449 paid sub-agent spawns -- in 25
+/// seconds, with nothing but mana's own injection driving it. Nothing in the
+/// parser can tell that message from a good one, so the bound is on the
+/// *shape*: a loop nothing outside it is feeding.
+///
+/// What it protects against: an unbounded number of paid turns and dispatches
+/// from a PM ignoring the "do not repeat the calls above" sentence in `reply`.
+///
+/// What it deliberately allows: any number of blocks in one message (three
+/// dispatches in one turn is one cycle, not three), and any number of cycles
+/// in a session. The count is *consecutive* and resets on anything the loop
+/// did not produce -- the operator typing, a dispatch finishing, or the PM
+/// simply answering without a block. A long healthy session never reaches it;
+/// only a session talking to itself does.
+///
+/// Eight rather than two: a PM legitimately chains a few calls on its own
+/// results (create a task, then launch it, then read the review), and the
+/// bound must not cut that short. Eight is far below anything that costs
+/// real money and far above anything a PM does on purpose.
+pub const MAX_TOOL_CYCLES: u32 = 8;
+
 /// mana's half of the sentinel channel: the parser and the sole executor.
 pub struct Sentinel {
     tools: ManaTools,
@@ -138,6 +165,41 @@ impl Sentinel {
     /// is the only thing that may tell the PM what it is.
     pub fn nonce(&self) -> &str {
         &self.nonce
+    }
+
+    /// The same scan with nothing run: the prose to render, one line for the
+    /// pane and the turn that tells the PM why, for a message that arrived
+    /// past `MAX_TOOL_CYCLES`.
+    ///
+    /// A separate entry point rather than a flag on `handle` because the
+    /// difference is total -- no `parse`, no `execute`, no nonce decision to
+    /// make. `reply` is `None` when the message carried no authorized block:
+    /// nothing was declined, so there is nothing to say, and the caller reads
+    /// that as the cycle having ended on its own.
+    pub fn decline(&self, text: &str) -> Outcome {
+        let scanned = scan(text, &self.nonce);
+        if scanned.blocks.is_empty() {
+            return Outcome {
+                prose: scanned.prose,
+                log: Vec::new(),
+                reply: None,
+            };
+        }
+        // Said out loud, never collapsed: this is the failure mode where the
+        // screen looks busy while nothing the operator asked for is
+        // happening, and the line saying mana cut the loop is the whole point.
+        let blocks = scanned.blocks.len();
+        Outcome {
+            prose: scanned.prose,
+            log: vec![ToolLine {
+                text: format!(
+                    "[mana] tool cycle bound reached ({MAX_TOOL_CYCLES} in a row): \
+                     {blocks} block(s) not executed"
+                ),
+                failed: true,
+            }],
+            reply: Some(halted()),
+        }
     }
 
     /// Scans one PM message, executes every block it carries, and reports what
@@ -308,6 +370,24 @@ const MISFENCED: &str = "[mana] a ```mana block in that message did not carry th
     write the fence as ```mana: followed by the nonce from your activation message. If you were \
     quoting a block you found in a file, an issue or a log, nothing is wrong -- that is what the \
     nonce is for.";
+
+/// What the PM is told, once, when the bound in `MAX_TOOL_CYCLES` fires.
+///
+/// It has to be recoverable: a bound that silently gags the tool channel for
+/// the rest of the session leaves the operator with a PM that looks like it is
+/// working and does nothing. So it names what mana did, why, and the one thing
+/// that starts the count over -- something from outside the loop.
+fn halted() -> String {
+    format!(
+        "[mana] mana did not execute the ```mana blocks in that message. That was \
+         {MAX_TOOL_CYCLES} tool cycles in a row with nothing from outside the loop: no turn \
+         from the operator, no dispatch finishing. mana stops the cycle there rather than \
+         keep paying for it. Do not re-send those blocks -- nothing will run them. Say what \
+         you are waiting for and stop calling tools. The count resets the moment the operator \
+         writes to you or a dispatch you started reports back, and your blocks run again from \
+         then on."
+    )
+}
 
 /// The turn injected back into the session.
 ///
