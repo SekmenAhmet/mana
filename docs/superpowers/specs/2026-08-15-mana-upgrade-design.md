@@ -84,6 +84,16 @@ binary.
 - Checksum/signature verification of downloaded binaries (self_update
   doesn't do this by default either; a v2 concern, not v1)
 
+> **Amendment (2026-08-18, #188):** the first and third bullets shipped and
+> are no longer out of scope. `cargo-dist` builds `mana-x86_64-pc-windows-msvc`
+> and `mana upgrade` resolves and installs it (`src/cli/upgrade.rs`) — the
+> "existing CI matrix" this bullet cited added Windows once v2 claimed
+> cross-platform support (see the CI pipeline design's own amendment).
+> Checksum verification shipped too: `mana upgrade` fetches the release's
+> `.sha256` asset and refuses to self-replace on a mismatch
+> (`src/cli/upgrade.rs`), ahead of the "v2 concern" this bullet expected. The
+> middle bullet, manually-pushed-tag releases, is still accurate.
+
 ## Testing
 
 - `describe_update_result` — unit tested for both `Status::UpToDate` and
