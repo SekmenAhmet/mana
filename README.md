@@ -459,8 +459,15 @@ through the shared decoder instead, pinning which notification becomes prose
 and which becomes a technical line. A separate job runs `cargo-deny` (RustSec
 advisories, a license allowlist, duplicate-major-version warnings, source
 restrictions — accepted exceptions are recorded with their exit path in
-`deny.toml`), checks that the generated release workflow still matches
-`dist-workspace.toml`, and reports coverage via `cargo-llvm-cov`. The same
+`deny.toml`), checks that `release.yml` — the only workflow cargo-dist
+generates — still matches `dist-workspace.toml` by running `dist generate
+--check`, and reports coverage via `cargo-llvm-cov`. That check compares
+`release.yml` in full against a fresh `dist generate`, so
+`dist-workspace.toml` sets `allow-dirty = ["ci"]` to let the hand-added
+`guard` job survive it; the cost is that `dist-workspace.toml` can now drift
+out of sync with `release.yml` without CI catching it — after editing
+`dist-workspace.toml`, run `dist generate` by hand and re-apply `guard`'s
+exceptions (see [RELEASING.md](RELEASING.md) for the full list). The same
 `cargo-deny` check also runs every Monday on a schedule, so a CVE published
 while the repo is quiet does not stay invisible until the next commit.
 
