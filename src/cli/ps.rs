@@ -5,9 +5,11 @@
 //! only what was *started*. See that module for what `running`, `done`,
 //! `stale` and `unknown` are each worth.
 //!
-//! Exit code is always 0, including when a stale dispatch is listed. `ps` is a
-//! listing, and a listing that fails is one no script can pipe; `mana doctor`
-//! is the command whose exit code is a verdict.
+//! No dispatch status — stale, unknown, or otherwise — ever changes `ps`'s
+//! exit code; only failing to resolve the state at all does (unresolvable
+//! mana home, unreadable registry, failing `current_dir`). That distinction
+//! is the line between a listing that found bad news and one that never ran.
+//! `mana doctor` is still the command whose exit code is a verdict.
 
 use crate::project::{mana_home, project_name_from_dir};
 use crate::status::{self, Dispatch, DispatchStatus, Liveness};
