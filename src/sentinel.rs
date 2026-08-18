@@ -66,6 +66,7 @@ use crate::mcp::ManaTools;
 use anyhow::Result;
 use serde::Serialize;
 use serde_json::Value;
+use std::cell::RefCell;
 use std::path::Path;
 
 /// The tools a fenced block may name. Spelled out so an unknown name can be
@@ -93,6 +94,24 @@ pub struct Sentinel {
     /// Kept in memory only -- persisting it anywhere would put it in reach of
     /// the quoted files it exists to disarm.
     nonce: String,
+    /// The body of the last block that was *successfully dispatched* (#191).
+    ///
+    /// A PM that re-emits the identical block it was just given results for
+    /// would otherwise spin indefinitely: one paid turn and one process spawn
+    /// per cycle. Comparing against the previous call rather than a sliding
+    /// window is the minimal rule that catches the measured failure (449 turns,
+    /// same body every time) without blocking a PM that calls the same tool
+    /// twice with different arguments, or calls it again after an intervening
+    /// different call.
+    ///
+    /// Read-only tools such as `list_agents` are tracked like any other: a PM
+    /// legitimately polling twice in a row will be refused, but the refusal
+    /// message names what was refused and tells it how to proceed, so recovery
+    /// is immediate. `RefCell` gives interior mutability so `handle` keeps its
+    /// `&self` signature -- it is called through a shared borrow of `self` in
+    /// `apply_tools`, where taking `&mut self` would conflict with the borrow of
+    /// `self.pm` for the reply turn that follows.
+    last_block: RefCell<Option<String>>,
 }
 
 /// What one PM message produced.
@@ -131,6 +150,7 @@ impl Sentinel {
             // that only has to survive one session needs -- and reusing what
             // is already in the tree beats reasoning about a second one.
             nonce: uuid::Uuid::new_v4().simple().to_string(),
+            last_block: RefCell::new(None),
         }
     }
 
@@ -167,8 +187,36 @@ impl Sentinel {
         for block in &blocks {
             let (line, result) = match parse(block) {
                 Ok(call) => {
-                    let outcome = self.execute(&call);
-                    (call.log_line(&outcome), call.result_line(&outcome))
+                    // Check for repeated identical block (#191): if this body is
+                    // byte-identical to the last successfully dispatched one, refuse
+                    // it rather than executing again. The refusal is explicit text so
+                    // the PM knows what happened and can reformulate instead of
+                    // waiting in silence for a result nobody will send.
+                    if self.last_block.borrow().as_deref() == Some(block.as_str()) {
+                        let reason = format!(
+                            "[mana] refused: this block is a repeated copy of the one \
+                             mana just executed. To call the same tool again, rewrite \
+                             the block (add a note, change the args, or send it in a \
+                             later turn after a different call clears this guard). \
+                             Refused body: {block}"
+                        );
+                        (
+                            ToolLine {
+                                text: reason.clone(),
+                                failed: true,
+                            },
+                            reason,
+                        )
+                    } else {
+                        let outcome = self.execute(&call);
+                        // On success, record this body so the next identical one
+                        // is caught. On failure, leave last_block unchanged: the
+                        // block did not run, so it is not a repeat worth blocking.
+                        if outcome.is_ok() {
+                            *self.last_block.borrow_mut() = Some(block.clone());
+                        }
+                        (call.log_line(&outcome), call.result_line(&outcome))
+                    }
                 }
                 Err(reason) => (
                     ToolLine {
@@ -949,5 +997,66 @@ mod tests {
             .handle(&fixture.block(r#"{"tool": "list_agents"}"#));
         let mcp = serde_json::to_value(fixture.tools.list_agents_impl().unwrap()).unwrap();
         assert!(sentinel.reply.unwrap().contains(&mcp.to_string()));
+    }
+
+    /// #191: the sentinel tool→reply cycle was unbounded. A PM that re-emits
+    /// the same block it was just given results for can spin indefinitely -- one
+    /// paid turn and one process spawn per iteration. The rule: if the last
+    /// *executed* block is identical to one arriving now, mana refuses that
+    /// block rather than running it again. The refusal is explicit text so a
+    /// legitimately repeating call is recoverable: the PM is told what was
+    /// refused and why, and can reformulate rather than wait in silence.
+    ///
+    /// "The same block twice in a row" is the minimal rule that would have
+    /// caught the measured run (449 turns, 25 seconds, same block every time).
+    /// It does not prevent a PM from calling the same tool with different args,
+    /// nor from calling it again after an intervening different call -- only
+    /// exact repetition of the last block is blocked.
+    #[test]
+    fn a_repeated_identical_block_is_refused_with_an_explanatory_message() {
+        let fixture = Fixture::new();
+        let block = fixture.block(r#"{"tool": "list_agents"}"#);
+
+        // First call: executes normally.
+        let first = fixture.sentinel.handle(&format!("Turn one.\n{block}"));
+        assert!(
+            first
+                .reply
+                .as_ref()
+                .is_some_and(|r| r.contains("list_agents ok:")),
+            "first call must succeed: {:?}",
+            first.reply
+        );
+        assert!(
+            first.log.iter().any(|l| !l.failed),
+            "first call must produce a success line"
+        );
+
+        // Second call: same block, same body -- mana refuses rather than
+        // executing again. This is what would have caught the 449-turn loop.
+        let second = fixture.sentinel.handle(&format!("Turn two.\n{block}"));
+        // The refusal must be in the reply, not silence -- so the PM knows
+        // what happened and can recover (e.g. wait, or reformulate).
+        let reply = second.reply.expect("a refused repeat must still reply");
+        assert!(
+            reply.contains("refused"),
+            "refusal reply must say 'refused': {reply}"
+        );
+        assert!(
+            reply.contains("repeated"),
+            "refusal reply must explain the reason: {reply}"
+        );
+        // The refusal line in the log is news: the PM is stuck in a loop and
+        // the operator must see it -- it is not annotation to collapse.
+        assert!(
+            second.log.iter().any(|l| l.failed),
+            "a refused repeat must produce a failed log line"
+        );
+        // Nothing was executed a second time: no second task, no second agent.
+        assert!(
+            second.log.iter().all(|l| l.failed),
+            "the refused block must not have run: {:?}",
+            second.log
+        );
     }
 }
