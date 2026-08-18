@@ -129,11 +129,19 @@ routing_weight        = 60
 # It needs one because discovery reports ids and nothing reports a cost class,
 # so with no statics at all every cost_class route silently resolved to claude
 # and this free tier -- the whole point of routing here -- was never used (#31).
-# An id outside the seed is still dispatchable when the PM names it together
-# with "cli"; see `routing::validate_model`.
+# An id outside the seed is *not* dispatchable, not even when the PM names it
+# with "cli": `routing::validate_model` takes a non-static id only while the
+# seed is empty, which #31 stopped being true here. To dispatch one more, seed
+# it -- `mana doctor` prints seed and discovery side by side so the gap shows
+# (#193).
 discovery_args = ["models"]         # refresh the seed from its output
-# No line_regex: the output is one bare "provider/model" id per line, unlike
-# agy's TSV, so the whole line is the id.
+# capture group = model id. Every id here is "provider/model", and the anchors
+# are the point: discovery reads stdout *and* stderr (two of the four shipped
+# CLIs answer on stderr), so with no regex a warning on that stream -- "one
+# time database migration, may take a few minutes..." on the first run after an
+# update -- was reported as a model and reseeded from (#165). Nothing but this
+# entry can tell an id from a sentence, which is what line_regex is for.
+line_regex     = '^(\S+/\S+)$'
 
 # Seeded from `opencode models` on 2026-08-16 -- all seven, all cheap, because
 # they are all the free OpenCode Zen tier and nothing here distinguishes them

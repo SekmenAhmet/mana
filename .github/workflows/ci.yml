@@ -93,7 +93,7 @@ jobs:
       # `cargo run` builds *and* executes it, so one line covers both, on all
       # three OSes without hardcoding the target path.
       - name: Smoke-test the shipping profile
-        run: cargo run --release --locked -- --version
+        run: cargo run --profile dist --locked -- --version
 
   health:
     name: deps & coverage

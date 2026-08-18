@@ -172,7 +172,12 @@ pub fn worktree_path(mana_home: &Path, project_root: &Path, task_id: &str) -> Pa
 /// landed, straight from the PM over MCP — untrusted enough that a `..` or a
 /// separator would otherwise build a path outside the worktree root and a
 /// branch name outside the `mana/` namespace.
-fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
+///
+/// Visible to the crate because `dispatch_reviewer` needs the same rule for
+/// the same reason and creates no worktree to get it from `create` (#187),
+/// and a second copy of the character set would be a second answer to "what
+/// is a task id".
+pub(crate) fn validate_task_id(task_id: &str) -> anyhow::Result<()> {
     let acceptable = !task_id.is_empty()
         && task_id
             .chars()
@@ -230,32 +235,51 @@ pub fn remove_at(project_root: &Path, path: &Path) -> anyhow::Result<()> {
 /// executor would be editing the shared tree. Repos hit by this are exactly
 /// the ones a user is likely to dispatch on: submodule checkouts set
 /// `core.worktree`. git-worktree(1) "CONFIGURATION FILE" prescribes this move.
-fn enable_worktree_config(project_root: &Path) -> anyhow::Result<()> {
-    let existing = git_output(
-        project_root,
-        &["config", "--local", "--get", "extensions.worktreeConfig"],
-    )?;
-    if probe_stdout(&existing) != "true"
-        && let Err(lost) = git(
-            project_root,
-            &["config", "--local", "extensions.worktreeConfig", "true"],
-        )
-    {
-        // `git config` takes `.git/config.lock` and does not retry, so in a
-        // project's first parallel wave every dispatch but one loses this
-        // write -- and used to fail the dispatch over a lock file (#201).
-        // Losing the write is not losing the outcome: the value this call
-        // wanted is the value the winner wrote. Only a repo that still does
-        // not have the extension is a real failure, and then the original
-        // git error is the one worth reporting.
-        let settled = git_output(
+/// Sets `extensions.worktreeConfig`, tolerating everyone who loses the race to
+/// set it.
+///
+/// `git config` takes `.git/config.lock` and does not retry, so in a project's
+/// first parallel wave every dispatch but one loses this write and used to fail
+/// the dispatch over a lock file (#201). Losing the write is not losing the
+/// outcome -- the value this call wanted is the value the winner is writing --
+/// but a single re-read is not enough: the winner holds the lock while it
+/// writes a temp file and renames it into place, so a loser that reads in that
+/// window still sees the old config. Hence read, attempt, read again, a few
+/// times over; only a repo that still has no extension at the end is a real
+/// failure, and then the last git error is the one worth reporting.
+///
+/// ponytail: a fixed attempt count rather than a backoff. The contended window
+/// is one git rename, and a dispatch still losing after this has a problem no
+/// amount of waiting solves.
+fn set_worktree_extension(project_root: &Path) -> anyhow::Result<()> {
+    const ATTEMPTS: usize = 5;
+    const PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+    let mut lost = None;
+    for attempt in 0..ATTEMPTS {
+        let existing = git_output(
             project_root,
             &["config", "--local", "--get", "extensions.worktreeConfig"],
         )?;
-        if probe_stdout(&settled) != "true" {
-            return Err(lost);
+        if probe_stdout(&existing) == "true" {
+            return Ok(());
+        }
+        match git(
+            project_root,
+            &["config", "--local", "extensions.worktreeConfig", "true"],
+        ) {
+            Ok(_) => return Ok(()),
+            Err(error) => lost = Some(error),
+        }
+        if attempt + 1 < ATTEMPTS {
+            std::thread::sleep(PAUSE);
         }
     }
+    Err(lost.expect("every attempt that fell through recorded its error"))
+}
+
+fn enable_worktree_config(project_root: &Path) -> anyhow::Result<()> {
+    set_worktree_extension(project_root)?;
 
     let shared_worktree = git_output(
         project_root,
@@ -759,8 +783,11 @@ mod tests {
     /// dispatches to a git lock file. Losing the write is not losing the
     /// outcome: the value the loser wanted is the value the winner wrote.
     ///
-    /// Ten rounds because one is a coin toss and the failure is what is being
-    /// pinned; the measured rate before the fix was 25/25 at this concurrency.
+    /// Four writers rather than two, because the first version of the fix
+    /// re-read exactly once and still lost on CI: the winner holds the lock
+    /// while it renames its temp file into place, so a loser reading in that
+    /// window sees the old config. More writers widens that window, which is
+    /// the thing worth pinning.
     #[test]
     fn a_lost_race_to_set_the_worktree_extension_is_not_a_failed_dispatch() {
         use std::sync::{Arc, Barrier};
@@ -768,9 +795,9 @@ mod tests {
         for round in 0..10 {
             let fixture = Fixture::new();
             let project = Arc::new(fixture.project.clone());
-            let gate = Arc::new(Barrier::new(2));
+            let gate = Arc::new(Barrier::new(4));
 
-            let handles: Vec<_> = (0..2)
+            let handles: Vec<_> = (0..4)
                 .map(|_| {
                     let project = Arc::clone(&project);
                     let gate = Arc::clone(&gate);
