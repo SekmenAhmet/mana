@@ -387,27 +387,49 @@ fn probe(entry: &CliEntry) -> Probe {
     }
 }
 
-/// The static list, or the result of actually running the CLI's discovery
-/// command. Half the catalogue would rot on someone else's release schedule
-/// otherwise, which is why `discovery_args` exists -- and why a failed
-/// discovery has to say so rather than quietly render an empty list.
+/// The static seed, what discovery offers, or both -- labelled, when there are
+/// two of them (#193). Both because they answer different questions and are
+/// not the same set: the seed is what `routing::validate_model` accepts, so it
+/// is the only list a dispatch may name, while discovery is what the installed
+/// CLI happens to serve today. Showing discovery *instead of* the seed, which
+/// is what this did while `discovery_args` was set, printed exactly the ids
+/// `launch_subagent` refuses and hid the ones it takes -- the escape hatch that
+/// once made a discovered id dispatchable only survives while the seed is
+/// empty, and #31 filled it in for both entries that discover.
+///
+/// Discovery still runs, and a failed one still has to say so rather than
+/// quietly render an empty list: half the catalogue would rot on someone
+/// else's release schedule without it.
 fn models_line(entry: &CliEntry, binary: Option<&Path>) -> String {
-    if !entry.models.discovery_args.is_empty() {
-        let Some(binary) = binary else {
-            return format!(
-                "discovered at runtime via `{}` -- needs the binary",
-                args_line(&entry.models.discovery_args)
-            );
-        };
-        return match discover_models(binary, entry) {
+    let seed = seed_line(entry);
+    if entry.models.discovery_args.is_empty() {
+        return seed;
+    }
+    let discovered = match binary {
+        // Not "no models": nothing was asked, so nothing was answered.
+        None => format!(
+            "discovered at runtime via `{}` -- needs the binary",
+            args_line(&entry.models.discovery_args)
+        ),
+        Some(binary) => match discover_models(binary, entry) {
             Ok(models) if models.is_empty() => format!(
                 "discovery via `{}` returned no model ids",
                 args_line(&entry.models.discovery_args)
             ),
-            Ok(models) => format!("{} (discovered)", truncate_list(&models)),
+            Ok(models) => format!("discovered: {}", truncate_list(&models)),
             Err(error) => format!("discovery failed: {error}"),
-        };
+        },
+    };
+    if entry.models.static_models.is_empty() {
+        // No seed to confuse it with -- and the one case where a discovered id
+        // really is dispatchable.
+        return discovered;
     }
+    format!("routable: {seed}; {discovered}")
+}
+
+/// The seed, rendered with the two facts routing reads off it.
+fn seed_line(entry: &CliEntry) -> String {
     if entry.models.static_models.is_empty() {
         return "none declared".to_string();
     }
@@ -1243,7 +1265,46 @@ mod process_tests {
         .unwrap();
 
         let models = models_line(&entry, Some(&script));
-        assert_eq!(models, "fast, slow (discovered)");
+        // Only the discovered half: which lists the line carries is the test
+        // below, this one is about the TSV capture.
+        assert!(models.ends_with("discovered: fast, slow"), "{models}");
+    }
+
+    /// #193: an entry with both lists had only the discovered one printed --
+    /// which is the list `routing::validate_model` refuses, since it accepts a
+    /// non-static id only while the seed is empty. Both, labelled, or doctor
+    /// names the models a dispatch cannot use and hides the ones it can.
+    #[test]
+    fn an_entry_with_a_seed_shows_it_beside_what_discovery_offers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let script = write_script(
+            tmp.path(),
+            "alpha",
+            "#!/bin/sh\nif [ \"$1\" = models ]; then\n  printf 'fast\\tcheap\\nslow\\tdear\\n'\nelse\n  echo 9.9.9\nfi\n",
+        );
+        let entry = parse_entry(
+            &super::tests::FIXTURE
+                .replace(
+                    r#"bin = "alpha-does-not-exist""#,
+                    &format!("bin = {script:?}"),
+                )
+                .replace(
+                    "discovery_args = []",
+                    "discovery_args = [\"models\"]\nline_regex = '^(\\S+)\\t'",
+                ),
+        )
+        .unwrap();
+        // Same warm-up, same reason as `probing_in_parallel_...` below: the
+        // first exec of a just-written script can outlast DISCOVERY_TIMEOUT on
+        // macOS, and that is a scan, not a discovery.
+        let _ = std::process::Command::new(&script)
+            .arg("--version")
+            .output();
+
+        assert_eq!(
+            models_line(&entry, Some(&script)),
+            "routable: mini (cheap, pool main); discovered: fast, slow"
+        );
     }
 
     #[test]
@@ -1316,7 +1377,10 @@ mod process_tests {
 
         let sequential: Vec<Probe> = entries.iter().map(probe).collect();
         assert_eq!(probe_all(&entries), sequential);
-        assert_eq!(sequential[0].models, "fast, slow (discovered)");
+        assert_eq!(
+            sequential[0].models,
+            "routable: mini (cheap, pool main); discovered: fast, slow"
+        );
         assert_eq!(sequential[1].binary, None);
     }
 
