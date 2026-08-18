@@ -235,11 +235,26 @@ fn enable_worktree_config(project_root: &Path) -> anyhow::Result<()> {
         project_root,
         &["config", "--local", "--get", "extensions.worktreeConfig"],
     )?;
-    if probe_stdout(&existing) != "true" {
-        git(
+    if probe_stdout(&existing) != "true"
+        && let Err(lost) = git(
             project_root,
             &["config", "--local", "extensions.worktreeConfig", "true"],
+        )
+    {
+        // `git config` takes `.git/config.lock` and does not retry, so in a
+        // project's first parallel wave every dispatch but one loses this
+        // write -- and used to fail the dispatch over a lock file (#201).
+        // Losing the write is not losing the outcome: the value this call
+        // wanted is the value the winner wrote. Only a repo that still does
+        // not have the extension is a real failure, and then the original
+        // git error is the one worth reporting.
+        let settled = git_output(
+            project_root,
+            &["config", "--local", "--get", "extensions.worktreeConfig"],
         )?;
+        if probe_stdout(&settled) != "true" {
+            return Err(lost);
+        }
     }
 
     let shared_worktree = git_output(
@@ -736,5 +751,44 @@ mod tests {
             .unwrap(),
             std::fs::canonicalize(&fixture.project).unwrap()
         );
+    }
+
+    /// #201: every dispatch in a parallel wave runs `enable_worktree_config`,
+    /// and `git config --local` takes `.git/config.lock` without retrying. The
+    /// losers used to bail, so a project's first parallel wave lost half its
+    /// dispatches to a git lock file. Losing the write is not losing the
+    /// outcome: the value the loser wanted is the value the winner wrote.
+    ///
+    /// Ten rounds because one is a coin toss and the failure is what is being
+    /// pinned; the measured rate before the fix was 25/25 at this concurrency.
+    #[test]
+    fn a_lost_race_to_set_the_worktree_extension_is_not_a_failed_dispatch() {
+        use std::sync::{Arc, Barrier};
+
+        for round in 0..10 {
+            let fixture = Fixture::new();
+            let project = Arc::new(fixture.project.clone());
+            let gate = Arc::new(Barrier::new(2));
+
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let project = Arc::clone(&project);
+                    let gate = Arc::clone(&gate);
+                    std::thread::spawn(move || {
+                        gate.wait();
+                        enable_worktree_config(&project)
+                    })
+                })
+                .collect();
+
+            for handle in handles {
+                let outcome = handle.join().unwrap();
+                assert!(
+                    outcome.is_ok(),
+                    "round {round}: a concurrent dispatch lost the config write and failed: {:#}",
+                    outcome.unwrap_err()
+                );
+            }
+        }
     }
 }
