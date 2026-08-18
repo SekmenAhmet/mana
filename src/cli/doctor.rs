@@ -229,10 +229,28 @@ pub fn diagnose(options: &Options<'_>) -> Result<Report> {
         None => None,
     };
 
+    // Derived once for the whole report, and not because it is expensive
+    // (though it is: `classify` probes every unfinished pid, and on Windows
+    // that shells out to `tasklist`). `status::dispatches_in` prints the
+    // registry's skipped-line warnings as it reads, so deriving it twice said
+    // every corruption twice -- against the "exactly once per command"
+    // contract `src/status.rs` states (#167).
+    let dispatches = match &project {
+        Some((_, _, name)) => status::dispatches_in(options.mana_home, name)?,
+        None => Vec::new(),
+    };
+
     catalogue_section(options, observations.as_ref(), &mut report);
     if let Some((root, paths, name)) = &project {
-        project_section(options, paths, name, observations.as_ref(), &mut report)?;
-        worktree_section(options, root, name, &mut report)?;
+        project_section(
+            options,
+            paths,
+            name,
+            &dispatches,
+            observations.as_ref(),
+            &mut report,
+        )?;
+        worktree_section(options, root, name, &dispatches, &mut report)?;
     }
     Ok(report)
 }
@@ -602,13 +620,13 @@ fn project_section(
     options: &Options<'_>,
     paths: &ProjectPaths,
     name: &str,
+    dispatches: &[Dispatch],
     observations: Option<&Observations>,
     report: &mut Report,
 ) -> Result<()> {
     report.say("");
     report.say(format!("project '{name}' -- {}", paths.root.display()));
 
-    let dispatches = status::dispatches_in(options.mana_home, name)?;
     if dispatches.is_empty() {
         report.say("  no dispatches recorded yet");
         return Ok(());
@@ -747,13 +765,13 @@ fn worktree_section(
     options: &Options<'_>,
     project_root: &Path,
     name: &str,
+    dispatches: &[Dispatch],
     report: &mut Report,
 ) -> Result<()> {
     let dir = worktree::worktrees_dir(options.mana_home, name);
     let Ok(entries) = std::fs::read_dir(&dir) else {
         return Ok(());
     };
-    let dispatches = status::dispatches_in(options.mana_home, name)?;
 
     let mut leftovers: Vec<(PathBuf, String, bool)> = Vec::new();
     for entry in entries {
