@@ -135,8 +135,13 @@ routing_weight        = 60
 # it -- `mana doctor` prints seed and discovery side by side so the gap shows
 # (#193).
 discovery_args = ["models"]         # refresh the seed from its output
-# No line_regex: the output is one bare "provider/model" id per line, unlike
-# agy's TSV, so the whole line is the id.
+# capture group = model id. Every id here is "provider/model", and the anchors
+# are the point: discovery reads stdout *and* stderr (two of the four shipped
+# CLIs answer on stderr), so with no regex a warning on that stream -- "one
+# time database migration, may take a few minutes..." on the first run after an
+# update -- was reported as a model and reseeded from (#165). Nothing but this
+# entry can tell an id from a sentence, which is what line_regex is for.
+line_regex     = '^(\S+/\S+)$'
 
 # Seeded from `opencode models` on 2026-08-16 -- all seven, all cheap, because
 # they are all the free OpenCode Zen tier and nothing here distinguishes them

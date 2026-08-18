@@ -461,8 +461,11 @@ fn discover_models(binary: &Path, entry: &CliEntry) -> Result<Vec<String>, Strin
     )
     .map_err(|error| error.to_string())?;
     let Some(pattern) = &entry.models.line_regex else {
-        // No regex means the whole line is the id, which is what the entries
-        // without one declare in so many words.
+        // No regex means the whole line is the id. That reads the merged
+        // stream above literally, warnings included (#165), which is why no
+        // shipped entry relies on it any more: an entry that discovers
+        // declares the shape of a line in `line_regex`, because nothing here
+        // can tell one of its ids from a sentence it prints beside them.
         return Ok(output
             .lines()
             .map(str::trim)
@@ -1304,6 +1307,34 @@ mod process_tests {
         assert_eq!(
             models_line(&entry, Some(&script)),
             "routable: mini (cheap, pool main); discovered: fast, slow"
+        );
+    }
+
+    /// #165: `Capture::Both` is deliberate -- two of the four shipped CLIs
+    /// print their list on stderr -- so every warning on that stream reached
+    /// the report as a model id, and a maintainer reseeds `[[models.static]]`
+    /// from exactly this list. Run against the shipped entry, not a fixture:
+    /// what the noise gets filtered by is that entry's `line_regex`, so the
+    /// test has to fail if the catalogue loses it.
+    #[test]
+    fn discovery_keeps_the_ids_and_drops_what_the_cli_says_beside_them() {
+        let tmp = tempfile::tempdir().unwrap();
+        // The warning is verbatim from the issue: a real `opencode` 1.14.30
+        // printed it to stderr on the first run after an update.
+        let script = write_script(
+            tmp.path(),
+            "opencode",
+            "#!/bin/sh\necho 'Performing one time database migration, may take a few minutes...' >&2\nprintf 'fake/model-a\\nfake/model-b\\n'\n",
+        );
+        let catalog = Catalog::embedded().unwrap();
+        let entry = catalog.get("opencode").unwrap();
+        let _ = std::process::Command::new(&script)
+            .arg("--version")
+            .output();
+
+        assert_eq!(
+            discover_models(&script, entry).unwrap(),
+            ["fake/model-a", "fake/model-b"]
         );
     }
 
