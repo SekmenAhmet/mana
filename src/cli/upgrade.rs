@@ -575,6 +575,13 @@ mod tests {
             ci.contains(&format!("/download/v{DIST_PLAN_VERSION}/")),
             "ci.yml installs a different dist than dist-workspace.toml pins"
         );
+        // release.yml is the file dist actually uses to build releases; its
+        // own copy of the version is pinned by nothing else.
+        let release = include_str!("../../.github/workflows/release.yml");
+        assert!(
+            release.contains(&format!("/download/v{DIST_PLAN_VERSION}/")),
+            "release.yml installs a different dist than dist-workspace.toml pins"
+        );
     }
 
     /// Whether `rest` (the text on a `run:` line after the colon) is a YAML
