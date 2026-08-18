@@ -342,12 +342,11 @@ struct Scan {
 /// Splits a PM message into the prose to render, the bodies of its authorized
 /// `mana` blocks, and the bodies of the ones it declined.
 ///
-/// Line-based, and it tracks the fence it is inside rather than looking for
-/// ` ```mana ` anywhere: a `mana` block quoted inside a ` ```markdown ` example
-/// belongs to the PM's prose, and executing it would let a PM explaining the
-/// format accidentally use it. The nonce is the second, independent guard
-/// (#140) -- nesting stops the PM quoting *itself*, the nonce stops it quoting
-/// anything else.
+/// Line-based, and it tracks the fence it is inside: a *bare* `mana` block
+/// quoted inside a ` ```markdown ` example belongs to the PM's prose. The one
+/// thing nesting does not override is the nonce (#140), which is the whole of
+/// the authorization -- an authorized fence is a call wherever it stands, so a
+/// fence the PM left unbalanced cannot swallow the call after it (#156).
 fn scan(text: &str, nonce: &str) -> Scan {
     let authorized = format!("{LANGUAGE}:{nonce}");
     let mut prose: Vec<&str> = Vec::new();
@@ -374,6 +373,19 @@ fn scan(text: &str, nonce: &str) -> Scan {
                     collected.push(line);
                 }
             }
+            // An authorized fence is a call wherever it stands, including
+            // inside a fence the PM opened and never closed -- which used to
+            // consume it as its own closer and drop the dispatch in silence
+            // (#156). Since #140 the nesting guard below only stops the PM
+            // quoting *this session's* nonce, which nothing it reads can
+            // carry and its skill already forbids: cheaper to give up than a
+            // call that vanishes.
+            None if trimmed
+                .strip_prefix(FENCE)
+                .is_some_and(|info| info.trim() == authorized) =>
+            {
+                body = Some(Vec::new());
+            }
             None if other_fence => {
                 prose.push(line);
                 if trimmed.starts_with(FENCE) {
@@ -387,21 +399,17 @@ fn scan(text: &str, nonce: &str) -> Scan {
             }
             None => {
                 if let Some(info) = trimmed.strip_prefix(FENCE) {
-                    let info = info.trim();
-                    if info == authorized {
-                        body = Some(Vec::new());
-                    } else {
-                        // Every other fence is skipped whole, and a `mana` one
-                        // is skipped *while being watched*: it is either the
-                        // PM forgetting its nonce or content it copied, and
-                        // only its body can tell those apart.
-                        declined = info
-                            .strip_prefix(LANGUAGE)
-                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-                            .then(Vec::new);
-                        other_fence = true;
-                        prose.push(line);
-                    }
+                    // Every fence that is not authorized is skipped whole, and
+                    // a `mana` one is skipped *while being watched*: it is
+                    // either the PM forgetting its nonce or content it copied,
+                    // and only its body can tell those apart.
+                    declined = info
+                        .trim()
+                        .strip_prefix(LANGUAGE)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+                        .then(Vec::new);
+                    other_fence = true;
+                    prose.push(line);
                 } else {
                     prose.push(line);
                 }
@@ -636,18 +644,66 @@ mod tests {
         assert!(reply.contains("must be an object"), "{reply}");
     }
 
-    /// The PM explaining the format must not fire a tool -- even with the
-    /// nonce, which it may legitimately be showing the user.
+    /// #156: a fence the PM left unbalanced must not swallow the call that
+    /// follows it. An authorized fence is a call wherever it appears, and a
+    /// dispatch that vanishes leaves the PM waiting for a result nobody sends.
+    #[test]
+    fn a_block_after_an_unbalanced_fence_is_still_executed() {
+        let fixture = Fixture::new();
+        let outcome = fixture.sentinel.handle(&format!(
+            "For example:\n```json\n{{\"a\": 1}}\n{}",
+            fixture.block(r#"{"tool": "list_agents"}"#)
+        ));
+
+        assert_eq!(
+            outcome.log,
+            [ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false
+            }]
+        );
+        let reply = outcome
+            .reply
+            .expect("the call after the stray fence must be answered");
+        assert!(
+            reply.contains("1. list_agents ok: {\"agents\":["),
+            "{reply}"
+        );
+    }
+
+    /// A *bare* `mana` block quoted inside another fence is still prose: the
+    /// PM explaining the format, or reproducing something it read, fires
+    /// nothing. What no longer protects it is nesting alone -- see
+    /// `a_block_carrying_this_sessions_nonce_runs_inside_another_fence`.
     #[test]
     fn a_mana_block_quoted_inside_another_fence_is_prose() {
+        let fixture = Fixture::new();
+        let text = "Here is the shape:\n```markdown\n```mana\n{\"tool\": \"list_agents\"}\n```\n```\nThat is all.";
+        let outcome = fixture.sentinel.handle(text);
+        assert_eq!(outcome.reply, None);
+        assert!(outcome.prose.contains("```mana"), "{}", outcome.prose);
+    }
+
+    /// The trade-off taken for #156, pinned so it is a decision and not a
+    /// regression: the nonce outranks nesting. A block carrying *this
+    /// session's* token runs even inside another fence, because the only text
+    /// that can carry it is text this PM wrote in this session -- and the
+    /// alternative is a dispatch dropped in silence whenever a fence above it
+    /// was left open.
+    #[test]
+    fn a_block_carrying_this_sessions_nonce_runs_inside_another_fence() {
         let fixture = Fixture::new();
         let text = format!(
             "Here is the shape:\n```markdown\n```mana:{}\n{{\"tool\": \"list_agents\"}}\n```\n```\nThat is all.",
             fixture.sentinel.nonce()
         );
         let outcome = fixture.sentinel.handle(&text);
-        assert_eq!(outcome.reply, None);
-        assert!(outcome.prose.contains("```mana:"), "{}", outcome.prose);
+        assert!(
+            outcome
+                .reply
+                .is_some_and(|reply| reply.contains("list_agents ok:")),
+            "a fence with this session's nonce must run wherever it stands"
+        );
     }
 
     /// #140, the whole of it: a block the PM copied out of a file, an issue or
