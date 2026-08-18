@@ -30,12 +30,13 @@ branch.
 - [Trust model](#trust-model)
 - [Status and roadmap](#status-and-roadmap)
 
-![The chat pane mid-session](docs/assets/chat-pane.png)
+![mana mid-session](docs/assets/tui-session.png)
 
-*A real session, uncut: the user asks for a file, the PM creates the task and
-dispatches a claude/haiku executor, the reviewer validates — and everything
-else the session produced (reasoning, tool activity, a CLI's stderr) is
-collapsed into one dim counted line instead of cluttering the conversation.*
+*A real session, uncut: two tasks dispatched to claude/haiku executors, both
+reviewed, one validated and one rejected on the code — and the second attempt
+at that one still running, which is the `◐` in the graph. Everything the
+session produced besides the conversation (reasoning, tool activity, a CLI's
+stderr) is collapsed into one counted line instead of cluttering it.*
 
 ## How it works
 
@@ -97,9 +98,12 @@ project's own repo under `~/.mana/worktrees/<project>/<task>`. Sub-agents are
 spawned with that worktree as their working directory and told to stay in it,
 so parallel dispatches edit separate checkouts instead of racing on one — a
 convention, not a sandbox: see [Trust model](#trust-model). A project needs to
-be a git repository for any write role to run at all — without one, mana
-refuses the dispatch with a clear message rather than offering a degraded
-write path. Read-only roles (reviewers) need no worktree.
+be a git repository before a session starts at all — without one, `mana
+launch` refuses with a clear message rather than offering a degraded write
+path. That check used to sit on the first dispatch, where it cost a PM turn per
+executor to say the one thing mana already knew at launch. Hoisting it does
+refuse a read-only role that would have run, and that is the point: the session
+exists to dispatch work, and isolation *is* the worktree.
 
 ### Executor and reviewer loop
 
@@ -120,11 +124,15 @@ The PM asks for a `cost_class` (`cheap`, `mid`, `expensive`) rather than
 naming a model, and mana resolves the concrete (CLI × model) pair
 deterministically: among the installed, not-cooling candidates of that class,
 the one with the most validated tasks wins; ties break on fewest quota
-failures, then alphabetically — so the same state always resolves the same
-way and the PM can reason about what it will get. mana never escalates to a
-pricier class on its own; an exhausted `cheap` class is reported back with
-what's cooling and until when, and escalating is the PM's call to make
-explicitly.
+failures, then on the entry's own `routing_weight`, then alphabetically — so
+the same state always resolves the same way and the PM can reason about what
+it will get. The weight is the catalogue's editorial preference and it sits
+third on purpose: a maintainer's belief yields to what this project has
+actually seen, but on a fresh project every counter is zero, and a CLI's
+*name* deciding which agent does the work is an accident rather than a
+choice. mana never escalates to a pricier class on its own; an exhausted
+`cheap` class is reported back with what's cooling and until when, and
+escalating is the PM's call to make explicitly.
 
 ### The catalogue
 
@@ -135,9 +143,14 @@ fails `cargo test`, never ships. `~/.mana/catalog.local.toml` replaces one
 shipped entry wholesale — or adds a fifth CLI — so a CLI that changes its
 flags overnight is a config edit, not a release. One entry, and exactly one:
 the file is parsed as a single entry, so a second `[cli]` table in it is a
-TOML error, and every command but `mana doctor` (which falls back to the
-shipped catalogue and reports the failure) refuses to start until it is fixed.
-This is the rule the whole design answers to:
+TOML error, and everything that reads the catalogue refuses to start until it
+is fixed: `mana launch` and the MCP server it spawns. `mana doctor` is the
+deliberate exception — it falls back to the shipped catalogue and reports the
+failure, so the command you reach for when something is broken is the one that
+still runs. `mana ps` and `mana kill` never open the catalogue at all; they
+read the project's own dispatch records, so a broken override never costs you
+sight of what is running or the ability to stop it. This is the rule the whole
+design answers to:
 
 > **Anything that differs between CLIs is a field in the catalogue, never a
 > branch in the code.**
@@ -240,9 +253,10 @@ session that crashed is taken over automatically.
 ![The graph pane](docs/assets/graph-pane.png)
 
 *The graph pane (Ctrl+G): one node per dispatched sub-agent, labeled with its
-role, CLI/model and task — and, once reviewed, its verdict. This session was
-resumed with `mana launch opencode -c`: the conversation and the graph both
-came back.*
+role, CLI/model and task — and, once reviewed, its verdict. The `◐` nodes
+are still running. This session was resumed with `mana launch agy -c`, and the
+graph came back with it: it is rebuilt from the project's own dispatch
+records, not from anything the conversation remembered.*
 
 The chat pane shows only what the PM said, what you typed, and mana's own
 notices. Everything else a session produces — reasoning, tool activity, a
@@ -255,6 +269,14 @@ collapsed to one dim counted line:
 
 Nothing is dropped: a CLI whose output stops making sense shows up as that
 counter climbing far too fast, and one keystroke says why.
+
+![The chat pane](docs/assets/chat-pane.png)
+
+*The same session with the graph closed, from its first turn: mana's own
+notices carry the `*` gutter, the turns you typed are the bright ones, and
+the last two are still queued behind the answer in flight — `…` in the
+transcript,
+`2 queued` in the status bar.*
 
 **Quitting** (`Ctrl+C`, or a PM that dies on its own) stops every sub-agent
 mana had in flight for this project, through the same path as `mana kill`:
@@ -300,8 +322,10 @@ that fails is not evidence of a dead process. `mana ps` prints a note under the
 table saying which of the two it was. It is an unhelpful state, and it stays
 that way: `mana kill` refuses a pid-less row rather than guess what to signal,
 and `mana doctor --prune` spares only the worktrees of dispatches it can see
-running, so an `unknown` one's worktree is treated as a leftover. `mana ps`
-always exits 0, so it is always safe to pipe.
+running, so an `unknown` one's worktree is treated as a leftover. No dispatch
+status ever changes `mana ps`'s exit code — stale and unknown included; only
+failing to read the state at all does, which is the difference between a
+listing that found bad news and one that never ran.
 
 ### `mana kill`
 
@@ -333,15 +357,17 @@ unix when a check cannot run at all.
 ### `mana doctor`
 
 ```sh
-mana doctor                   # catalogue, this project, config
+mana doctor                   # catalogue, this project, worktrees
 mana doctor --project ../my-api
 mana doctor --prune           # remove worktrees no running dispatch is using
 ```
 
 Reports, per catalogued CLI: whether its binary is on `PATH` and its version,
-its PM driver and tool channel, its models (static or discovered live), its
-quota pools and failure signatures, any pair currently on cooldown, and every
-capability it lacks (no auto-approve flag, no allowlist, a concurrency cap).
+its PM driver and tool channel, its models — the routing seed mana may choose
+from on its own, and beside it whatever the CLI's own discovery command
+reports, which is not the same list — its quota pools and failure signatures,
+any pair currently on cooldown, and every capability it lacks (no auto-approve
+flag, no allowlist, a concurrency cap).
 Then the project's dispatch counters, anything still running or stale, and
 leftover worktrees. Three exit codes, because "the report never ran" and "the
 report ran and found something" are different answers: `0` is a report with
@@ -393,9 +419,12 @@ changed together, not a stable public API.
 None of the four catalogued CLIs expose a way to query remaining quota:
 copilot's `/limits` and `/usage` are interactive-only slash commands, claude
 only emits a `rate_limit_event` mid-run, `opencode stats` is historical, and
-agy reports nothing at all. So mana does not ask; it watches. Every
+agy reports nothing at all. So mana does not ask; it watches. Every *failed*
 dispatch's exit code and stdout/stderr are matched, in order, against the
-catalogue's `[[failure]]` signatures for that CLI — copilot's is `exit 1`
+catalogue's `[[failure]]` signatures for that CLI — a run that exited 0 is
+never matched, and neither is one mana can see an operator killed, since a
+CLI that merely printed the words "rate limit" would otherwise rest a pool
+for an hour on a kill somebody meant — copilot's is `exit 1`
 plus `"exceeded your monthly quota"` on stderr, claude's is `rate.?limit` on
 stdout. A match records a failure meaning (`quota_exhausted`, `rate_limited`,
 or `auth_expired` — which never triggers a cooldown, since waiting does not
@@ -420,16 +449,19 @@ CI runs on every push and pull request to `main` and `develop`, on all three
 OSes — Windows is in the matrix because mana claims cross-platform support,
 and claimed-but-untested is how v1 shipped broken. Each run checks
 formatting, clippy with warnings denied, a full build, and the test suite,
-including golden transcripts recorded per CLI (`catalog/goldens/`) replayed
-against every catalogue entry's `[pm.events]` maps — a JSONPath drifting out
-of sync with a CLI's real output fails a test instead of degrading silently
-in the field. A separate job runs `cargo-deny` (RustSec advisories, a license
-allowlist, duplicate-major-version warnings, source restrictions — accepted
-exceptions are recorded with their exit path in `deny.toml`), checks that the
-generated release workflow still matches `dist-workspace.toml`, and reports
-coverage via `cargo-llvm-cov`. The same `cargo-deny` check also runs every
-Monday on a schedule, so a CVE published while the repo is quiet does not
-stay invisible until the next commit.
+including golden transcripts recorded per CLI (`catalog/goldens/`). The two
+non-ACP entries' goldens are replayed against that entry's `[pm.events]`
+JSONPaths, so a path drifting out of sync with a CLI's real output fails a
+test instead of degrading silently in the field; the two ACP entries carry no
+`[pm.events]` to drift — ACP is one protocol — and their goldens replay
+through the shared decoder instead, pinning which notification becomes prose
+and which becomes a technical line. A separate job runs `cargo-deny` (RustSec
+advisories, a license allowlist, duplicate-major-version warnings, source
+restrictions — accepted exceptions are recorded with their exit path in
+`deny.toml`), checks that the generated release workflow still matches
+`dist-workspace.toml`, and reports coverage via `cargo-llvm-cov`. The same
+`cargo-deny` check also runs every Monday on a schedule, so a CVE published
+while the repo is quiet does not stay invisible until the next commit.
 
 Releases are two human decisions and otherwise robot-driven — see
 [RELEASING.md](RELEASING.md) for the full flow: release-plz handles
