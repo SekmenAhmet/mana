@@ -78,8 +78,9 @@ const TOOLS: [&str; 4] = [
     "list_agents",
 ];
 
-/// The fence the PM opens. Anything else fenced (` ```json `, ` ``` `) is the
-/// PM's own prose and is skipped whole, so a `mana` block quoted inside a
+/// The shortest fence the PM may open -- a longer run of backticks opens one
+/// too, see `fence`. Anything else fenced (` ```json `, ` ``` `) is the PM's
+/// own prose and is skipped whole, so a bare `mana` block quoted inside a
 /// markdown example never fires.
 const FENCE: &str = "```";
 const LANGUAGE: &str = "mana";
@@ -339,73 +340,94 @@ struct Scan {
     quoted: Vec<String>,
 }
 
+/// The backtick run that opens or closes a fence, and its info string.
+///
+/// CommonMark: an opener is a run of *three or more* backticks and the closer
+/// must be at least as long. Three is only the minimum, and four is what a
+/// model reaches for when the fenced body might itself contain backticks --
+/// code, a diff, a log excerpt -- which for a brief is the normal case. mana
+/// used to strip exactly three, so a longer fence matched neither the
+/// authorized test nor the declined one and the block was dropped with no run
+/// and no corrective (#190).
+fn fence(trimmed: &str) -> Option<(usize, &str)> {
+    let info = trimmed.trim_start_matches('`');
+    let run = trimmed.len() - info.len();
+    (run >= FENCE.len()).then_some((run, info.trim()))
+}
+
 /// Splits a PM message into the prose to render, the bodies of its authorized
 /// `mana` blocks, and the bodies of the ones it declined.
 ///
-/// Line-based, and it tracks the fence it is inside rather than looking for
-/// ` ```mana ` anywhere: a `mana` block quoted inside a ` ```markdown ` example
-/// belongs to the PM's prose, and executing it would let a PM explaining the
-/// format accidentally use it. The nonce is the second, independent guard
-/// (#140) -- nesting stops the PM quoting *itself*, the nonce stops it quoting
-/// anything else.
+/// Line-based, and it tracks the fence it is inside: a *bare* `mana` block
+/// quoted inside a ` ```markdown ` example belongs to the PM's prose. The one
+/// thing nesting does not override is the nonce (#140), which is the whole of
+/// the authorization -- an authorized fence is a call wherever it stands, so a
+/// fence the PM left unbalanced cannot swallow the call after it (#156).
 fn scan(text: &str, nonce: &str) -> Scan {
     let authorized = format!("{LANGUAGE}:{nonce}");
     let mut prose: Vec<&str> = Vec::new();
     let mut blocks: Vec<String> = Vec::new();
     let mut quoted: Vec<String> = Vec::new();
     let mut body: Option<Vec<&str>> = None;
-    let mut other_fence = false;
+    // The backtick run that opened `body`, since the closer must match it.
+    let mut open = 0;
+    // `Some(run)` while inside a fence that is not a call, carrying the run
+    // that opened it for the same reason.
+    let mut other_fence: Option<usize> = None;
     // `Some` while inside a `mana` fence that is being rendered rather than
     // run, collecting what it would have been.
     let mut declined: Option<Vec<&str>> = None;
 
     for line in text.lines() {
-        let trimmed = line.trim();
-        match &mut body {
-            // Inside a mana block: the first closing fence ends it. A block
-            // whose body contains its own fence therefore ends early and comes
-            // back as malformed JSON, which is a corrective message rather
-            // than a silently truncated tool call.
-            Some(collected) => {
-                if trimmed.starts_with(FENCE) {
-                    blocks.push(collected.join("\n"));
-                    body = None;
-                } else {
-                    collected.push(line);
-                }
+        match (&mut body, fence(line.trim())) {
+            // Inside a mana block: the first fence at least as long as the one
+            // that opened it ends it. A block whose body contains such a fence
+            // therefore ends early and comes back as malformed JSON, which is
+            // a corrective message rather than a silently truncated tool call.
+            (Some(collected), Some((run, _))) if run >= open => {
+                blocks.push(collected.join("\n"));
+                body = None;
             }
-            None if other_fence => {
-                prose.push(line);
-                if trimmed.starts_with(FENCE) {
-                    other_fence = false;
+            (Some(collected), _) => collected.push(line),
+            // An authorized fence is a call wherever it stands, including
+            // inside a fence the PM opened and never closed -- which used to
+            // consume it as its own closer and drop the dispatch in silence
+            // (#156). Since #140 the nesting guard below only stops the PM
+            // quoting *this session's* nonce, which nothing it reads can
+            // carry and its skill already forbids: cheaper to give up than a
+            // call that vanishes.
+            (None, Some((run, info))) if info == authorized => {
+                open = run;
+                body = Some(Vec::new());
+            }
+            (None, fenced) => match (other_fence, fenced) {
+                (Some(opened), Some((run, _))) if run >= opened => {
+                    prose.push(line);
+                    other_fence = None;
                     if let Some(collected) = declined.take() {
                         quoted.push(collected.join("\n"));
                     }
-                } else if let Some(collected) = &mut declined {
-                    collected.push(line);
                 }
-            }
-            None => {
-                if let Some(info) = trimmed.strip_prefix(FENCE) {
-                    let info = info.trim();
-                    if info == authorized {
-                        body = Some(Vec::new());
-                    } else {
-                        // Every other fence is skipped whole, and a `mana` one
-                        // is skipped *while being watched*: it is either the
-                        // PM forgetting its nonce or content it copied, and
-                        // only its body can tell those apart.
-                        declined = info
-                            .strip_prefix(LANGUAGE)
-                            .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
-                            .then(Vec::new);
-                        other_fence = true;
-                        prose.push(line);
+                (Some(_), _) => {
+                    prose.push(line);
+                    if let Some(collected) = &mut declined {
+                        collected.push(line);
                     }
-                } else {
+                }
+                // Every fence that is not authorized is skipped whole, and a
+                // `mana` one is skipped *while being watched*: it is either
+                // the PM forgetting its nonce or content it copied, and only
+                // its body can tell those apart.
+                (None, Some((run, info))) => {
+                    declined = info
+                        .strip_prefix(LANGUAGE)
+                        .is_some_and(|rest| rest.is_empty() || rest.starts_with(':'))
+                        .then(Vec::new);
+                    other_fence = Some(run);
                     prose.push(line);
                 }
-            }
+                (None, None) => prose.push(line),
+            },
         }
     }
     // A block the PM never closed: the CLI truncated the turn, or the model
@@ -636,18 +658,66 @@ mod tests {
         assert!(reply.contains("must be an object"), "{reply}");
     }
 
-    /// The PM explaining the format must not fire a tool -- even with the
-    /// nonce, which it may legitimately be showing the user.
+    /// #156: a fence the PM left unbalanced must not swallow the call that
+    /// follows it. An authorized fence is a call wherever it appears, and a
+    /// dispatch that vanishes leaves the PM waiting for a result nobody sends.
+    #[test]
+    fn a_block_after_an_unbalanced_fence_is_still_executed() {
+        let fixture = Fixture::new();
+        let outcome = fixture.sentinel.handle(&format!(
+            "For example:\n```json\n{{\"a\": 1}}\n{}",
+            fixture.block(r#"{"tool": "list_agents"}"#)
+        ));
+
+        assert_eq!(
+            outcome.log,
+            [ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false
+            }]
+        );
+        let reply = outcome
+            .reply
+            .expect("the call after the stray fence must be answered");
+        assert!(
+            reply.contains("1. list_agents ok: {\"agents\":["),
+            "{reply}"
+        );
+    }
+
+    /// A *bare* `mana` block quoted inside another fence is still prose: the
+    /// PM explaining the format, or reproducing something it read, fires
+    /// nothing. What no longer protects it is nesting alone -- see
+    /// `a_block_carrying_this_sessions_nonce_runs_inside_another_fence`.
     #[test]
     fn a_mana_block_quoted_inside_another_fence_is_prose() {
+        let fixture = Fixture::new();
+        let text = "Here is the shape:\n```markdown\n```mana\n{\"tool\": \"list_agents\"}\n```\n```\nThat is all.";
+        let outcome = fixture.sentinel.handle(text);
+        assert_eq!(outcome.reply, None);
+        assert!(outcome.prose.contains("```mana"), "{}", outcome.prose);
+    }
+
+    /// The trade-off taken for #156, pinned so it is a decision and not a
+    /// regression: the nonce outranks nesting. A block carrying *this
+    /// session's* token runs even inside another fence, because the only text
+    /// that can carry it is text this PM wrote in this session -- and the
+    /// alternative is a dispatch dropped in silence whenever a fence above it
+    /// was left open.
+    #[test]
+    fn a_block_carrying_this_sessions_nonce_runs_inside_another_fence() {
         let fixture = Fixture::new();
         let text = format!(
             "Here is the shape:\n```markdown\n```mana:{}\n{{\"tool\": \"list_agents\"}}\n```\n```\nThat is all.",
             fixture.sentinel.nonce()
         );
         let outcome = fixture.sentinel.handle(&text);
-        assert_eq!(outcome.reply, None);
-        assert!(outcome.prose.contains("```mana:"), "{}", outcome.prose);
+        assert!(
+            outcome
+                .reply
+                .is_some_and(|reply| reply.contains("list_agents ok:")),
+            "a fence with this session's nonce must run wherever it stands"
+        );
     }
 
     /// #140, the whole of it: a block the PM copied out of a file, an issue or
@@ -735,6 +805,71 @@ mod tests {
             .handle("Result:\n```json\n{\"tool\": \"list_agents\"}\n```");
         assert_eq!(outcome.reply, None);
         assert!(outcome.prose.contains("```json"), "{}", outcome.prose);
+    }
+
+    /// #190: three backticks are the *minimum*, not the shape. A model
+    /// reaches for four whenever the fenced body might itself contain
+    /// backticks -- a brief carrying code, a diff, a log excerpt -- which is
+    /// the normal case here, and the block used to be dropped outright.
+    #[test]
+    fn a_block_opened_with_four_backticks_is_executed() {
+        let fixture = Fixture::new();
+        let outcome = fixture.sentinel.handle(&format!(
+            "````mana:{}\n{{\"tool\": \"list_agents\"}}\n````",
+            fixture.sentinel.nonce()
+        ));
+
+        assert_eq!(
+            outcome.log,
+            [ToolLine {
+                text: "⚙ list_agents ✓".to_string(),
+                failed: false
+            }]
+        );
+        let reply = outcome.reply.expect("a longer fence is still a call");
+        assert!(
+            reply.contains("1. list_agents ok: {\"agents\":["),
+            "{reply}"
+        );
+    }
+
+    /// The other half of #190: a longer fence without the nonce is watched
+    /// like any other `mana` fence, so a PM that reached for four backticks
+    /// *and* forgot its nonce is told once instead of ignored twice over.
+    #[test]
+    fn a_bare_mana_block_behind_a_longer_fence_is_still_reported() {
+        let fixture = Fixture::new();
+        let reply = fixture
+            .sentinel
+            .handle(
+                "````mana\n{\"tool\": \"create_task\", \"args\": {\"title\": \"x\", \"prompt\": \"y\"}}\n````",
+            )
+            .reply
+            .expect("a block that would have parsed is never answered with silence");
+        assert!(
+            reply.contains("did not carry this session's nonce"),
+            "{reply}"
+        );
+    }
+
+    /// A closer shorter than its opener does not close it (CommonMark), so a
+    /// fenced snippet inside a four-backtick brief stays in the body instead
+    /// of cutting the call in half.
+    #[test]
+    fn a_shorter_fence_does_not_close_a_longer_block() {
+        let fixture = Fixture::new();
+        let reply = fixture
+            .sentinel
+            .handle(&format!(
+                "````mana:{}\n{{\"tool\": \"list_agents\"}}\n```\n````",
+                fixture.sentinel.nonce()
+            ))
+            .reply
+            .unwrap();
+        // The ``` line is body, not the closer -- so the body is the JSON plus
+        // that line, which is malformed and comes back as a corrective rather
+        // than as a call assembled out of half a block.
+        assert!(reply.contains("not valid JSON"), "{reply}");
     }
 
     /// Backticks inside the JSON are ordinary characters -- a brief that shows
