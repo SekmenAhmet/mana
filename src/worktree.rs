@@ -140,7 +140,50 @@ pub fn create(
 /// for exactly that reason: a retry rebuilds the same branch from a fresh
 /// base, so the name mana promised at dispatch is still the name afterwards.
 pub fn branch_name(task_id: &str) -> String {
-    format!("mana/{task_id}")
+    format!("{BRANCH_PREFIX}{task_id}")
+}
+
+/// The namespace every task branch lives in. One constant, because doctor
+/// lists the namespace (#194) and `branch_name` builds into it.
+const BRANCH_PREFIX: &str = "mana/";
+
+/// Every `mana/*` branch this repo carries, in git's own order, each paired
+/// with whether HEAD already contains its commits.
+///
+/// Two `git branch --list` calls rather than one `merge-base` per branch: a
+/// few hundred leftover branches is exactly the state this exists for (#194),
+/// and per-branch probing would be a few hundred process spawns in a
+/// diagnostic.
+///
+/// Best-effort by design: a project that is no git repo (doctor reports on
+/// those too) or a git that will not run has no branches to report, which is
+/// an empty list and not a report that fails.
+pub fn mana_branches(project_root: &Path) -> Vec<(String, bool)> {
+    let glob = format!("{BRANCH_PREFIX}*");
+    let list = |extra: &[&str]| -> Vec<String> {
+        let mut args = vec!["branch", "--list", &glob, "--format=%(refname:short)"];
+        args.extend_from_slice(extra);
+        let Ok(output) = git_output(project_root, &args) else {
+            return Vec::new();
+        };
+        if !output.status.success() {
+            return Vec::new();
+        }
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(str::to_string)
+            .collect()
+    };
+    let merged = list(&["--merged", "HEAD"]);
+    list(&[])
+        .into_iter()
+        .map(|branch| {
+            let is_merged = merged.contains(&branch);
+            (branch, is_merged)
+        })
+        .collect()
 }
 
 /// Where every task worktree for one project lives.
@@ -669,6 +712,43 @@ mod tests {
             fixture.git_ok(&fixture.project, &["rev-parse", &info.branch]),
             tip
         );
+    }
+
+    /// Issue #194: `remove_at` keeps the branch on purpose and nothing picks
+    /// it up afterwards, so `mana/*` branches accumulate forever. Reporting
+    /// them starts with being able to list them -- and with saying which ones
+    /// HEAD already contains, since those are the only ones a user can delete
+    /// without losing work.
+    #[test]
+    fn mana_branches_lists_the_namespace_and_flags_what_head_already_contains() {
+        let fixture = Fixture::new();
+        let first = fixture.seed_commit("README.md", "base\n");
+        let second = fixture.seed_commit("more.md", "more\n");
+        fixture.git_ok(&fixture.project, &["branch", "mana/landed", &first]);
+        fixture.git_ok(&fixture.project, &["branch", "mana/unlanded", &second]);
+        // Outside the namespace: the user's own branches are none of doctor's
+        // business.
+        fixture.git_ok(&fixture.project, &["branch", "feature/mine", &second]);
+        // HEAD back to the first commit, which puts `mana/unlanded` ahead of
+        // it -- work nothing has landed.
+        fixture.git_ok(&fixture.project, &["reset", "--hard", &first]);
+
+        assert_eq!(
+            mana_branches(&fixture.project),
+            vec![
+                ("mana/landed".to_string(), true),
+                ("mana/unlanded".to_string(), false),
+            ]
+        );
+    }
+
+    /// Doctor runs on projects that are not repos at all (a read-only role
+    /// never needs one), and a report that dies there is worse than one that
+    /// says nothing about branches.
+    #[test]
+    fn mana_branches_is_empty_outside_a_git_repo() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(mana_branches(tmp.path()).is_empty());
     }
 
     #[test]
