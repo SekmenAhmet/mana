@@ -278,6 +278,17 @@ impl AcpDriver {
                     .into_iter()
                     .all(|event| sender.send(event).is_ok())
             });
+            // Whatever the PM had said since its last newline (#157). ACP
+            // agents chunk prose token by token -- opencode sent nine chunks
+            // for "MANA-TOOLS-OK 2", not a newline among them -- so a turn
+            // that never reached its `stopReason` (the agent fell over, a
+            // quota kill landed, `shutdown()` closed stdin) has its whole
+            // partial answer sitting in `state`, which is dropped here. Flushed
+            // ahead of the stderr drain so it reads in the order it happened:
+            // what the PM was saying, then why it stopped, then the code.
+            for event in state.flush() {
+                let _ = sender.send(event);
+            }
             // stdout is at EOF, so every write end is closed and the child is
             // on its way out. Drain stderr before reporting the exit: when a PM
             // dies, the reason is on stderr and it must reach the user ahead of
@@ -1776,6 +1787,14 @@ while IFS= read -r line; do
           echo 'boom: the agent fell over' >&2
           exit 9
           ;;
+        die-midline)
+          # One chunk with no newline in its text -- the shape opencode streams
+          # prose in -- and then death, so the turn never reaches its
+          # `stopReason` (#157).
+          printf '{"jsonrpc":"2.0","method":"session/update","params":{"sessionId":"s-1","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"half a sen"}}}}\n'
+          echo 'boom: the agent fell over mid-sentence' >&2
+          exit 9
+          ;;
         noisy)
           # One line on stderr, one on stdout: the shape the duplicated-stderr
           # hunt needed a ruler for.
@@ -2138,6 +2157,29 @@ done
         // A turn sent to a corpse fails where the person who typed it can see.
         let error = driver.send_user("hello?").unwrap_err();
         assert!(!format!("{error:#}").is_empty());
+    }
+
+    /// The other half of the same death: what the PM had already said (#157).
+    ///
+    /// ACP agents chunk prose token by token -- `catalog/opencode.toml` records
+    /// nine chunks reading "MAN","A","-","TO","OLS","-","OK"," ","2", not a
+    /// newline among them -- so a turn only becomes text when something flushes
+    /// the buffer. The `stopReason` response does; an agent that falls over
+    /// mid-sentence never sends one, and EOF used to drop `TurnState` with the
+    /// whole partial answer still in it. Stderr and an exit code where the
+    /// answer belongs is the silent failure `src/pm/mod.rs` forbids.
+    #[test]
+    fn an_agent_that_dies_mid_sentence_still_reports_what_it_had_said() {
+        let fixture = Fixture::new();
+        let mut driver = fixture.driver("die-midline");
+        driver.send_user("go on then").unwrap();
+
+        let events = drain_to_exit(&driver);
+        assert!(
+            events.contains(&PmEvent::Text("half a sen".to_string())),
+            "{events:#?}"
+        );
+        assert_eq!(events.last(), Some(&PmEvent::Exited { code: Some(9) }));
     }
 
     /// One line on the PM's stderr is one line in the pane. Once.
