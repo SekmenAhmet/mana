@@ -1128,6 +1128,8 @@ pub struct ReviewOut {
     /// `brief` if the brief itself was at fault.
     #[serde(skip_serializing_if = "Option::is_none")]
     attribution: Option<String>,
+    /// Bounded by `bounded_issues`, and carrying its own truncation notice
+    /// when it was cut.
     issues: Vec<String>,
     /// Whether this verdict counts against the model's record. A brief you
     /// wrote badly does not.
@@ -1139,6 +1141,59 @@ pub struct ReviewOut {
     worktree: String,
 }
 
+/// The issues worth spending PM context on, under the same two bounds
+/// `failure_tail` obeys and for the same reason (#186).
+///
+/// `issues` is an unbounded `Vec<String>` parsed out of a file a reviewer
+/// sub-agent wrote -- the same kind of process as the executor, under the same
+/// fifteen-minute budget, read whole by `read_verdict` -- and `get_review`
+/// hands it to the PM, whose context pays for every line of it on each
+/// subsequent turn. That is the destination `TAIL_LINES`/`TAIL_BYTES` were
+/// written for; the two channels are a few hundred lines apart in this file
+/// and only one of them had ever been capped.
+///
+/// The cap lives here and not in `read_verdict` because the PM's context is
+/// the only place the price is paid: routing (`mcp/routing.rs`), the
+/// dependency gate, the TUI graph, `doctor` and `mana dev` all read the same
+/// verdict and want it whole.
+///
+/// The head rather than the tail, unlike `tail_of`: a CLI's last words are
+/// what it died of, but a reviewer leads with the issue it thinks matters
+/// most, and the PM acts on the first one. Both bounds again -- the item count
+/// is the useful unit, and the byte ceiling is what holds when a reviewer
+/// writes one "issue" that is a megabyte of prose. Either cut says so in the
+/// output, so the PM does not read a half-sentence as the whole verdict.
+fn bounded_issues(issues: &[String]) -> Vec<String> {
+    let mut kept: Vec<String> = Vec::new();
+    let mut budget = TAIL_BYTES;
+    for issue in issues.iter().take(TAIL_LINES) {
+        if budget == 0 {
+            break;
+        }
+        if issue.len() <= budget {
+            budget -= issue.len();
+            kept.push(issue.clone());
+            continue;
+        }
+        // Back to the previous char boundary rather than slicing at the byte
+        // offset: this is a model's prose, and one multi-byte character
+        // straddling the cut would panic the tool call over a long issue.
+        let cut = (0..=budget)
+            .rev()
+            .find(|index| issue.is_char_boundary(*index))
+            .unwrap_or(0);
+        kept.push(format!("{} [truncated]", &issue[..cut]));
+        break;
+    }
+    if kept.len() < issues.len() {
+        kept.push(format!(
+            "[{} further issue(s) truncated -- read the verdict file for all of them]",
+            issues.len() - kept.len()
+        ));
+    }
+    kept
+}
+
 impl ReviewOut {
     /// Not a `From<&Verdict>` any more: a verdict on its own does not know
     /// which branch it judged, and the whole point of #36 is that the PM is
@@ -1148,7 +1203,7 @@ impl ReviewOut {
         ReviewOut {
             verdict: verdict.verdict.word().to_string(),
             attribution: verdict.attribution.map(|a| a.word().to_string()),
-            issues: verdict.issues.clone(),
+            issues: bounded_issues(&verdict.issues),
             counts_against_model: verdict.counts_against_model(),
             branch,
             worktree,
@@ -1655,6 +1710,68 @@ mod tests {
         .unwrap();
         let review = fixture.tools.get_review_impl(TaskRef { task_id }).unwrap();
         assert!(!review.counts_against_model);
+    }
+
+    /// #186: `issues` reaches the PM's context through the same door
+    /// `failure_tail` does, and only one of the two was ever bounded.
+    #[test]
+    fn get_review_bounds_the_issues_it_puts_in_the_pm_context() {
+        let fixture = Fixture::new();
+        std::fs::create_dir_all(&fixture.paths.reviews).unwrap();
+
+        // A reviewer that enumerates: many issues, each one small.
+        let task_id = fixture.create("Verbose reviewer", "brief", None);
+        let many: Vec<String> = (0..500)
+            .map(|i| format!("src/a.rs:{i} criterion {i} unmet"))
+            .collect();
+        std::fs::write(
+            fixture.paths.reviews.join(format!("{task_id}.json")),
+            serde_json::json!({"verdict": "rejected", "attribution": "code", "issues": many})
+                .to_string(),
+        )
+        .unwrap();
+        let review = fixture.tools.get_review_impl(TaskRef { task_id }).unwrap();
+        assert!(
+            review.issues.len() <= TAIL_LINES + 1,
+            "{} issues survived a {TAIL_LINES}-item cap",
+            review.issues.len()
+        );
+        let bytes: usize = review.issues.iter().map(String::len).sum();
+        assert!(bytes <= TAIL_BYTES * 2, "{bytes} bytes reached the PM");
+        assert!(
+            review
+                .issues
+                .iter()
+                .any(|issue| issue.contains("truncated")),
+            "the PM cannot tell the list was cut: {:?}",
+            review.issues
+        );
+
+        // A reviewer that rambles: one issue, megabytes long, multi-byte so a
+        // naive byte slice would panic. The item cap alone does nothing here
+        // -- this is what the byte ceiling is for.
+        let task_id = fixture.create("Rambling reviewer", "brief", None);
+        std::fs::write(
+            fixture.paths.reviews.join(format!("{task_id}.json")),
+            serde_json::json!({
+                "verdict": "rejected",
+                "attribution": "code",
+                "issues": ["e\u{9731}".repeat(400_000)],
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let review = fixture.tools.get_review_impl(TaskRef { task_id }).unwrap();
+        let bytes: usize = review.issues.iter().map(String::len).sum();
+        assert!(bytes <= TAIL_BYTES * 2, "{bytes} bytes reached the PM");
+        assert!(
+            review
+                .issues
+                .iter()
+                .any(|issue| issue.contains("truncated")),
+            "the PM may read a half-sentence as the whole verdict: {:?}",
+            review.issues
+        );
     }
 
     #[test]
