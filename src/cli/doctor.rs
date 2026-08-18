@@ -575,7 +575,11 @@ fn cooldowns_line(entry: &CliEntry, observations: &Observations) -> String {
 /// What this CLI cannot do, straight from its entry. Every one of these is a
 /// field being empty or set, never a name being recognised — which is what
 /// makes the list correct for a CLI added through the local override.
-fn degradations(entry: &CliEntry) -> Vec<String> {
+///
+/// Visible to the rest of `cli` because `mana launch` says the same list at
+/// startup: an operator about to spend a session on this CLI is the one who
+/// can act on it, and one source of truth beats a second copy of the strings.
+pub(super) fn degradations(entry: &CliEntry) -> Vec<String> {
     let mut degradations = Vec::new();
     if entry.pm.permission_args.is_empty() {
         degradations.push(

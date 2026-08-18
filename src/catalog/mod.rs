@@ -308,6 +308,43 @@ url = "https://example.invalid/alpha"
         (dir, path)
     }
 
+    /// The design document's reference entry is what someone building an
+    /// override copies, and an override replaces a whole entry -- there is no
+    /// field-by-field merge -- so a field the reference forgets is a field the
+    /// copy silently loses.
+    ///
+    /// Asserts on the field names inside the section rather than parsing the
+    /// fenced TOML out of the Markdown: the fields belonging to a driver the
+    /// reference entry is not (`oneshot-continue`) are shown commented out, as
+    /// `line_regex` already was, and a TOML parse would not see them at all.
+    #[test]
+    fn the_design_documents_reference_entry_names_every_field_the_schema_accepts() {
+        const DESIGN: &str =
+            include_str!("../../docs/superpowers/specs/2026-08-15-mana-v2-design.md");
+        let section = DESIGN
+            .split_once("### Schema (`schema = 1`)")
+            .expect("the reference entry section")
+            .1
+            .split_once("\n### ")
+            .expect("the reference entry section ends at the next heading")
+            .0;
+        for field in [
+            "permission_args",
+            "resume_args",
+            "first_args",
+            "continue_args",
+            "routing_weight",
+            "inline_in_activation",
+            "exit_codes",
+            "stderr_regex",
+        ] {
+            assert!(
+                section.contains(field),
+                "{field} is missing from the design document's reference entry"
+            );
+        }
+    }
+
     /// The build-time gate. If a shipped catalogue file is malformed this test
     /// fails, so the bad data never reaches a release.
     #[test]
