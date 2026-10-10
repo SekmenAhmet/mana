@@ -142,7 +142,7 @@ jobs:
       # `@cargo-llvm-cov` is a rolling ref, not a version -- pinned to the
       # v2.86.1 commit with the tool name moved into `with:`, same behaviour.
       - name: Install cargo-llvm-cov
-        uses: taiki-e/install-action@5b4d68e2e660441203ab128a23676f1e4faf1532 # v2.86.3
+        uses: taiki-e/install-action@ab6895351a88b908e96a4697860d4ffea5e57dbe # v2.87.27
         with:
           tool: cargo-llvm-cov
 
