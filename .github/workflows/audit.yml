@@ -33,4 +33,4 @@ jobs:
           # "silence looks like health" failure this workflow exists to catch.
           # Any other trigger audits the ref that fired it.
           ref: ${{ github.event_name == 'schedule' && 'develop' || github.ref }}
-      - uses: EmbarkStudios/cargo-deny-action@3c6349835b2b7b196a839186cb8b78e02f7b5f25 # v2
+      - uses: EmbarkStudios/cargo-deny-action@17aeb3c839e42274e2b8adf721c8c65edfdc74dd # v2
